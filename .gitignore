@@ -1,0 +1,9 @@
+# Security / Credentials
+.env
+*.json
+google-ads.yaml
+get_refresh_token.py
+
+# Python Virtual Environment
+venv/
+__pycache__/

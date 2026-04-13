@@ -1,0 +1,1589 @@
+"""GoHighLevel (LeadConnector) API client for contacts."""
+
+# -*- coding: utf-8 -*-
+
+
+from __future__ import annotations
+
+import os
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+import requests
+from dotenv import load_dotenv
+
+_PROJECT_DIR = Path(__file__).resolve().parent
+load_dotenv(_PROJECT_DIR / ".env")
+
+BASE_URL = "https://services.leadconnectorhq.com"
+API_VERSION = "2021-07-28"
+
+# Match picklist labels in GHL; "How did you hear about us?" must map to Facebook / Instagram.
+HEAR_ABOUT_US_FIELD_NAME = "How did you hear about us?"
+
+MEMBERSHIP_LEVEL_FIELD_NAME = "Membership Level"
+# GHL label may be "Committed?", "Committed", or a typo "Commited?"
+COMMITTED_FIELD_NAME = "Committed?"
+COMMITTED_FIELD_ALIASES = (
+    "Committed?",
+    "Commited?",
+    "Committed",
+)
+
+# GHL labels vary ("Sign Up Date" vs "Sign-Up Date"); matching uses alphanumeric fingerprint.
+SIGN_UP_DATE_FIELD_ALIASES = (
+    "Sign Up Date",
+    "Sign-Up Date",
+)
+
+# GHL label for membership cancellation date (DATE custom field).
+CANCELLATION_DATE_FIELD_ALIASES = (
+    "Membership Cancellation Date",
+    "Cancellation Date",
+    "Cancel Date",
+)
+
+
+def _bearer_token() -> str:
+    return (
+        os.getenv("GHL_ACCESS_TOKEN")
+        or os.getenv("GHL_PRIVATE_INTEGRATION_TOKEN")
+        or os.getenv("GHL_API_KEY")
+        or ""
+    ).strip()
+
+
+def _location_id() -> str:
+    return (os.getenv("GHL_LOCATION_ID") or "").strip()
+
+
+def _hear_about_us_field_id() -> str:
+    return (os.getenv("GHL_HEAR_ABOUT_US_FIELD_ID") or "").strip()
+
+
+def _membership_level_field_id() -> str:
+    return (os.getenv("GHL_MEMBERSHIP_LEVEL_FIELD_ID") or "").strip()
+
+
+def _sign_up_date_field_id() -> str:
+    return (os.getenv("GHL_SIGN_UP_DATE_FIELD_ID") or "").strip()
+
+
+def _cancellation_date_field_id() -> str:
+    return (os.getenv("GHL_CANCELLATION_DATE_FIELD_ID") or "").strip()
+
+
+def _committed_field_id() -> str:
+    return (os.getenv("GHL_COMMITTED_FIELD_ID") or "").strip()
+
+
+def _request_headers() -> dict[str, str]:
+    token = _bearer_token()
+    if not token:
+        raise ValueError(
+            "Set GHL_ACCESS_TOKEN, GHL_PRIVATE_INTEGRATION_TOKEN, or GHL_API_KEY in .env"
+        )
+    return {
+        "Authorization": f"Bearer {token}",
+        "Version": API_VERSION,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+
+def _normalize_field_name(name: str) -> str:
+    return "".join(c for c in name.casefold() if c.isalnum() or c.isspace()).strip()
+
+
+def _field_name_fingerprint(name: str) -> str:
+    """Collapse label variants (spaces vs hyphens) for loose field-name matching."""
+    return "".join(c for c in name.casefold() if c.isalnum())
+
+
+COMMITTED_FIELD_FINGERPRINTS = frozenset(
+    _field_name_fingerprint(a) for a in COMMITTED_FIELD_ALIASES
+)
+
+
+def _contact_sort_key(contact: dict[str, Any]) -> str:
+    for key in ("dateAdded", "dateUpdated", "createdAt"):
+        val = contact.get(key)
+        if val:
+            return str(val)
+    return ""
+
+
+def fetch_last_created_contacts(
+    limit: int = 20, *, location_id: str | None = None
+) -> list[dict[str, Any]]:
+    """
+    Fetch up to ``limit`` contacts created most recently, newest first.
+
+    Uses POST ``/contacts/search`` with ``pageLimit`` and server-side sort on
+    ``dateAdded`` descending (GHL’s creation timestamp; responses do not use a
+    ``date_created`` key).
+
+    If ``location_id`` is omitted or empty, uses ``GHL_LOCATION_ID`` from the environment.
+
+    Environment:
+        GHL_ACCESS_TOKEN — OAuth access token for the sub-account, or
+        GHL_PRIVATE_INTEGRATION_TOKEN — private integration token, or
+        GHL_API_KEY — alias some setups use for the same secret
+        GHL_LOCATION_ID — sub-account / location ID
+    """
+    if not _bearer_token():
+        raise ValueError(
+            "Set GHL_ACCESS_TOKEN, GHL_PRIVATE_INTEGRATION_TOKEN, or GHL_API_KEY in .env"
+        )
+    if location_id and location_id.strip():
+        location_id = location_id.strip()
+    else:
+        location_id = _location_id()
+    if not location_id:
+        raise ValueError("Set GHL_LOCATION_ID in .env")
+
+    payload: dict[str, Any] = {
+        "locationId": location_id,
+        "pageLimit": limit,
+        "sort": [{"field": "dateAdded", "direction": "desc"}],
+    }
+    data = _ghl_post_json("/contacts/search", payload)
+    contacts = data.get("contacts")
+    if contacts is None:
+        inner = data.get("data")
+        contacts = inner if isinstance(inner, list) else []
+    if not isinstance(contacts, list):
+        contacts = []
+    return contacts[:limit]
+
+
+def fetch_recent_contacts(
+    limit: int = 20, *, location_id: str | None = None
+) -> list[dict[str, Any]]:
+    """Backward-compatible alias for :func:`fetch_last_created_contacts`."""
+    return fetch_last_created_contacts(limit=limit, location_id=location_id)
+
+
+def _ghl_post_json(path: str, payload: dict[str, Any], timeout: int = 60) -> dict[str, Any]:
+    url = f"{BASE_URL}{path}"
+    response = requests.post(url, json=payload, headers=_request_headers(), timeout=timeout)
+    if not response.ok:
+        detail = response.text
+        try:
+            err = response.json()
+            if isinstance(err, dict):
+                detail = err.get("message") or err.get("error") or str(err)
+        except ValueError:
+            pass
+        raise RuntimeError(f"GHL API error {response.status_code}: {detail}")
+    data = response.json()
+    return data if isinstance(data, dict) else {}
+
+
+def _ghl_get_json(
+    path: str, params: dict[str, Any] | None = None, timeout: int = 60
+) -> dict[str, Any]:
+    url = f"{BASE_URL}{path}"
+    response = requests.get(
+        url, params=params or {}, headers=_request_headers(), timeout=timeout
+    )
+    if not response.ok:
+        detail = response.text
+        try:
+            err = response.json()
+            if isinstance(err, dict):
+                detail = err.get("message") or err.get("error") or str(err)
+        except ValueError:
+            pass
+        raise RuntimeError(f"GHL API error {response.status_code}: {detail}")
+    data = response.json()
+    return data if isinstance(data, dict) else {}
+
+
+DC_APPOINTMENT_FORM_NAME_DEFAULT = "DC Appointment Form"
+
+# Fingerprints for the “how did you hear about us?” question on form payloads (labels vary).
+_FORM_SOURCE_QUESTION_FINGERPRINTS = frozenset(
+    {
+        _field_name_fingerprint("How did you hear about us?"),
+        _field_name_fingerprint("How Did You Hear About Us?"),
+        _field_name_fingerprint("Where did you hear about us?"),
+        _field_name_fingerprint("How did you find us?"),
+    }
+)
+
+# Skip these when guessing source from unlabeled / opaque form keys.
+_FORM_FIELD_LABEL_SKIP_FINGERPRINTS = frozenset(
+    {
+        _field_name_fingerprint("email"),
+        _field_name_fingerprint("phone"),
+        _field_name_fingerprint("first name"),
+        _field_name_fingerprint("last name"),
+        _field_name_fingerprint("name"),
+        _field_name_fingerprint("message"),
+        _field_name_fingerprint("comments"),
+    }
+)
+
+
+def fetch_location_custom_fields(location_id: str | None = None) -> list[dict[str, Any]]:
+    """
+    List custom fields for the location.
+
+    Used to resolve the field id for ``How did you hear about us?`` when
+    ``GHL_HEAR_ABOUT_US_FIELD_ID`` is not set.
+    """
+    if location_id and location_id.strip():
+        location_id = location_id.strip()
+    else:
+        location_id = _location_id()
+    if not location_id:
+        raise ValueError("Set GHL_LOCATION_ID in .env")
+
+    url = f"{BASE_URL}/locations/{location_id}/customFields"
+    response = requests.get(url, headers=_request_headers(), timeout=60)
+    if not response.ok:
+        detail = response.text
+        try:
+            err = response.json()
+            if isinstance(err, dict):
+                detail = err.get("message") or err.get("error") or str(err)
+        except ValueError:
+            pass
+        raise RuntimeError(f"GHL API error {response.status_code}: {detail}")
+
+    data = response.json()
+    fields = data.get("customFields")
+    if fields is None and isinstance(data.get("data"), list):
+        fields = data["data"]
+    if not isinstance(fields, list):
+        fields = []
+    return fields
+
+
+def resolve_hear_about_us_custom_field_id(
+    location_id: str | None = None,
+    *,
+    field_name: str = HEAR_ABOUT_US_FIELD_NAME,
+) -> str:
+    """
+    Return the GHL custom field id (or key) used in search filters.
+
+    Prefer ``GHL_HEAR_ABOUT_US_FIELD_ID`` in the environment; otherwise match
+    ``field_name`` against GET /locations/.../customFields (contact model).
+    """
+    env_id = _hear_about_us_field_id()
+    if env_id:
+        return env_id
+
+    want = _normalize_field_name(field_name)
+    for f in fetch_location_custom_fields(location_id):
+        if not isinstance(f, dict):
+            continue
+        nm = f.get("name") or f.get("fieldName") or ""
+        if _normalize_field_name(str(nm)) == want:
+            fid = f.get("id") or f.get("fieldKey") or f.get("key")
+            if fid:
+                return str(fid)
+
+    raise ValueError(
+        f"No contact custom field matching {field_name!r}. "
+        "Set GHL_HEAR_ABOUT_US_FIELD_ID in .env to the field id from GHL."
+    )
+
+
+def _resolve_optional_custom_field_id(
+    location_id: str | None,
+    *,
+    env_raw: str,
+    field_name: str,
+    cached_definitions: list[dict[str, Any]] | None,
+) -> tuple[str | None, list[dict[str, Any]] | None]:
+    """Resolve a contact custom field id; reuse ``cached_definitions`` when provided."""
+    env_trim = (env_raw or "").strip()
+    if env_trim:
+        return env_trim, cached_definitions
+
+    want = _normalize_field_name(field_name)
+    definitions = cached_definitions
+    if definitions is None:
+        try:
+            definitions = fetch_location_custom_fields(location_id)
+        except Exception:
+            definitions = []
+    for f in definitions:
+        if not isinstance(f, dict):
+            continue
+        nm = f.get("name") or f.get("fieldName") or ""
+        if _normalize_field_name(str(nm)) == want:
+            fid = f.get("id") or f.get("fieldKey") or f.get("key")
+            if fid:
+                return str(fid), definitions
+    return None, definitions
+
+
+def _resolve_optional_custom_field_id_by_name_fingerprints(
+    location_id: str | None,
+    *,
+    env_raw: str,
+    fingerprints: frozenset[str],
+    cached_definitions: list[dict[str, Any]] | None,
+) -> tuple[str | None, list[dict[str, Any]] | None]:
+    """Like ``_resolve_optional_custom_field_id`` but match any field whose name fingerprint is in the set."""
+    env_trim = (env_raw or "").strip()
+    if env_trim:
+        return env_trim, cached_definitions
+
+    definitions = cached_definitions
+    if definitions is None:
+        try:
+            definitions = fetch_location_custom_fields(location_id)
+        except Exception:
+            definitions = []
+    for f in definitions:
+        if not isinstance(f, dict):
+            continue
+        nm = f.get("name") or f.get("fieldName") or ""
+        if _field_name_fingerprint(str(nm)) in fingerprints:
+            fid = f.get("id") or f.get("fieldKey") or f.get("key")
+            if fid:
+                return str(fid), definitions
+    return None, definitions
+
+
+def resolve_membership_level_custom_field_id(
+    location_id: str | None = None,
+    *,
+    field_name: str = MEMBERSHIP_LEVEL_FIELD_NAME,
+) -> str | None:
+    """
+    Return the GHL custom field id for membership level, or None if unknown.
+
+    Prefer ``GHL_MEMBERSHIP_LEVEL_FIELD_ID``; otherwise match ``field_name`` on
+    location custom fields (same lookup as hear-about-us).
+    """
+    mid, _ = _resolve_optional_custom_field_id(
+        location_id,
+        env_raw=_membership_level_field_id(),
+        field_name=field_name,
+        cached_definitions=None,
+    )
+    return mid
+
+
+def resolve_cancellation_date_custom_field_id(
+    location_id: str | None = None,
+) -> str | None:
+    """
+    Return the GHL custom field id for membership cancellation date, or None.
+
+    Prefer ``GHL_CANCELLATION_DATE_FIELD_ID``; otherwise match labels such as
+    **Membership Cancellation Date** on location custom fields.
+    """
+    fps = frozenset(_field_name_fingerprint(a) for a in CANCELLATION_DATE_FIELD_ALIASES)
+    cid, _ = _resolve_optional_custom_field_id_by_name_fingerprints(
+        location_id,
+        env_raw=_cancellation_date_field_id(),
+        fingerprints=fps,
+        cached_definitions=None,
+    )
+    return cid
+
+
+def resolve_sign_up_date_custom_field_id(
+    location_id: str | None = None,
+) -> str | None:
+    """
+    Return the GHL custom field id for sign-up date, or None if unknown.
+
+    Prefer ``GHL_SIGN_UP_DATE_FIELD_ID``; otherwise match common labels such as
+    "Sign Up Date" / "Sign-Up Date" on location custom fields.
+    """
+    fps = frozenset(_field_name_fingerprint(a) for a in SIGN_UP_DATE_FIELD_ALIASES)
+    sid, _ = _resolve_optional_custom_field_id_by_name_fingerprints(
+        location_id,
+        env_raw=_sign_up_date_field_id(),
+        fingerprints=fps,
+        cached_definitions=None,
+    )
+    return sid
+
+
+def resolve_committed_custom_field_id(
+    location_id: str | None = None,
+    *,
+    field_name: str = COMMITTED_FIELD_NAME,
+) -> str | None:
+    """
+    Return the GHL custom field id for the Committed field, or None if unknown.
+
+    Prefer ``GHL_COMMITTED_FIELD_ID``; otherwise match ``field_name`` or any
+    label in ``COMMITTED_FIELD_ALIASES`` on location custom fields.
+    """
+    env_id = (_committed_field_id() or "").strip()
+    if env_id:
+        return env_id
+    cid, defs = _resolve_optional_custom_field_id(
+        location_id,
+        env_raw="",
+        field_name=field_name,
+        cached_definitions=None,
+    )
+    if cid:
+        return cid
+    cid2, _ = _resolve_optional_custom_field_id_by_name_fingerprints(
+        location_id,
+        env_raw="",
+        fingerprints=COMMITTED_FIELD_FINGERPRINTS,
+        cached_definitions=defs,
+    )
+    return cid2
+
+
+def _parse_contact_date_added_ms(raw: Any) -> int | None:
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, (int, float)):
+        v = int(raw)
+        return v if v > 10_000_000_000 else int(v * 1000)
+    s = str(raw).strip()
+    if s.isdigit():
+        v = int(s)
+        return v if v > 10_000_000_000 else int(v * 1000)
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except ValueError:
+        return None
+
+
+def contact_created_utc_date_str(contact: dict[str, Any]) -> str | None:
+    """Calendar date ``YYYY-MM-DD`` in UTC from ``dateAdded`` or ``createdAt``."""
+    ms = _parse_contact_date_added_ms(
+        contact.get("dateAdded") or contact.get("createdAt")
+    )
+    if ms is None:
+        return None
+    dt = datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+    return dt.strftime("%Y-%m-%d")
+
+
+def _calendar_dates_inclusive(since: str, until: str) -> list[str]:
+    """Inclusive ``YYYY-MM-DD`` strings from ``since`` through ``until``."""
+    a = datetime.strptime(since, "%Y-%m-%d").date()
+    b = datetime.strptime(until, "%Y-%m-%d").date()
+    out: list[str] = []
+    d = a
+    while d <= b:
+        out.append(d.isoformat())
+        d += timedelta(days=1)
+    return out
+
+
+def _inclusive_utc_range_ms(since: str, until: str) -> tuple[int, int]:
+    """Inclusive calendar range [since, until] in UTC, as millisecond timestamps."""
+    start = datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    end_day = datetime.strptime(until, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    end = end_day + timedelta(days=1) - timedelta(microseconds=1)
+    return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
+
+
+def _ghl_custom_field_value_to_str(val: Any) -> str:
+    """Turn GHL custom field payloads (including date / option objects) into display text."""
+    if val is None:
+        return ""
+    if isinstance(val, bool):
+        return "true" if val else "false"
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        n = float(val)
+        if n == int(n):
+            iv = int(n)
+            if iv > 10_000_000_000:
+                try:
+                    dt = datetime.fromtimestamp(iv / 1000.0, tz=timezone.utc)
+                    return dt.strftime("%Y-%m-%d")
+                except (OSError, OverflowError, ValueError):
+                    pass
+            if 1_000_000_000 < iv < 10_000_000_000:
+                try:
+                    dt = datetime.fromtimestamp(float(iv), tz=timezone.utc)
+                    return dt.strftime("%Y-%m-%d")
+                except (OSError, OverflowError, ValueError):
+                    pass
+        s = str(val).strip()
+        return s if s not in ("{}", "[]", "null", "None") else ""
+    if isinstance(val, dict):
+        for k in (
+            "value",
+            "fieldValue",
+            "date",
+            "selectedValue",
+            "name",
+            "label",
+            "text",
+            "option",
+        ):
+            if k not in val or val[k] in (None, "", []):
+                continue
+            inner = _ghl_custom_field_value_to_str(val[k])
+            if inner:
+                return inner
+        return ""
+    if isinstance(val, list):
+        parts = [_ghl_custom_field_value_to_str(x) for x in val]
+        return ", ".join(p for p in parts if p)
+    s = str(val).strip()
+    if s in ("{}", "[]", "null", "None"):
+        return ""
+    return s
+
+
+def contact_custom_field_value(contact: dict[str, Any], field_id: str) -> str:
+    if not (field_id or "").strip():
+        return ""
+    cf = contact.get("customFields")
+    if isinstance(cf, dict):
+        v = cf.get(field_id)
+        return _ghl_custom_field_value_to_str(v)
+    if not isinstance(cf, list):
+        return ""
+    fid = str(field_id)
+    for item in cf:
+        if not isinstance(item, dict):
+            continue
+        iid = str(item.get("id") or "")
+        ikey = str(item.get("key") or item.get("fieldKey") or "")
+        if iid == fid or ikey == fid:
+            val = item.get("value")
+            if val is None:
+                val = item.get("fieldValue")
+            return _ghl_custom_field_value_to_str(val)
+    return ""
+
+
+def _is_facebook_or_instagram_source(value: str) -> bool:
+    v = value.strip().casefold()
+    return v in ("facebook", "instagram")
+
+
+def _search_contacts_page(
+    location_id: str,
+    filters: list[dict[str, Any]],
+    *,
+    page_limit: int,
+    search_after: list[Any] | None,
+) -> tuple[list[dict[str, Any]], list[Any] | None, int | None]:
+    payload: dict[str, Any] = {
+        "locationId": location_id,
+        "pageLimit": page_limit,
+        "filters": filters,
+    }
+    if search_after:
+        payload["searchAfter"] = search_after
+
+    data = _ghl_post_json("/contacts/search", payload)
+    contacts = data.get("contacts")
+    if contacts is None:
+        inner = data.get("data")
+        contacts = inner if isinstance(inner, list) else []
+    if not isinstance(contacts, list):
+        contacts = []
+
+    next_cursor: list[Any] | None = None
+    for key in ("searchAfter", "nextSearchAfter"):
+        cur = data.get(key)
+        if isinstance(cur, list) and cur:
+            next_cursor = cur
+            break
+    meta = data.get("meta")
+    if next_cursor is None and isinstance(meta, dict):
+        cur = meta.get("searchAfter") or meta.get("nextSearchAfter")
+        if isinstance(cur, list) and cur:
+            next_cursor = cur
+
+    total_reported: int | None = None
+    tr = data.get("total")
+    if isinstance(tr, int):
+        total_reported = tr
+    elif isinstance(tr, str) and tr.isdigit():
+        total_reported = int(tr)
+
+    return contacts, next_cursor, total_reported
+
+
+def search_contacts_by_custom_field_equals(
+    field_id: str,
+    value: str,
+    *,
+    location_id: str | None = None,
+    page_limit: int = 100,
+    max_pages: int = 50,
+) -> tuple[list[dict[str, Any]], bool]:
+    """
+    Return contacts matching customFields.<field_id> == value (paginated).
+
+    Uses POST /contacts/search with ``filters`` (operator ``eq``).
+    The second return value is True if more results may exist (pagination cap).
+    """
+    if location_id and location_id.strip():
+        location_id = location_id.strip()
+    else:
+        location_id = _location_id()
+    if not location_id:
+        raise ValueError("Set GHL_LOCATION_ID in .env")
+
+    filters = [
+        {
+            "field": f"customFields.{field_id}",
+            "operator": "eq",
+            "value": value,
+        }
+    ]
+
+    out: list[dict[str, Any]] = []
+    cursor: list[Any] | None = None
+    for _ in range(max_pages):
+        batch, cursor, _ = _search_contacts_page(
+            location_id, filters, page_limit=page_limit, search_after=cursor
+        )
+        out.extend(batch)
+        if not batch or len(batch) < page_limit or not cursor:
+            break
+    else:
+        return out, True
+    return out, False
+
+
+def search_contacts_date_added_range(
+    since: str,
+    until: str,
+    *,
+    location_id: str | None = None,
+    page_limit: int = 100,
+    max_pages: int = 500,
+) -> tuple[list[dict[str, Any]], bool, int]:
+    """
+    Contacts whose ``dateAdded`` falls in the inclusive UTC range [since, until].
+
+    Uses POST ``/contacts/search`` with ``dateAdded`` ``range`` (millisecond timestamps)
+    and **page**-based pagination (1-based). For this filter shape the API often omits
+    ``searchAfter``, so ``page`` is required to retrieve all rows.
+
+    Returns:
+        (contacts, truncated_pages, total_reported)
+        ``total_reported`` is from the API (first page), or 0 if absent.
+    """
+    if location_id and location_id.strip():
+        location_id = location_id.strip()
+    else:
+        location_id = _location_id()
+    if not location_id:
+        raise ValueError("Set GHL_LOCATION_ID in .env")
+
+    start_ms, end_ms = _inclusive_utc_range_ms(since, until)
+    filters: list[dict[str, Any]] = [
+        {
+            "field": "dateAdded",
+            "operator": "range",
+            "value": {"gte": start_ms, "lte": end_ms},
+        }
+    ]
+
+    out: list[dict[str, Any]] = []
+    total_reported = 0
+    truncated = False
+    for p in range(1, max_pages + 1):
+        payload: dict[str, Any] = {
+            "locationId": location_id,
+            "pageLimit": page_limit,
+            "page": p,
+            "filters": filters,
+        }
+        data = _ghl_post_json("/contacts/search", payload)
+        batch = data.get("contacts")
+        if batch is None:
+            inner = data.get("data")
+            batch = inner if isinstance(inner, list) else []
+        if not isinstance(batch, list):
+            batch = []
+        if p == 1:
+            tr = data.get("total")
+            if isinstance(tr, int):
+                total_reported = tr
+            elif isinstance(tr, str) and tr.isdigit():
+                total_reported = int(tr)
+        out.extend(batch)
+        if not batch or len(batch) < page_limit:
+            break
+    else:
+        truncated = True
+
+    return out, truncated, total_reported
+
+
+def classify_hear_about_wom_vs_google(raw: str) -> str | None:
+    """
+    Map **How did you hear about us?** text to **Word of mouth** or **Google**.
+
+    - **Word of mouth**: value contains ``word of mouth`` (case-insensitive), e.g.
+      picklist labels like "Word of mouth (e.g. family member, friend, etc.)".
+    - **Google**: value contains ``google`` (case-insensitive), checked after the WOM rule.
+    """
+    v = (raw or "").strip().casefold()
+    if not v:
+        return None
+    if "word of mouth" in v:
+        return "Word of mouth"
+    if "google" in v:
+        return "Google"
+    return None
+
+
+def fetch_hear_about_wom_google_monthly_by_date_added(
+    since: str,
+    until: str,
+    *,
+    location_id: str | None = None,
+    field_name: str = HEAR_ABOUT_US_FIELD_NAME,
+) -> dict[str, Any]:
+    """
+    Contacts created in [since, until] (UTC ``dateAdded``) whose **How did you hear about us?**
+    is non-blank and classifies as **Word of mouth** (*word of mouth* substring) or **Google**
+    (``google`` substring). Aggregated by calendar month of ``dateAdded``.
+    """
+    field_id = resolve_hear_about_us_custom_field_id(location_id, field_name=field_name)
+    contacts, truncated, total_reported = search_contacts_date_added_range(
+        since, until, location_id=location_id
+    )
+    start_ms, end_ms = _inclusive_utc_range_ms(since, until)
+
+    by_channel: dict[str, int] = {"Word of mouth": 0, "Google": 0}
+    blank_field = 0
+    other_value = 0
+    date_mismatch = 0
+    per_month: dict[str, dict[str, int]] = {}
+
+    for c in contacts:
+        ms = _parse_contact_date_added_ms(c.get("dateAdded") or c.get("createdAt"))
+        if ms is None or not (start_ms <= ms <= end_ms):
+            date_mismatch += 1
+            continue
+        raw = contact_custom_field_value(c, field_id)
+        if not (raw or "").strip():
+            blank_field += 1
+            continue
+        channel = classify_hear_about_wom_vs_google(raw)
+        if channel is None:
+            other_value += 1
+            continue
+        by_channel[channel] = by_channel.get(channel, 0) + 1
+        d = contact_created_utc_date_str(c)
+        if not d:
+            continue
+        try:
+            day = date.fromisoformat(d)
+        except ValueError:
+            continue
+        ym = f"{day.year:04d}-{day.month:02d}"
+        bucket = per_month.setdefault(ym, {"Word of mouth": 0, "Google": 0})
+        bucket[channel] += 1
+
+    monthly: list[dict[str, Any]] = []
+    for month_start, month_label in _month_periods_inclusive(since, until):
+        ym = month_start[:7]
+        vals = per_month.get(ym, {"Word of mouth": 0, "Google": 0})
+        monthly.append(
+            {
+                "month_start": month_start,
+                "month_label": month_label,
+                "word_of_mouth": int(vals["Word of mouth"]),
+                "google": int(vals["Google"]),
+            }
+        )
+
+    return {
+        "since": since,
+        "until": until,
+        "field_id": field_id,
+        "field_name": field_name,
+        "monthly": monthly,
+        "by_channel": by_channel,
+        "truncated_pages": truncated,
+        "total_reported_in_range": total_reported,
+        "contacts_loaded": len(contacts),
+        "blank_hear_about_in_range": blank_field,
+        "other_hear_about_in_range": other_value,
+        "date_mismatch_skipped": date_mismatch,
+    }
+
+
+def fetch_facebook_instagram_conversions(
+    since: str,
+    until: str,
+    *,
+    location_id: str | None = None,
+    field_name: str = HEAR_ABOUT_US_FIELD_NAME,
+) -> dict[str, Any]:
+    """
+    Contacts whose ``How did you hear about us?`` is Facebook or Instagram,
+    with ``dateAdded`` in the inclusive UTC range [since, until] (YYYY-MM-DD).
+
+    Align this window with Meta campaign insights (e.g. ZM Primary Care weekly
+    chart defaults).
+
+    Environment:
+        Same as ``fetch_recent_contacts``, plus optional
+        ``GHL_HEAR_ABOUT_US_FIELD_ID`` to skip resolving the field by name.
+        Optional ``GHL_MEMBERSHIP_LEVEL_FIELD_ID`` / ``GHL_SIGN_UP_DATE_FIELD_ID``
+        for table columns.
+
+    Returns:
+        {
+            "since": str,
+            "until": str,
+            "field_id": str,
+            "field_name": str,
+            "membership_level_field_id": str,  # "" if not resolved
+            "sign_up_date_field_id": str,  # "" if not resolved
+            "contacts": list of contact dicts (deduped),
+            "by_source": {"Facebook": n, "Instagram": n},
+            "daily": list of {
+                "date_start": str,  # YYYY-MM-DD UTC
+                "facebook": int,
+                "instagram": int,
+                "total": int,
+            }  # one row per calendar day in [since, until], zeros filled
+            "truncated_pages": bool  # True if pagination stopped early (safety cap)
+        }
+    """
+    field_id = resolve_hear_about_us_custom_field_id(location_id, field_name=field_name)
+    defs: list[dict[str, Any]] | None = None
+    mid, defs = _resolve_optional_custom_field_id(
+        location_id,
+        env_raw=_membership_level_field_id(),
+        field_name=MEMBERSHIP_LEVEL_FIELD_NAME,
+        cached_definitions=defs,
+    )
+    sign_fps = frozenset(_field_name_fingerprint(a) for a in SIGN_UP_DATE_FIELD_ALIASES)
+    sid, defs = _resolve_optional_custom_field_id_by_name_fingerprints(
+        location_id,
+        env_raw=_sign_up_date_field_id(),
+        fingerprints=sign_fps,
+        cached_definitions=defs,
+    )
+    membership_level_field_id = mid or ""
+    sign_up_date_field_id = sid or ""
+    start_ms, end_ms = _inclusive_utc_range_ms(since, until)
+
+    truncated = False
+    combined: dict[str, dict[str, Any]] = {}
+    for label in ("Facebook", "Instagram"):
+        raw, more = search_contacts_by_custom_field_equals(
+            field_id, label, location_id=location_id
+        )
+        truncated = truncated or more
+        for c in raw:
+            cid = str(c.get("id") or "")
+            if cid:
+                combined[cid] = c
+
+    filtered: list[dict[str, Any]] = []
+    by_source: dict[str, int] = {"Facebook": 0, "Instagram": 0}
+    for c in combined.values():
+        added_ms = _parse_contact_date_added_ms(
+            c.get("dateAdded") or c.get("createdAt")
+        )
+        if added_ms is None or not (start_ms <= added_ms <= end_ms):
+            continue
+        src = contact_custom_field_value(c, field_id)
+        if not _is_facebook_or_instagram_source(src):
+            continue
+        filtered.append(c)
+        key = "Facebook" if src.strip().casefold() == "facebook" else "Instagram"
+        by_source[key] = by_source.get(key, 0) + 1
+
+    filtered.sort(key=_contact_sort_key, reverse=True)
+
+    per_day: dict[str, dict[str, int]] = {}
+    for c in filtered:
+        d = contact_created_utc_date_str(c)
+        if not d:
+            continue
+        bucket = per_day.setdefault(d, {"Facebook": 0, "Instagram": 0})
+        src_raw = contact_custom_field_value(c, field_id).strip().casefold()
+        if src_raw == "facebook":
+            bucket["Facebook"] += 1
+        elif src_raw == "instagram":
+            bucket["Instagram"] += 1
+
+    daily: list[dict[str, Any]] = []
+    for ds in _calendar_dates_inclusive(since, until):
+        vals = per_day.get(ds, {"Facebook": 0, "Instagram": 0})
+        fb = vals["Facebook"]
+        ig = vals["Instagram"]
+        daily.append(
+            {
+                "date_start": ds,
+                "facebook": fb,
+                "instagram": ig,
+                "total": fb + ig,
+            }
+        )
+
+    return {
+        "since": since,
+        "until": until,
+        "field_id": field_id,
+        "field_name": field_name,
+        "membership_level_field_id": membership_level_field_id,
+        "sign_up_date_field_id": sign_up_date_field_id,
+        "contacts": filtered,
+        "by_source": by_source,
+        "daily": daily,
+        "truncated_pages": truncated,
+    }
+
+
+def _month_periods_inclusive(since: str, until: str) -> list[tuple[str, str]]:
+    """
+    Calendar months from the month containing ``since`` through the month
+    containing ``until`` (inclusive).
+
+    Returns list of (month_start_iso, display_label) e.g. ("2025-09-01", "Sep 2025").
+    """
+    a = datetime.strptime(since, "%Y-%m-%d").date()
+    b = datetime.strptime(until, "%Y-%m-%d").date()
+    y, m = a.year, a.month
+    end_y, end_m = b.year, b.month
+    out: list[tuple[str, str]] = []
+    while (y, m) <= (end_y, end_m):
+        first = date(y, m, 1)
+        label = first.strftime("%b %Y")
+        out.append((first.isoformat(), label))
+        if m == 12:
+            y, m = y + 1, 1
+        else:
+            m += 1
+    return out
+
+
+def _parse_submission_timestamp_ms(sub: dict[str, Any]) -> int | None:
+    for key in (
+        "submittedAt",
+        "submissionDate",
+        "dateAdded",
+        "createdAt",
+        "updatedAt",
+    ):
+        raw = sub.get(key)
+        if raw is None or raw == "":
+            continue
+        ms = _parse_contact_date_added_ms(raw)
+        if ms is not None:
+            return ms
+    return None
+
+
+def _submission_submitted_utc_date_str(sub: dict[str, Any]) -> str | None:
+    ms = _parse_submission_timestamp_ms(sub)
+    if ms is None:
+        return None
+    dt = datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+    return dt.strftime("%Y-%m-%d")
+
+
+def _iter_submission_label_value_pairs(sub: dict[str, Any]) -> list[tuple[str, str]]:
+    """Flatten common GHL form submission shapes to (label_or_key, text)."""
+    pairs: list[tuple[str, str]] = []
+
+    def add_from_mapping(m: Any, key_as_label: bool = True) -> None:
+        if not isinstance(m, dict):
+            return
+        for k, v in m.items():
+            label = str(k) if key_as_label else ""
+            text = _ghl_custom_field_value_to_str(v)
+            if text:
+                pairs.append((label, text))
+
+    add_from_mapping(sub.get("others"))
+    add_from_mapping(sub.get("formData"))
+    add_from_mapping(sub.get("data"))
+
+    for arr_key in ("fields", "customFields", "customData", "answers"):
+        arr = sub.get(arr_key)
+        if not isinstance(arr, list):
+            continue
+        for item in arr:
+            if not isinstance(item, dict):
+                continue
+            label = (
+                item.get("name")
+                or item.get("label")
+                or item.get("fieldName")
+                or item.get("title")
+                or item.get("id")
+                or item.get("fieldId")
+                or ""
+            )
+            val = item.get("value")
+            if val is None:
+                val = item.get("fieldValue")
+            text = _ghl_custom_field_value_to_str(val)
+            if text:
+                pairs.append((str(label), text))
+
+    return pairs
+
+
+def _field_label_suggests_hear_about_source(label: str) -> bool:
+    fp = _field_name_fingerprint(label)
+    if fp in _FORM_SOURCE_QUESTION_FINGERPRINTS:
+        return True
+    if "hearabout" in fp or "heardabout" in fp:
+        return True
+    if "howdidyouhear" in fp:
+        return True
+    if "where" in fp and "hear" in fp:
+        return True
+    if "findus" in fp or "foundus" in fp:
+        return True
+    return False
+
+
+def submission_hear_about_answer(sub: dict[str, Any]) -> str:
+    """Best-effort answer for how-they-heard, from submission payload."""
+    pairs = _iter_submission_label_value_pairs(sub)
+    for label, text in pairs:
+        if _field_label_suggests_hear_about_source(label):
+            return text
+    env_fp = (os.getenv("GHL_FORM_SOURCE_FIELD_FINGERPRINT") or "").strip().casefold()
+    if env_fp:
+        for label, text in pairs:
+            if _field_name_fingerprint(label).casefold() == env_fp:
+                return text
+    for label, text in pairs:
+        fp = _field_name_fingerprint(label)
+        if fp in _FORM_FIELD_LABEL_SKIP_FINGERPRINTS:
+            continue
+        if "@" in text or len(text) > 120:
+            continue
+        if _classify_word_of_mouth_vs_google(text):
+            return text
+    return ""
+
+
+def _classify_word_of_mouth_vs_google(answer: str) -> str | None:
+    """
+    Bucket form answers into **Google** vs **Word of mouth** (family, friend, etc.).
+
+    Returns ``Google``, ``Word of mouth``, or None if neither matches.
+    """
+    v = (answer or "").strip().casefold()
+    if not v:
+        return None
+    if "google" in v:
+        return "Google"
+    wom_phrases = (
+        "family member",
+        "word of mouth",
+        "neighbor",
+        "neighbour",
+        "colleague",
+        "coworker",
+        "co-worker",
+        "referral",
+        "referred",
+        "existing patient",
+        "another patient",
+        "patient referral",
+        "family/friend",
+        "friend or family",
+    )
+    for phrase in wom_phrases:
+        if phrase in v:
+            return "Word of mouth"
+    if v in ("friend", "family", "wom", "word of mouth"):
+        return "Word of mouth"
+    return None
+
+
+def fetch_forms(location_id: str | None = None) -> list[dict[str, Any]]:
+    """GET ``/forms/`` for the location (ids and names)."""
+    if location_id and location_id.strip():
+        location_id = location_id.strip()
+    else:
+        location_id = _location_id()
+    if not location_id:
+        raise ValueError("Set GHL_LOCATION_ID in .env")
+
+    data = _ghl_get_json("/forms/", {"locationId": location_id})
+    forms = data.get("forms")
+    if forms is None and isinstance(data.get("form"), dict):
+        forms = [data["form"]]
+    if forms is None:
+        inner = data.get("data")
+        forms = inner if isinstance(inner, list) else []
+    if not isinstance(forms, list):
+        forms = []
+    return [f for f in forms if isinstance(f, dict)]
+
+
+def resolve_form_id_by_name(
+    form_name: str,
+    location_id: str | None = None,
+    *,
+    env_form_id_var: str = "GHL_DC_APPOINTMENT_FORM_ID",
+) -> str:
+    env_id = (os.getenv(env_form_id_var) or "").strip()
+    if env_id:
+        return env_id
+    want = _normalize_field_name(form_name)
+    for f in fetch_forms(location_id):
+        nm = f.get("name") or f.get("title") or ""
+        if _normalize_field_name(str(nm)) == want:
+            fid = f.get("id")
+            if fid:
+                return str(fid)
+    raise ValueError(
+        f"No form matching name {form_name!r}. Set {env_form_id_var} in .env to the form id."
+    )
+
+
+def fetch_form_submissions_all(
+    form_id: str,
+    *,
+    location_id: str | None = None,
+    page_limit: int = 100,
+    max_pages: int = 500,
+    stop_when_page_oldest_before_ms: int | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """
+    Paginate GET ``/forms/submissions`` for one form.
+
+    The API accepts ``locationId``, ``formId``, ``limit``, and ``page`` (1-based);
+    ``skip`` / ``startAfterId`` are rejected with 422.
+
+    Results are newest-first. If ``stop_when_page_oldest_before_ms`` is set (e.g. range
+    start), pagination stops once the oldest submission on a page is strictly before
+    that instant (no later page can include newer rows).
+
+    Returns (submissions, truncated) where truncated is True if ``max_pages`` hit.
+    """
+    if location_id and location_id.strip():
+        location_id = location_id.strip()
+    else:
+        location_id = _location_id()
+    if not location_id:
+        raise ValueError("Set GHL_LOCATION_ID in .env")
+
+    fid = (form_id or "").strip()
+    if not fid:
+        raise ValueError("form_id is required")
+
+    out: list[dict[str, Any]] = []
+    truncated = False
+    for page in range(1, max_pages + 1):
+        data = _ghl_get_json(
+            "/forms/submissions",
+            {
+                "locationId": location_id,
+                "formId": fid,
+                "limit": page_limit,
+                "page": page,
+            },
+        )
+        batch = data.get("submissions")
+        if batch is None and isinstance(data.get("submission"), dict):
+            batch = [data["submission"]]
+        if batch is None:
+            inner = data.get("data")
+            batch = inner if isinstance(inner, list) else []
+        if not isinstance(batch, list):
+            batch = []
+        dict_batch = [s for s in batch if isinstance(s, dict)]
+        out.extend(dict_batch)
+
+        page_ms = [
+            m
+            for s in dict_batch
+            if (m := _parse_submission_timestamp_ms(s)) is not None
+        ]
+        if (
+            stop_when_page_oldest_before_ms is not None
+            and page_ms
+            and min(page_ms) < stop_when_page_oldest_before_ms
+        ):
+            break
+
+        meta = data.get("meta")
+        next_p = meta.get("nextPage") if isinstance(meta, dict) else None
+        if next_p is None:
+            break
+    else:
+        truncated = True
+
+    return out, truncated
+
+
+def fetch_dc_appointment_form_source_monthly(
+    since: str,
+    until: str,
+    *,
+    location_id: str | None = None,
+    form_name: str = DC_APPOINTMENT_FORM_NAME_DEFAULT,
+) -> dict[str, Any]:
+    """
+    **DC Appointment Form** submissions in [since, until] (UTC calendar days),
+    grouped by submission month. Each row counts **Word of mouth** vs **Google**
+    based on the “how did you hear” answer (see :func:`submission_hear_about_answer`).
+    """
+    start_ms, end_ms = _inclusive_utc_range_ms(since, until)
+    form_id = resolve_form_id_by_name(form_name, location_id)
+    submissions, truncated = fetch_form_submissions_all(
+        form_id,
+        location_id=location_id,
+        stop_when_page_oldest_before_ms=start_ms,
+    )
+
+    per_month: dict[str, dict[str, int]] = {}
+    by_bucket: dict[str, int] = {"Word of mouth": 0, "Google": 0}
+    missing_submission_date = 0
+    out_of_range = 0
+    unclassified_in_range = 0
+
+    for sub in submissions:
+        d = _submission_submitted_utc_date_str(sub)
+        sub_ms = _parse_submission_timestamp_ms(sub)
+        if not d or sub_ms is None:
+            missing_submission_date += 1
+            continue
+        try:
+            day = date.fromisoformat(d)
+        except ValueError:
+            missing_submission_date += 1
+            continue
+        if not (start_ms <= sub_ms <= end_ms):
+            out_of_range += 1
+            continue
+        ans = submission_hear_about_answer(sub)
+        bucket = _classify_word_of_mouth_vs_google(ans)
+        if bucket is None:
+            unclassified_in_range += 1
+            continue
+        by_bucket[bucket] = by_bucket.get(bucket, 0) + 1
+        ym = f"{day.year:04d}-{day.month:02d}"
+        m_bucket = per_month.setdefault(
+            ym, {"Word of mouth": 0, "Google": 0}
+        )
+        m_bucket[bucket] += 1
+
+    monthly: list[dict[str, Any]] = []
+    for month_start, month_label in _month_periods_inclusive(since, until):
+        ym = month_start[:7]
+        vals = per_month.get(ym, {"Word of mouth": 0, "Google": 0})
+        w = int(vals["Word of mouth"])
+        g = int(vals["Google"])
+        monthly.append(
+            {
+                "month_start": month_start,
+                "month_label": month_label,
+                "word_of_mouth": w,
+                "google": g,
+            }
+        )
+
+    return {
+        "since": since,
+        "until": until,
+        "form_id": form_id,
+        "form_name": form_name,
+        "monthly": monthly,
+        "by_bucket": by_bucket,
+        "truncated_pages": truncated,
+        "submissions_loaded": len(submissions),
+        "missing_submission_date": missing_submission_date,
+        "unclassified_in_range": unclassified_in_range,
+        "submissions_out_of_range": out_of_range,
+    }
+
+
+def fetch_committed_true_contacts(
+    since: str,
+    until: str,
+    *,
+    location_id: str | None = None,
+    committed_field_name: str = COMMITTED_FIELD_NAME,
+) -> dict[str, Any]:
+    """
+    Contacts where custom field ``Committed`` is true and ``dateAdded`` falls in
+    the inclusive UTC range [since, until] (YYYY-MM-DD).
+    """
+    committed_field_id = resolve_committed_custom_field_id(
+        location_id, field_name=committed_field_name
+    )
+    if not committed_field_id:
+        raise ValueError(
+            "Could not resolve the 'Committed' custom field. "
+            "Set GHL_COMMITTED_FIELD_ID in .env."
+        )
+    start_ms, end_ms = _inclusive_utc_range_ms(since, until)
+
+    truncated = False
+    combined: dict[str, dict[str, Any]] = {}
+    for val in ("TRUE", "true", "True"):
+        raw, more = search_contacts_by_custom_field_equals(
+            committed_field_id, val, location_id=location_id
+        )
+        truncated = truncated or more
+        for c in raw:
+            cid = str(c.get("id") or "")
+            if cid:
+                combined[cid] = c
+
+    filtered: list[dict[str, Any]] = []
+    for c in combined.values():
+        added_ms = _parse_contact_date_added_ms(
+            c.get("dateAdded") or c.get("createdAt")
+        )
+        if added_ms is None or not (start_ms <= added_ms <= end_ms):
+            continue
+        filtered.append(c)
+
+    filtered.sort(key=_contact_sort_key, reverse=True)
+    return {
+        "since": since,
+        "until": until,
+        "committed_field_id": committed_field_id,
+        "contacts": filtered,
+        "truncated_pages": truncated,
+    }
+
+
+def fetch_committed_yes_contacts(
+    *,
+    location_id: str | None = None,
+    committed_field_name: str = COMMITTED_FIELD_NAME,
+    max_pages: int = 100,
+) -> dict[str, Any]:
+    """
+    All contacts where the Committed custom field equals **Yes** (no date filter).
+
+    Paginates ``/contacts/search`` until results end or ``max_pages`` is hit per
+    value variant. Deduplicates by contact id.
+
+    Returns:
+        {
+            "committed_field_id": str,
+            "membership_level_field_id": str,  # "" if not resolved
+            "contacts": list of contact dicts,
+            "truncated_pages": bool,
+        }
+    """
+    committed_field_id = resolve_committed_custom_field_id(
+        location_id, field_name=committed_field_name
+    )
+    if not committed_field_id:
+        raise ValueError(
+            "Could not resolve the Committed custom field. "
+            "Set GHL_COMMITTED_FIELD_ID in .env."
+        )
+    mid = resolve_membership_level_custom_field_id(location_id)
+
+    truncated = False
+    combined: dict[str, dict[str, Any]] = {}
+    for val in ("Yes", "yes", "YES"):
+        raw, more = search_contacts_by_custom_field_equals(
+            committed_field_id,
+            val,
+            location_id=location_id,
+            max_pages=max_pages,
+        )
+        truncated = truncated or more
+        for c in raw:
+            cid = str(c.get("id") or "")
+            if cid:
+                combined[cid] = c
+
+    contacts = sorted(combined.values(), key=_contact_sort_key, reverse=True)
+    return {
+        "committed_field_id": committed_field_id,
+        "membership_level_field_id": mid or "",
+        "contacts": contacts,
+        "truncated_pages": truncated,
+    }
+
+
+def search_contacts_custom_field_date_range(
+    field_id: str,
+    since: str,
+    until: str,
+    *,
+    location_id: str | None = None,
+    page_limit: int = 100,
+    max_pages: int = 500,
+) -> tuple[list[dict[str, Any]], bool, int]:
+    """
+    Contacts whose DATE custom field is in ``[since, until]`` inclusive (YYYY-MM-DD).
+
+    Uses POST ``/contacts/search`` with operator ``range`` and
+    ``value: {"gte": since, "lte": until}``. Pagination uses the ``page`` field
+    (1-based).
+
+    Returns:
+        (contacts, truncated_pages, total_reported)
+        ``total_reported`` is the API ``total`` count from the first page, or 0.
+    """
+    if location_id and location_id.strip():
+        location_id = location_id.strip()
+    else:
+        location_id = _location_id()
+    if not location_id:
+        raise ValueError("Set GHL_LOCATION_ID in .env")
+
+    fid = (field_id or "").strip()
+    if not fid:
+        raise ValueError("field_id is required")
+
+    filters = [
+        {
+            "field": f"customFields.{fid}",
+            "operator": "range",
+            "value": {"gte": since, "lte": until},
+        }
+    ]
+
+    out: list[dict[str, Any]] = []
+    total_reported = 0
+    truncated = False
+    for p in range(1, max_pages + 1):
+        payload: dict[str, Any] = {
+            "locationId": location_id,
+            "pageLimit": page_limit,
+            "page": p,
+            "filters": filters,
+        }
+        data = _ghl_post_json("/contacts/search", payload)
+        batch = data.get("contacts")
+        if batch is None:
+            inner = data.get("data")
+            batch = inner if isinstance(inner, list) else []
+        if not isinstance(batch, list):
+            batch = []
+        if p == 1:
+            tr = data.get("total")
+            if isinstance(tr, int):
+                total_reported = tr
+            elif isinstance(tr, str) and tr.isdigit():
+                total_reported = int(tr)
+
+        out.extend(batch)
+        if not batch or len(batch) < page_limit:
+            break
+    else:
+        truncated = True
+
+    return out, truncated, total_reported
+
+
+def fetch_contacts_cancellation_date_in_range(
+    since: str,
+    until: str,
+    *,
+    location_id: str | None = None,
+) -> dict[str, Any]:
+    """
+    All contacts whose cancellation date custom field falls in ``[since, until]``
+    (inclusive calendar dates, YYYY-MM-DD).
+
+    Resolves **Membership Cancellation Date** (or ``GHL_CANCELLATION_DATE_FIELD_ID``).
+    """
+    cid = resolve_cancellation_date_custom_field_id(location_id)
+    if not cid:
+        raise ValueError(
+            "Could not resolve the cancellation date custom field. "
+            "Set GHL_CANCELLATION_DATE_FIELD_ID in .env."
+        )
+    mid = resolve_membership_level_custom_field_id(location_id)
+    contacts, truncated, total_reported = search_contacts_custom_field_date_range(
+        cid,
+        since,
+        until,
+        location_id=location_id,
+    )
+    contacts.sort(key=_contact_sort_key, reverse=True)
+    return {
+        "since": since,
+        "until": until,
+        "cancellation_field_id": cid,
+        "membership_level_field_id": mid or "",
+        "contacts": contacts,
+        "truncated_pages": truncated,
+        "total_reported": total_reported,
+    }
+
+
+def parse_membership_cancellation_date(raw: str) -> date | None:
+    """Parse **Membership Cancellation Date** style values to a calendar date."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(raw[:10], fmt).date()
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
+
+
+def fetch_cancellation_counts_by_month(
+    since: str,
+    until: str,
+    *,
+    location_id: str | None = None,
+) -> dict[str, Any]:
+    """
+    Contacts with **Membership Cancellation Date** in ``[since, until]`` (inclusive),
+    aggregated by **calendar month of that cancellation date** (same month grid as
+    :func:`fetch_hear_about_wom_google_monthly_by_date_added` for the same window).
+    """
+    base = fetch_contacts_cancellation_date_in_range(since, until, location_id=location_id)
+    fid = base["cancellation_field_id"]
+    contacts = base["contacts"]
+    per_month: dict[str, int] = {}
+    unparseable = 0
+    for c in contacts:
+        raw = contact_custom_field_value(c, fid)
+        d = parse_membership_cancellation_date(raw)
+        if d is None:
+            unparseable += 1
+            continue
+        ym = f"{d.year:04d}-{d.month:02d}"
+        per_month[ym] = per_month.get(ym, 0) + 1
+
+    monthly: list[dict[str, Any]] = []
+    for month_start, month_label in _month_periods_inclusive(since, until):
+        ym = month_start[:7]
+        monthly.append(
+            {
+                "month_start": month_start,
+                "month_label": month_label,
+                "cancellations": int(per_month.get(ym, 0)),
+            }
+        )
+
+    return {
+        "since": since,
+        "until": until,
+        "cancellation_field_id": fid,
+        "monthly": monthly,
+        "contacts_loaded": len(contacts),
+        "unparseable_cancellation_dates": unparseable,
+        "truncated_pages": base["truncated_pages"],
+        "total_reported": int(base.get("total_reported") or 0),
+    }

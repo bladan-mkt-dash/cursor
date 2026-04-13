@@ -1,0 +1,9 @@
+streamlit
+altair
+plotly
+requests
+python-dotenv
+pandas
+facebook-business
+google-analytics-data
+google-ads
