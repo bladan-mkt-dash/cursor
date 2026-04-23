@@ -170,7 +170,7 @@ fig.update_xaxes(type="category", categoryorder="array", categoryarray=quarter_o
 chart_col, table_col = st.columns([1.65, 1], gap="large")
 with chart_col:
     st.subheader("Sessions by quarter")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 with table_col:
     st.subheader("Q4 2025 → Q1 2026 (why sessions moved)")
@@ -193,7 +193,7 @@ with table_col:
         )
         st.dataframe(
             show,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             column_config={
                 "Channel": st.column_config.TextColumn("Channel"),
@@ -247,7 +247,7 @@ else:
     )
     st.dataframe(
         po_show,
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
         column_config={
             "Source / medium": st.column_config.TextColumn(
@@ -284,4 +284,4 @@ with st.expander("Quarterly table (channel breakdown)"):
     wide = wide.reset_index().sort_values(
         ["Period_start"],
     )
-    st.dataframe(wide, use_container_width=True, hide_index=True)
+    st.dataframe(wide, width="stretch", hide_index=True)

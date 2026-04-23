@@ -288,7 +288,7 @@ fig_sessions = px.bar(
     },
 )
 fig_sessions.update_layout(xaxis_type="category", yaxis_title="Sessions")
-st.plotly_chart(fig_sessions, use_container_width=True)
+st.plotly_chart(fig_sessions, width="stretch")
 
 st.subheader("New users by source / medium")
 fig_new = px.bar(
@@ -307,14 +307,14 @@ fig_new = px.bar(
     },
 )
 fig_new.update_layout(xaxis_type="category", yaxis_title="New users")
-st.plotly_chart(fig_new, use_container_width=True)
+st.plotly_chart(fig_new, width="stretch")
 
 with st.expander("Full March breakdown by source / medium (all rows)"):
     st.dataframe(
         df_detail.rename(
             columns={"Source_medium": "Source / medium", "New_Users": "New users"}
         ),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -363,7 +363,7 @@ else:
         color_discrete_map={"Branded": "#9467bd", "Non-branded": "#17becf"},
     )
     fig_brand.update_layout(xaxis_type="category", yaxis_title="Sessions")
-    st.plotly_chart(fig_brand, use_container_width=True)
+    st.plotly_chart(fig_brand, width="stretch")
 
     st.dataframe(
         df_brand[
@@ -382,7 +382,7 @@ else:
                 "Non_branded": "Non-branded (sessions)",
             }
         ),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -398,7 +398,7 @@ else:
                     "Organic_non_branded_page_title": "Organic — non-branded (page title proxy)",
                 }
             ),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -413,7 +413,7 @@ st.dataframe(
             "New_Users": "New users",
         }
     ),
-    use_container_width=True,
+    width="stretch",
     hide_index=True,
 )
 

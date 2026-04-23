@@ -151,7 +151,7 @@ else:
     )
     st.subheader("Cancellations by week (Q1 2026)")
     st.caption("Each point is the Monday starting that week; weeks with no cancellations show as zero.")
-    st.altair_chart(chart, use_container_width=True)
+    st.altair_chart(chart, width="stretch")
 
 # Optional: by membership level
 if mid:
@@ -175,7 +175,7 @@ if mid:
         .properties(height=380)
     )
     st.subheader("By membership level")
-    st.altair_chart(pie, use_container_width=True)
+    st.altair_chart(pie, width="stretch")
 
 show_table = st.checkbox("Show all records", value=False)
 if show_table:
@@ -183,4 +183,4 @@ if show_table:
     display_df["Cancellation date"] = display_df["Cancellation date"].apply(
         lambda x: x.isoformat() if isinstance(x, date) else ""
     )
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    st.dataframe(display_df, width="stretch", hide_index=True)

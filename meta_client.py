@@ -26,7 +26,15 @@ ZM_PRIMARY_CARE_CAMPAIGN_INSIGHTS_SINCE = "2026-02-01"
 
 
 def _access_token() -> str:
-    return (os.getenv("META_ACCESS_TOKEN") or os.getenv("FB_ACCESS_TOKEN") or "").strip()
+    return (
+        (
+            os.getenv("META_SYSTEM_USER_TOKEN")
+            or os.getenv("META_USER_ACCESS_TOKEN")
+            or os.getenv("META_ACCESS_TOKEN")
+            or os.getenv("FB_ACCESS_TOKEN")
+            or ""
+        ).strip()
+    )
 
 
 def _ad_account_id() -> str:
@@ -49,7 +57,10 @@ def _parse_float(value: str | None) -> float:
 def _init_api() -> AdAccount:
     token = _access_token()
     if not token:
-        raise ValueError("Set META_ACCESS_TOKEN (or FB_ACCESS_TOKEN) in .env")
+        raise ValueError(
+            "Set one of META_SYSTEM_USER_TOKEN, META_USER_ACCESS_TOKEN, "
+            "META_ACCESS_TOKEN, or FB_ACCESS_TOKEN in .env"
+        )
     FacebookAdsApi.init(access_token=token, api_version=API_VERSION)
     return AdAccount(_ad_account_id())
 

@@ -78,6 +78,10 @@ def _committed_field_id() -> str:
     return (os.getenv("GHL_COMMITTED_FIELD_ID") or "").strip()
 
 
+def _membership_cancelled_field_id() -> str:
+    return (os.getenv("GHL_MEMBERSHIP_CANCELLED_FIELD_ID") or "").strip()
+
+
 def _request_headers() -> dict[str, str]:
     token = _bearer_token()
     if not token:
@@ -103,6 +107,15 @@ def _field_name_fingerprint(name: str) -> str:
 
 COMMITTED_FIELD_FINGERPRINTS = frozenset(
     _field_name_fingerprint(a) for a in COMMITTED_FIELD_ALIASES
+)
+
+MEMBERSHIP_CANCELLED_FIELD_ALIASES = (
+    "Membership Cancelled",
+    "Membership Canceled",
+    "Membership Cancelled?",
+)
+MEMBERSHIP_CANCELLED_FIELD_FINGERPRINTS = frozenset(
+    _field_name_fingerprint(a) for a in MEMBERSHIP_CANCELLED_FIELD_ALIASES
 )
 
 
@@ -436,6 +449,35 @@ def resolve_committed_custom_field_id(
         location_id,
         env_raw="",
         fingerprints=COMMITTED_FIELD_FINGERPRINTS,
+        cached_definitions=defs,
+    )
+    return cid2
+
+
+def resolve_membership_cancelled_custom_field_id(
+    location_id: str | None = None,
+) -> str | None:
+    """
+    Return the GHL custom field id for **Membership Cancelled** (boolean / Yes-No),
+    or None if unknown.
+
+    Prefer ``GHL_MEMBERSHIP_CANCELLED_FIELD_ID``; otherwise match common labels.
+    """
+    env_id = (_membership_cancelled_field_id() or "").strip()
+    if env_id:
+        return env_id
+    cid, defs = _resolve_optional_custom_field_id(
+        location_id,
+        env_raw="",
+        field_name="Membership Cancelled",
+        cached_definitions=None,
+    )
+    if cid:
+        return cid
+    cid2, _ = _resolve_optional_custom_field_id_by_name_fingerprints(
+        location_id,
+        env_raw="",
+        fingerprints=MEMBERSHIP_CANCELLED_FIELD_FINGERPRINTS,
         cached_definitions=defs,
     )
     return cid2
@@ -1488,6 +1530,72 @@ def search_contacts_custom_field_date_range(
     return out, truncated, total_reported
 
 
+def fetch_signup_date_range_committed_yes_contacts(
+    since: str,
+    until: str,
+    *,
+    location_id: str | None = None,
+) -> dict[str, Any]:
+    """
+    Contacts whose **Sign Up Date** custom field is in ``[since, until]`` (inclusive,
+    YYYY-MM-DD) and whose **Committed?** field equals **Yes** (case-insensitive).
+
+    Uses :func:`search_contacts_custom_field_date_range` on the sign-up field, then
+    filters in memory on the committed field value.
+
+    Raises:
+        ValueError: If sign-up or committed custom field id cannot be resolved.
+
+    Returns:
+        Dict with ``contacts`` (filtered list), field ids, ``truncated_pages``,
+        ``total_reported`` from the sign-up date search (before committed filter),
+        ``signup_matches_loaded``, and ``excluded_not_committed_yes``.
+    """
+    sid = resolve_sign_up_date_custom_field_id(location_id)
+    if not sid:
+        raise ValueError(
+            "Could not resolve the Sign Up Date custom field. "
+            "Set GHL_SIGN_UP_DATE_FIELD_ID in .env."
+        )
+    committed_id = resolve_committed_custom_field_id(location_id)
+    if not committed_id:
+        raise ValueError(
+            "Could not resolve the Committed custom field. "
+            "Set GHL_COMMITTED_FIELD_ID in .env."
+        )
+    mid = resolve_membership_level_custom_field_id(location_id)
+
+    contacts, truncated, total_reported = search_contacts_custom_field_date_range(
+        sid,
+        since,
+        until,
+        location_id=location_id,
+    )
+
+    filtered: list[dict[str, Any]] = []
+    excluded_not_yes = 0
+    for c in contacts:
+        raw = contact_custom_field_value(c, committed_id).strip()
+        if raw.casefold() != "yes":
+            excluded_not_yes += 1
+            continue
+        filtered.append(c)
+
+    filtered.sort(key=_contact_sort_key, reverse=True)
+    return {
+        "since": since,
+        "until": until,
+        "sign_up_date_field_id": sid,
+        "committed_field_id": committed_id,
+        "membership_level_field_id": mid or "",
+        "contacts": filtered,
+        "truncated_pages": truncated,
+        "total_reported": total_reported,
+        "signup_matches_loaded": len(contacts),
+        "excluded_not_committed_yes": excluded_not_yes,
+    }
+
+
 def fetch_contacts_cancellation_date_in_range(
     since: str,
     until: str,
@@ -1522,6 +1630,52 @@ def fetch_contacts_cancellation_date_in_range(
         "contacts": contacts,
         "truncated_pages": truncated,
         "total_reported": total_reported,
+    }
+
+
+def fetch_cancellation_date_range_membership_cancelled_true_contacts(
+    since: str,
+    until: str,
+    *,
+    location_id: str | None = None,
+) -> dict[str, Any]:
+    """
+    Contacts whose **Membership Cancellation Date** is in ``[since, until]`` (inclusive)
+    and whose **Membership Cancelled** custom field is truthy (**true** / **yes** /
+    **1**, case-insensitive).
+
+    Raises:
+        ValueError: If cancellation date field or membership-cancelled field cannot
+        be resolved.
+    """
+    base = fetch_contacts_cancellation_date_in_range(since, until, location_id=location_id)
+    mc_id = resolve_membership_cancelled_custom_field_id(location_id)
+    if not mc_id:
+        raise ValueError(
+            "Could not resolve the Membership Cancelled custom field. "
+            "Set GHL_MEMBERSHIP_CANCELLED_FIELD_ID in .env."
+        )
+    contacts: list[dict[str, Any]] = base["contacts"]
+    filtered: list[dict[str, Any]] = []
+    excluded = 0
+    for c in contacts:
+        raw = contact_custom_field_value(c, mc_id).strip()
+        if raw.casefold() not in ("true", "yes", "1", "y"):
+            excluded += 1
+            continue
+        filtered.append(c)
+    filtered.sort(key=_contact_sort_key, reverse=True)
+    return {
+        "since": base["since"],
+        "until": base["until"],
+        "cancellation_field_id": base["cancellation_field_id"],
+        "membership_cancelled_field_id": mc_id,
+        "membership_level_field_id": base.get("membership_level_field_id") or "",
+        "contacts": filtered,
+        "truncated_pages": base["truncated_pages"],
+        "total_reported": int(base.get("total_reported") or 0),
+        "cancellation_matches_loaded": len(contacts),
+        "excluded_not_cancelled_true": excluded,
     }
 
 

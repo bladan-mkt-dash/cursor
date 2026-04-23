@@ -143,10 +143,10 @@ cpc_chart = _with_trendline(
     tooltip_format="$,.2f",
 )
 
-st.altair_chart(impressions_chart, use_container_width=True)
-st.altair_chart(clicks_chart, use_container_width=True)
-st.altair_chart(spend_chart, use_container_width=True)
-st.altair_chart(cpc_chart, use_container_width=True)
+st.altair_chart(impressions_chart, width="stretch")
+st.altair_chart(clicks_chart, width="stretch")
+st.altair_chart(spend_chart, width="stretch")
+st.altair_chart(cpc_chart, width="stretch")
 
 with st.expander("Meta — daily table"):
     st.dataframe(
@@ -159,7 +159,7 @@ with st.expander("Meta — daily table"):
                 "cpc": "Cost Per Click",
             }
         ),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
 
@@ -240,7 +240,7 @@ else:
             title="GHL — Facebook / Instagram by day (date added, UTC)",
         )
     )
-    st.altair_chart(ghl_chart, use_container_width=True)
+    st.altair_chart(ghl_chart, width="stretch")
 
     with st.expander("GHL — daily counts"):
         st.dataframe(
@@ -252,6 +252,6 @@ else:
                     "total": "Total",
                 }
             ),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )

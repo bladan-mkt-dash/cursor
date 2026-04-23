@@ -132,7 +132,7 @@ chart = (
     .properties(height=440)
 )
 
-st.altair_chart(chart, use_container_width=True)
+st.altair_chart(chart, width="stretch")
 
 st.divider()
 st.subheader(CHART2_TITLE)
@@ -201,4 +201,4 @@ elif cancel_data is not None:
         )
         .properties(height=440)
     )
-    st.altair_chart(chart2, use_container_width=True)
+    st.altair_chart(chart2, width="stretch")

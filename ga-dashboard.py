@@ -35,9 +35,9 @@ fig = px.line(
 )
 
 # Render the interactive chart in Streamlit
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, width="stretch")
 
 # Add an expandable section to view the raw numbers if needed
 with st.expander("View Raw Data Table"):
-    st.dataframe(df_ga4, use_container_width=True)
+    st.dataframe(df_ga4, width="stretch")
     

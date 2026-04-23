@@ -69,7 +69,7 @@ else:
         )
         .properties(height=400)
     )
-    st.altair_chart(pie, use_container_width=True)
+    st.altair_chart(pie, width="stretch")
 
     show_table = st.checkbox("Show contact list", value=False)
     if show_table:
@@ -87,4 +87,4 @@ else:
                     "Date added": (c.get("dateAdded") or "") or "",
                 }
             )
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.dataframe(rows, width="stretch", hide_index=True)
