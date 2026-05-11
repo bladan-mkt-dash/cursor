@@ -1,4 +1,11 @@
-"""Streamlit: Meta YoY new followers line chart (Facebook + Instagram)."""
+"""Streamlit: Meta YoY new followers line chart (Facebook + Instagram).
+
+Run:
+
+    streamlit run meta_followers_yoy_line_chart.py
+
+For year-to-date top posts only (separate browser tab / port), use `meta_top_posts_ytd.py`.
+"""
 
 from __future__ import annotations
 
@@ -418,75 +425,148 @@ def _instagram_monthly_new_followers(ig_daily: pd.DataFrame) -> pd.DataFrame:
     return monthly[["month", "new_followers"]]
 
 
+def _instagram_post_type_label(
+    media_product_type: str, media_type: str, permalink: str
+) -> str:
+    """Human-readable Instagram media type for reporting."""
+    mpt = (media_product_type or "").strip().upper()
+    mt = (media_type or "").strip().upper()
+    pl = (permalink or "").lower()
+    if mpt == "REELS" or "/reel/" in pl:
+        return "Reel"
+    if mpt == "STORY":
+        return "Story"
+    if mpt == "AD":
+        return "Ad"
+    if mt == "CAROUSEL_ALBUM":
+        return "Carousel"
+    if mt == "IMAGE":
+        return "Single image"
+    if mt == "VIDEO":
+        return "Video"
+    if mt:
+        return mt.replace("_", " ").title()
+    return "Unknown"
+
+
+def _facebook_post_type_label(post: dict[str, Any], permalink: str) -> str:
+    """Infer Facebook Page post format from attachments and permalink."""
+    pl = (permalink or "").lower()
+    if "/reel/" in pl or "facebook.com/reel/" in pl or "fb.watch/" in pl:
+        return "Reel"
+    atts = post.get("attachments") or {}
+    items = atts.get("data") or []
+    if not items:
+        return "Text / link"
+
+    first = items[0]
+    typ = (first.get("type") or "").strip().lower()
+    subs = (first.get("subattachments") or {}).get("data") or []
+    n_sub = len(subs)
+    if typ == "album" or n_sub > 1:
+        return "Carousel"
+    if typ in ("photo",) or (first.get("media_type") or "").strip().lower() == "photo":
+        return "Single image"
+    if typ in ("video_inline", "video_autoplay", "video_direct_response"):
+        return "Video"
+    if typ == "share":
+        return "Shared post"
+    if typ in ("multi_share", "native_templates"):
+        return "Link / other"
+    if typ:
+        return typ.replace("_", " ").title()
+    return "Unknown"
+
+
 def _fetch_facebook_posts_engagement(
     page_id: str, page_token: str, *, max_posts: int = 500
 ) -> pd.DataFrame:
-    fields = (
+    empty_cols = [
+        "created_time",
+        "post_id",
+        "message",
+        "permalink_url",
+        "post_type",
+        "reactions",
+        "comments",
+        "shares",
+        "engagement",
+    ]
+    fields_rich = (
+        "id,created_time,message,permalink_url,shares,"
+        "attachments{type,media_type,subattachments},"
+        "reactions.limit(0).summary(true),comments.limit(0).summary(true)"
+    )
+    fields_plain = (
         "id,created_time,message,permalink_url,shares,"
         "reactions.limit(0).summary(true),comments.limit(0).summary(true)"
     )
-    url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{page_id}/posts"
-    params: dict[str, Any] = {
-        "fields": fields,
-        "limit": 100,
-        "access_token": page_token,
-    }
+
+    def _pull(fields: str) -> list[dict[str, Any]]:
+        base = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{page_id}/posts"
+        url: str = base
+        params: dict[str, Any] = {
+            "fields": fields,
+            "limit": 100,
+            "access_token": page_token,
+        }
+        acc: list[dict[str, Any]] = []
+        while url and len(acc) < max_posts:
+            response = requests.get(url, params=params, timeout=60)
+            if not response.ok:
+                raise RuntimeError(f"HTTP {response.status_code}\n{response.text}")
+            payload = response.json()
+            err = payload.get("error")
+            if err:
+                raise RuntimeError(json.dumps(err))
+
+            for post in payload.get("data") or []:
+                reactions = (
+                    (post.get("reactions") or {}).get("summary") or {}
+                ).get("total_count", 0)
+                comments = (
+                    (post.get("comments") or {}).get("summary") or {}
+                ).get("total_count", 0)
+                shares = (post.get("shares") or {}).get("count", 0)
+                created_time = post.get("created_time")
+                created = pd.to_datetime(created_time, utc=True, errors="coerce")
+                if pd.isna(created):
+                    continue
+                engagement = int(reactions or 0) + int(comments or 0) + int(shares or 0)
+                permalink = (post.get("permalink_url") or "").strip()
+                acc.append(
+                    {
+                        "created_time": created,
+                        "post_id": str(post.get("id") or ""),
+                        "message": (post.get("message") or "").strip(),
+                        "permalink_url": permalink,
+                        "post_type": _facebook_post_type_label(post, permalink),
+                        "reactions": int(reactions or 0),
+                        "comments": int(comments or 0),
+                        "shares": int(shares or 0),
+                        "engagement": engagement,
+                    }
+                )
+                if len(acc) >= max_posts:
+                    break
+
+            next_url = (payload.get("paging") or {}).get("next")
+            url = str(next_url) if next_url else ""
+            params = {}
+        return acc
 
     rows: list[dict[str, Any]] = []
-    while url and len(rows) < max_posts:
-        response = requests.get(url, params=params, timeout=60)
-        if not response.ok:
-            raise RuntimeError(f"HTTP {response.status_code}\n{response.text}")
-        payload = response.json()
-        err = payload.get("error")
-        if err:
-            raise RuntimeError(json.dumps(err))
-
-        for post in payload.get("data") or []:
-            reactions = (
-                (post.get("reactions") or {}).get("summary") or {}
-            ).get("total_count", 0)
-            comments = (
-                (post.get("comments") or {}).get("summary") or {}
-            ).get("total_count", 0)
-            shares = (post.get("shares") or {}).get("count", 0)
-            created_time = post.get("created_time")
-            created = pd.to_datetime(created_time, utc=True, errors="coerce")
-            if pd.isna(created):
-                continue
-            engagement = int(reactions or 0) + int(comments or 0) + int(shares or 0)
-            rows.append(
-                {
-                    "created_time": created,
-                    "post_id": str(post.get("id") or ""),
-                    "message": (post.get("message") or "").strip(),
-                    "permalink_url": (post.get("permalink_url") or "").strip(),
-                    "reactions": int(reactions or 0),
-                    "comments": int(comments or 0),
-                    "shares": int(shares or 0),
-                    "engagement": engagement,
-                }
-            )
-            if len(rows) >= max_posts:
-                break
-
-        next_url = (payload.get("paging") or {}).get("next")
-        url = str(next_url) if next_url else ""
-        params = {}
+    try:
+        rows = _pull(fields_rich)
+    except RuntimeError as exc:
+        err_text = str(exc).lower()
+        if "attachment" in err_text:
+            rows = _pull(fields_plain)
+        else:
+            raise
 
     if not rows:
-        return pd.DataFrame(
-            columns=[
-                "created_time",
-                "post_id",
-                "message",
-                "permalink_url",
-                "reactions",
-                "comments",
-                "shares",
-                "engagement",
-            ]
-        )
+        return pd.DataFrame(columns=empty_cols)
 
     out = pd.DataFrame(rows)
     out = out.sort_values(["engagement", "created_time"], ascending=[False, False]).reset_index(
@@ -498,61 +578,84 @@ def _fetch_facebook_posts_engagement(
 def _fetch_instagram_posts_engagement(
     ig_user_id: str, page_token: str, *, max_posts: int = 1000
 ) -> pd.DataFrame:
-    fields = "id,caption,timestamp,permalink,like_count,comments_count"
-    url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{ig_user_id}/media"
-    params: dict[str, Any] = {
-        "fields": fields,
-        "limit": 100,
-        "access_token": page_token,
-    }
+    empty_cols = [
+        "created_time",
+        "post_id",
+        "caption",
+        "permalink_url",
+        "post_type",
+        "likes",
+        "comments",
+        "engagement",
+    ]
+    fields_rich = (
+        "id,caption,timestamp,permalink,like_count,comments_count,"
+        "media_type,media_product_type"
+    )
+    fields_plain = "id,caption,timestamp,permalink,like_count,comments_count"
+
+    def _pull(fields: str) -> list[dict[str, Any]]:
+        base = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{ig_user_id}/media"
+        url: str = base
+        params: dict[str, Any] = {
+            "fields": fields,
+            "limit": 100,
+            "access_token": page_token,
+        }
+        acc: list[dict[str, Any]] = []
+        while url and len(acc) < max_posts:
+            response = requests.get(url, params=params, timeout=60)
+            if not response.ok:
+                raise RuntimeError(f"HTTP {response.status_code}\n{response.text}")
+            payload = response.json()
+            err = payload.get("error")
+            if err:
+                raise RuntimeError(json.dumps(err))
+
+            for post in payload.get("data") or []:
+                created = pd.to_datetime(post.get("timestamp"), utc=True, errors="coerce")
+                if pd.isna(created):
+                    continue
+                likes = int(post.get("like_count") or 0)
+                comments = int(post.get("comments_count") or 0)
+                engagement = likes + comments
+                permalink = (post.get("permalink") or "").strip()
+                acc.append(
+                    {
+                        "created_time": created,
+                        "post_id": str(post.get("id") or ""),
+                        "caption": (post.get("caption") or "").strip(),
+                        "permalink_url": permalink,
+                        "post_type": _instagram_post_type_label(
+                            str(post.get("media_product_type") or ""),
+                            str(post.get("media_type") or ""),
+                            permalink,
+                        ),
+                        "likes": likes,
+                        "comments": comments,
+                        "engagement": engagement,
+                    }
+                )
+                if len(acc) >= max_posts:
+                    break
+
+            next_url = (payload.get("paging") or {}).get("next")
+            url = str(next_url) if next_url else ""
+            params = {}
+        return acc
 
     rows: list[dict[str, Any]] = []
-    while url and len(rows) < max_posts:
-        response = requests.get(url, params=params, timeout=60)
-        if not response.ok:
-            raise RuntimeError(f"HTTP {response.status_code}\n{response.text}")
-        payload = response.json()
-        err = payload.get("error")
-        if err:
-            raise RuntimeError(json.dumps(err))
-
-        for post in payload.get("data") or []:
-            created = pd.to_datetime(post.get("timestamp"), utc=True, errors="coerce")
-            if pd.isna(created):
-                continue
-            likes = int(post.get("like_count") or 0)
-            comments = int(post.get("comments_count") or 0)
-            engagement = likes + comments
-            rows.append(
-                {
-                    "created_time": created,
-                    "post_id": str(post.get("id") or ""),
-                    "caption": (post.get("caption") or "").strip(),
-                    "permalink_url": (post.get("permalink") or "").strip(),
-                    "likes": likes,
-                    "comments": comments,
-                    "engagement": engagement,
-                }
-            )
-            if len(rows) >= max_posts:
-                break
-
-        next_url = (payload.get("paging") or {}).get("next")
-        url = str(next_url) if next_url else ""
-        params = {}
+    try:
+        rows = _pull(fields_rich)
+    except RuntimeError as exc:
+        err_text = str(exc).lower()
+        if "media_type" in err_text or "media_product_type" in err_text:
+            rows = _pull(fields_plain)
+        else:
+            raise
 
     if not rows:
-        return pd.DataFrame(
-            columns=[
-                "created_time",
-                "post_id",
-                "caption",
-                "permalink_url",
-                "likes",
-                "comments",
-                "engagement",
-            ]
-        )
+        return pd.DataFrame(columns=empty_cols)
 
     out = pd.DataFrame(rows)
     out = out.sort_values(["engagement", "created_time"], ascending=[False, False]).reset_index(
@@ -647,6 +750,115 @@ def _top_instagram_posts(posts_df: pd.DataFrame, top_n: int = 7) -> pd.DataFrame
     return top[
         ["Rank", "Date", "Post preview", "Engagement", "Likes", "Comments", "Link"]
     ]
+
+
+TOP_POSTS_YTD_N = 7
+_YTD_RANK_COLS = ["Rank", "Date", "Post type", "Engagement", "Breakdown", "Preview", "URL"]
+
+
+def _empty_ytd_rank_table() -> pd.DataFrame:
+    return pd.DataFrame(columns=_YTD_RANK_COLS)
+
+
+def _finalize_ytd_ranked(df: pd.DataFrame, top_n: int) -> pd.DataFrame:
+    if df.empty:
+        return _empty_ytd_rank_table()
+    out = df.sort_values("Engagement", ascending=False).head(top_n).reset_index(drop=True)
+    out.insert(0, "Rank", range(1, len(out) + 1))
+    out["Date"] = out["Date"].dt.strftime("%Y-%m-%d")
+    return out
+
+
+def _build_ytd_ranked_post_tables(
+    fb_df: pd.DataFrame,
+    ig_df: pd.DataFrame,
+    since: pd.Timestamp,
+    *,
+    top_n: int = TOP_POSTS_YTD_N,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    From pre-fetched post DataFrames (with post_type, engagement, etc.), return
+    (facebook display table, instagram display table) for posts on/after `since`,
+    each ranked by engagement (top_n rows).
+    """
+    fb_f = fb_df.loc[fb_df["created_time"] >= since] if not fb_df.empty else fb_df
+    ig_f = ig_df.loc[ig_df["created_time"] >= since] if not ig_df.empty else ig_df
+
+    fb_rows: list[dict[str, Any]] = []
+    for _, r in fb_f.iterrows():
+        msg = str(r.get("message") or "").replace("\n", " ").strip()
+        fb_rows.append(
+            {
+                "Date": r["created_time"],
+                "Post type": str(r.get("post_type") or "Unknown"),
+                "Engagement": int(r["engagement"]),
+                "Breakdown": (
+                    f"{int(r['reactions'])} reactions, "
+                    f"{int(r['comments'])} comments, "
+                    f"{int(r['shares'])} shares"
+                ),
+                "Preview": (msg[:280] + "…") if len(msg) > 280 else (msg or "(no text)"),
+                "URL": str(r.get("permalink_url") or ""),
+            }
+        )
+
+    ig_rows: list[dict[str, Any]] = []
+    for _, r in ig_f.iterrows():
+        cap = str(r.get("caption") or "").replace("\n", " ").strip()
+        ig_rows.append(
+            {
+                "Date": r["created_time"],
+                "Post type": str(r.get("post_type") or "Unknown"),
+                "Engagement": int(r["engagement"]),
+                "Breakdown": f"{int(r['likes'])} likes, {int(r['comments'])} comments",
+                "Preview": (cap[:280] + "…") if len(cap) > 280 else (cap or "(no text)"),
+                "URL": str(r.get("permalink_url") or ""),
+            }
+        )
+
+    fb_out = _finalize_ytd_ranked(pd.DataFrame(fb_rows), top_n) if fb_rows else _empty_ytd_rank_table()
+    ig_out = _finalize_ytd_ranked(pd.DataFrame(ig_rows), top_n) if ig_rows else _empty_ytd_rank_table()
+    return fb_out, ig_out
+
+
+def fetch_ytd_top_post_display_tables(
+    since: pd.Timestamp,
+    *,
+    max_fb_posts: int,
+    max_ig_posts: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, str]:
+    """
+    Fetch Facebook/Instagram posts from Meta and return ranked YTD display tables
+    (top ``TOP_POSTS_YTD_N`` per platform). Does **not** exclude paid/boosted posts
+    (use the YoY dashboard for paid-filtered lists).
+
+    Returns ``(facebook_df, instagram_df, error_message)`` — error_message empty on success.
+    """
+    user_token = _token()
+    if not user_token:
+        return (
+            _empty_ytd_rank_table(),
+            _empty_ytd_rank_table(),
+            "Set one of META_SYSTEM_USER_TOKEN, META_USER_ACCESS_TOKEN, META_ACCESS_TOKEN, "
+            "or FB_ACCESS_TOKEN in .env.",
+        )
+
+    try:
+        page_id_pref = _preferred_page_id() or None
+        page_id, page_token = _page_access_token(user_token, page_id_pref)
+        ig_user_id = _resolve_ig_user_id(page_id, page_token)
+        posts_page_token = _page_token_for_posts(page_id, user_token)
+        fb = _fetch_facebook_posts_engagement(
+            page_id, posts_page_token, max_posts=max_fb_posts
+        )
+        ig = _fetch_instagram_posts_engagement(
+            ig_user_id, page_token, max_posts=max_ig_posts
+        )
+    except Exception as exc:
+        return _empty_ytd_rank_table(), _empty_ytd_rank_table(), str(exc)
+
+    fb_out, ig_out = _build_ytd_ranked_post_tables(fb, ig, since, top_n=TOP_POSTS_YTD_N)
+    return fb_out, ig_out, ""
 
 
 def _normalize_permalink(url: str) -> str:
@@ -842,10 +1054,12 @@ def main() -> None:
     }
     paid_markers_error = ""
     try:
-        posts_user_token = _post_ranking_user_token()
-        posts_page_token = _page_token_for_posts(page_id, posts_user_token)
+        # Same token as page resolution: stale META_USER_ACCESS_TOKEN can break
+        # `_post_ranking_user_token()` while META_SYSTEM_USER_TOKEN still works.
+        posts_page_token = _page_token_for_posts(page_id, user_token)
         try:
-            paid_markers = _fetch_paid_content_markers(posts_user_token)
+            paid_token = _post_ranking_user_token() or user_token
+            paid_markers = _fetch_paid_content_markers(paid_token)
         except Exception as exc:
             paid_markers_error = str(exc)
         fb_posts = _fetch_facebook_posts_engagement(page_id, posts_page_token)

@@ -7,3 +7,4 @@ pandas
 facebook-business
 google-analytics-data
 google-ads
+matplotlib==3.10.9
