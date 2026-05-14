@@ -14,10 +14,26 @@ DEFAULT_GOOGLE_ADS_CUSTOMER_ID = "5504078633"
 DEFAULT_GOOGLE_ADS_LOGIN_CUSTOMER_ID = "9759824543"
 CAMPAIGN_NAME = "Leads-Performance Max March '26 Restart"
 PROJECT_DIR = Path(__file__).resolve().parent
+# Altair/Vega-Lite line smoothing (avoids overshoot between points vs. "natural").
+_SMOOTH_LINE = "monotone"
+
+
+def _google_ads_yaml_path() -> Path:
+    """Config is usually at repo root (.gitignore); walk up from this script's folder."""
+    for d in [PROJECT_DIR, *PROJECT_DIR.parents]:
+        p = d / "google-ads.yaml"
+        if p.is_file():
+            return p
+    return PROJECT_DIR / "google-ads.yaml"
 
 
 def _load_ads_client() -> GoogleAdsClient:
-    client = GoogleAdsClient.load_from_storage(path=str(PROJECT_DIR / "google-ads.yaml"))
+    cfg = _google_ads_yaml_path()
+    if not cfg.is_file():
+        raise FileNotFoundError(
+            f"google-ads.yaml not found. Place it in the repo root or under {PROJECT_DIR}"
+        )
+    client = GoogleAdsClient.load_from_storage(path=str(cfg))
     client.login_customer_id = DEFAULT_GOOGLE_ADS_LOGIN_CUSTOMER_ID
     return client
 
@@ -31,28 +47,50 @@ def _to_date_string(d: date) -> str:
 
 
 @st.cache_data(show_spinner=False, ttl=900)
-def fetch_campaign_names() -> list[str]:
+def fetch_campaigns_for_filter() -> tuple[list[str], dict[str, str]]:
+    """
+    Non-removed campaigns: (names sorted active-first, then alpha), and status enum name per name.
+    """
     customer_id = DEFAULT_GOOGLE_ADS_CUSTOMER_ID.replace("-", "").strip()
     query = """
         SELECT
-            campaign.name
+            campaign.name,
+            campaign.status
         FROM campaign
         WHERE campaign.status != 'REMOVED'
         ORDER BY campaign.name
     """
     client = _load_ads_client()
     service = client.get_service("GoogleAdsService")
-    names: set[str] = set()
+    status_by_name: dict[str, str] = {}
     try:
         stream = service.search_stream(customer_id=customer_id, query=query)
         for batch in stream:
             for row in batch.results:
-                if row.campaign.name:
-                    names.add(str(row.campaign.name))
+                name = str(row.campaign.name or "").strip()
+                if not name:
+                    continue
+                stt = row.campaign.status
+                status_name = stt.name if hasattr(stt, "name") else str(stt).split(".")[-1]
+                status_by_name[name] = status_name
     except GoogleAdsException as ex:
         msg = "\n".join(err.message for err in ex.failure.errors)
         raise RuntimeError(f"Google Ads API error:\n{msg}") from ex
-    return sorted(names)
+
+    def _sort_key(nm: str) -> tuple[int, str]:
+        s = status_by_name.get(nm, "")
+        tier = 0 if s == "ENABLED" else 1
+        return (tier, nm.lower())
+
+    names = sorted(status_by_name.keys(), key=_sort_key)
+    return names, status_by_name
+
+
+def _campaign_select_format(name: str, status_by_name: dict[str, str]) -> str:
+    if status_by_name.get(name) == "ENABLED":
+        return name
+    # Light-shade prefix reads as “grayed” in the native select (no per-row HTML styling).
+    return f"░ {name} · inactive"
 
 
 @st.cache_data(show_spinner=False, ttl=900)
@@ -286,7 +324,7 @@ def make_line_chart(
 ) -> alt.Chart:
     return (
         alt.Chart(df)
-        .mark_line(color=color, point=True)
+        .mark_line(color=color, point=True, interpolate=_SMOOTH_LINE)
         .encode(
             x=alt.X("date:T", title="Date", axis=alt.Axis(format="%b %d")),
             y=alt.Y(f"{metric}:Q", title=y_title),
@@ -299,6 +337,52 @@ def make_line_chart(
     )
 
 
+def make_actual_cpa_chart_with_trend(df: pd.DataFrame) -> alt.Chart:
+    """Daily actual CPA (cost ÷ conversions) plus a linear least-squares trend line."""
+    d = df.loc[df["actual_cpa"].notna()].sort_values("date")
+    if d.empty:
+        return make_line_chart(
+            df, "actual_cpa", "Actual CPA by day", "#00897B", "Actual CPA ($)", "$,.2f"
+        )
+    if len(d) < 2:
+        return make_line_chart(
+            d, "actual_cpa", "Actual CPA by day", "#00897B", "Actual CPA ($)", "$,.2f"
+        )
+
+    x_enc = alt.X("date:T", title="Date", axis=alt.Axis(format="%b %d"))
+    y_enc = alt.Y("actual_cpa:Q", title="Actual CPA ($)")
+
+    daily = (
+        alt.Chart(d)
+        .mark_line(color="#00897B", point=True, strokeWidth=2, interpolate=_SMOOTH_LINE)
+        .encode(
+            x=x_enc,
+            y=y_enc,
+            tooltip=[
+                alt.Tooltip("date:T", title="Date", format="%Y-%m-%d"),
+                alt.Tooltip("actual_cpa:Q", title="Actual CPA", format="$,.2f"),
+            ],
+        )
+    )
+    trend = (
+        alt.Chart(d)
+        .transform_regression("date", "actual_cpa", method="linear")
+        .mark_line(color="#F57C00", strokeWidth=2.5, strokeDash=[6, 4], interpolate=_SMOOTH_LINE)
+        .encode(
+            x=x_enc,
+            y=y_enc,
+            tooltip=[
+                alt.Tooltip("date:T", title="Date (trend)", format="%Y-%m-%d"),
+                alt.Tooltip("actual_cpa:Q", title="Trend (linear fit)", format="$,.2f"),
+            ],
+        )
+    )
+    return (
+        alt.layer(daily, trend)
+        .properties(height=320, title="Actual CPA by day")
+    )
+
+
 def make_limits_step_chart(df: pd.DataFrame) -> alt.Chart:
     d = df.copy().sort_values("date")
     d["daily_budget_limit"] = d["daily_budget_limit"].replace(0, pd.NA).ffill()
@@ -306,7 +390,7 @@ def make_limits_step_chart(df: pd.DataFrame) -> alt.Chart:
 
     budget = (
         alt.Chart(d)
-        .mark_line(interpolate="step-after", color="#7E57C2", strokeWidth=3)
+        .mark_line(interpolate=_SMOOTH_LINE, color="#7E57C2", strokeWidth=3)
         .encode(
             x=alt.X("date:T", title="Date", axis=alt.Axis(format="%b %d")),
             y=alt.Y("daily_budget_limit:Q", title="Daily budget limit ($)"),
@@ -318,7 +402,7 @@ def make_limits_step_chart(df: pd.DataFrame) -> alt.Chart:
     )
     cpa = (
         alt.Chart(d)
-        .mark_line(interpolate="step-after", color="#D81B60", strokeWidth=3)
+        .mark_line(interpolate=_SMOOTH_LINE, color="#D81B60", strokeWidth=3)
         .encode(
             x=alt.X("date:T", title="Date", axis=alt.Axis(format="%b %d")),
             y=alt.Y("max_cpa_limit:Q", title="Max CPA allowance ($)"),
@@ -333,78 +417,7 @@ def make_limits_step_chart(df: pd.DataFrame) -> alt.Chart:
         .resolve_scale(y="independent")
         .properties(
             height=360,
-            title="Daily budget limit and max CPA allowance (step chart)",
-        )
-    )
-
-
-def make_limits_change_step_chart(
-    perf_df: pd.DataFrame,
-    changes_df: pd.DataFrame,
-    current_budget: float | None,
-    current_cpa: float | None,
-) -> alt.Chart | None:
-    if perf_df.empty:
-        return None
-
-    d = perf_df[["date"]].copy().sort_values("date")
-    d["daily_budget_level"] = 0
-    d["target_cpa_level"] = 0
-
-    if not changes_df.empty:
-        budget_dates = (
-            changes_df.loc[changes_df["is_budget_change"], "change_dt"].dt.normalize().drop_duplicates().tolist()
-        )
-        cpa_dates = (
-            changes_df.loc[changes_df["is_cpa_change"], "change_dt"].dt.normalize().drop_duplicates().tolist()
-        )
-        d.loc[d["date"].isin(budget_dates), "daily_budget_level"] = 1
-        d.loc[d["date"].isin(cpa_dates), "target_cpa_level"] = 1
-
-    # Cumulative step-level markers for each change event sequence.
-    d["daily_budget_level"] = d["daily_budget_level"].cumsum()
-    d["target_cpa_level"] = d["target_cpa_level"].cumsum()
-
-    melted = d.melt(
-        id_vars=["date"],
-        value_vars=["daily_budget_level", "target_cpa_level"],
-        var_name="series",
-        value_name="level",
-    )
-    label_map = {
-        "daily_budget_level": "Daily budget change count",
-        "target_cpa_level": "Target CPA change count",
-    }
-    melted["series_label"] = melted["series"].map(label_map)
-
-    latest_budget = f"${current_budget:,.2f}" if current_budget is not None else "n/a"
-    latest_cpa = f"${current_cpa:,.2f}" if current_cpa is not None else "n/a"
-    return (
-        alt.Chart(melted)
-        .mark_line(interpolate="step-after", point=False, strokeWidth=3)
-        .encode(
-            x=alt.X("date:T", title="Date", axis=alt.Axis(format="%b %d")),
-            y=alt.Y("level:Q", title="Cumulative count of limit changes"),
-            color=alt.Color(
-                "series_label:N",
-                title="Change type",
-                scale=alt.Scale(
-                    domain=["Daily budget change count", "Target CPA change count"],
-                    range=["#7E57C2", "#D81B60"],
-                ),
-            ),
-            tooltip=[
-                alt.Tooltip("date:T", title="Date", format="%Y-%m-%d"),
-                alt.Tooltip("series_label:N", title="Series"),
-                alt.Tooltip("level:Q", title="Change count", format=","),
-            ],
-        )
-        .properties(
-            height=360,
-            title=(
-                "Daily budget and Target CPA edit timeline (step chart) "
-                f"| Current limits: Budget {latest_budget}, Target CPA {latest_cpa}"
-            ),
+            title="Daily budget limit and max CPA allowance",
         )
     )
 
@@ -540,7 +553,7 @@ def make_limits_value_step_chart(
 
     return (
         alt.Chart(long_df)
-        .mark_line(interpolate="step-after", strokeWidth=3)
+        .mark_line(interpolate=_SMOOTH_LINE, strokeWidth=3)
         .encode(
             x=alt.X("date:T", title="Date", axis=alt.Axis(format="%b %d")),
             y=alt.Y(
@@ -564,7 +577,7 @@ def make_limits_value_step_chart(
         )
         .properties(
             height=360,
-            title="Daily budget and Target CPA levels over time ($ step chart)",
+            title="Daily budget and Target CPA levels over time ($)",
         )
     )
 
@@ -582,15 +595,29 @@ def main() -> None:
     with st.sidebar:
         st.subheader("Filters")
         try:
-            campaigns = fetch_campaign_names()
+            campaign_names, campaign_status = fetch_campaigns_for_filter()
         except Exception as e:
             st.error(str(e))
             st.stop()
 
+        if not campaign_names:
+            st.warning("No non-removed campaigns found for this account.")
+            st.stop()
+
+        def _fmt(n: str) -> str:
+            return _campaign_select_format(n, campaign_status)
+
+        _default = CAMPAIGN_NAME if CAMPAIGN_NAME in campaign_names else (campaign_names[0] if campaign_names else "")
         campaign = st.selectbox(
             "Campaign",
-            options=campaigns,
-            index=campaigns.index(CAMPAIGN_NAME) if CAMPAIGN_NAME in campaigns else 0,
+            options=campaign_names,
+            index=campaign_names.index(_default) if _default in campaign_names else 0,
+            format_func=_fmt,
+            help=(
+                "Serving (ENABLED) campaigns are listed first. Paused and other non-serving campaigns "
+                "show a shaded prefix and an inactive label."
+            ),
+            key="google_ads_campaign_pick",
         )
         exclude_recent = st.checkbox(
             "Exclude yesterday and today",
@@ -674,6 +701,76 @@ def main() -> None:
         ),
         width="stretch",
     )
+    st.subheader("Budget & Target CPA limit levels")
+    if change_start_date > start_date:
+        st.warning(
+            "Google Ads change history supports up to 30 days lookback. "
+            f"Change-derived charts below use {change_start_date} to {end_date}."
+        )
+    if not changes_df.empty:
+        with st.expander("Budget/Target CPA change events (raw)"):
+            show_cols = ["change_dt", "change_type", "resource_name", "changed_fields"]
+            st.dataframe(changes_df[show_cols], width="stretch", hide_index=True)
+    value_step_chart = make_limits_value_step_chart(
+        changes_df=changes_df,
+        start_date=start_date,
+        end_date=end_date,
+        current_budget=current_budget,
+        current_cpa=current_cpa,
+    )
+    if value_step_chart is not None:
+        st.altair_chart(value_step_chart, width="stretch")
+        st.caption(
+            "This chart shows actual dollar limit levels parsed from Google Ads change events "
+            "(old/new values), expanded to every day in the selected range."
+        )
+    else:
+        st.info("Could not derive daily dollar limit levels for this selected range.")
+    with st.expander("Dollar-value extraction diagnostics"):
+        value_events = extract_limit_value_events(changes_df)
+        budget_event_count = int(changes_df["is_budget_change"].sum()) if not changes_df.empty else 0
+        cpa_event_count = int(changes_df["is_cpa_change"].sum()) if not changes_df.empty else 0
+        old_nonempty = (
+            int(changes_df["old_resource"].fillna("").str.len().gt(0).sum())
+            if not changes_df.empty
+            else 0
+        )
+        new_nonempty = (
+            int(changes_df["new_resource"].fillna("").str.len().gt(0).sum())
+            if not changes_df.empty
+            else 0
+        )
+        d1, d2, d3, d4, d5 = st.columns(5)
+        d1.metric("Raw change rows", f"{len(changes_df):,}")
+        d2.metric("Budget edit rows", f"{budget_event_count:,}")
+        d3.metric("CPA edit rows", f"{cpa_event_count:,}")
+        d4.metric("Rows with old_resource", f"{old_nonempty:,}")
+        d5.metric("Rows with new_resource", f"{new_nonempty:,}")
+        if value_events.empty:
+            st.warning(
+                "No parsable dollar old/new values were extracted from current change-event payloads."
+            )
+        else:
+            st.dataframe(
+                value_events[["change_dt", "change_type", "old_value", "new_value", "resource_name"]],
+                width="stretch",
+                hide_index=True,
+            )
+
+    df_acpa = df.copy()
+    df_acpa["actual_cpa"] = (df_acpa["cost"] / df_acpa["conversions"]).where(df_acpa["conversions"] > 0)
+    if df_acpa["actual_cpa"].notna().any():
+        st.altair_chart(
+            make_actual_cpa_chart_with_trend(df_acpa),
+            width="stretch",
+        )
+        st.caption(
+            "Cost ÷ conversions for each day (teal). Orange dashed line = linear trend (least squares). "
+            "Days with zero conversions are omitted."
+        )
+    else:
+        st.info("No days with conversions in this range, so actual CPA cannot be charted.")
+
     st.altair_chart(
         make_line_chart(
             df,
@@ -685,73 +782,6 @@ def main() -> None:
         ),
         width="stretch",
     )
-    step_chart = make_limits_change_step_chart(df, changes_df, current_budget, current_cpa)
-    if step_chart is not None:
-        st.subheader("Budget & Target CPA change timeline")
-        if change_start_date > start_date:
-            st.warning(
-                "Google Ads change history supports up to 30 days lookback. "
-                f"The edit timeline below is shown for {change_start_date} to {end_date}."
-            )
-        st.altair_chart(step_chart, width="stretch")
-        st.caption(
-            "This step chart marks dates where Google Ads recorded edits to campaign budget or Target CPA. "
-            "Each upward step = one additional change event. Use it to line up setting changes with performance shifts."
-        )
-        if not changes_df.empty:
-            with st.expander("Budget/Target CPA change events (raw)"):
-                show_cols = ["change_dt", "change_type", "resource_name", "changed_fields"]
-                st.dataframe(changes_df[show_cols], width="stretch", hide_index=True)
-        value_step_chart = make_limits_value_step_chart(
-            changes_df=changes_df,
-            start_date=start_date,
-            end_date=end_date,
-            current_budget=current_budget,
-            current_cpa=current_cpa,
-        )
-        if value_step_chart is not None:
-            st.altair_chart(value_step_chart, width="stretch")
-            st.caption(
-                "This chart shows actual dollar level changes parsed from Google Ads change events "
-                "(old/new values), then expanded to every day in the selected range."
-            )
-        else:
-            st.info("Could not derive daily dollar limit levels for this selected range.")
-        with st.expander("Dollar-value extraction diagnostics"):
-            value_events = extract_limit_value_events(changes_df)
-            budget_event_count = int(changes_df["is_budget_change"].sum()) if not changes_df.empty else 0
-            cpa_event_count = int(changes_df["is_cpa_change"].sum()) if not changes_df.empty else 0
-            old_nonempty = (
-                int(changes_df["old_resource"].fillna("").str.len().gt(0).sum())
-                if not changes_df.empty
-                else 0
-            )
-            new_nonempty = (
-                int(changes_df["new_resource"].fillna("").str.len().gt(0).sum())
-                if not changes_df.empty
-                else 0
-            )
-            d1, d2, d3, d4, d5 = st.columns(5)
-            d1.metric("Raw change rows", f"{len(changes_df):,}")
-            d2.metric("Budget edit rows", f"{budget_event_count:,}")
-            d3.metric("CPA edit rows", f"{cpa_event_count:,}")
-            d4.metric("Rows with old_resource", f"{old_nonempty:,}")
-            d5.metric("Rows with new_resource", f"{new_nonempty:,}")
-            if value_events.empty:
-                st.warning(
-                    "No parsable dollar old/new values were extracted from current change-event payloads."
-                )
-            else:
-                st.dataframe(
-                    value_events[["change_dt", "change_type", "old_value", "new_value", "resource_name"]],
-                    width="stretch",
-                    hide_index=True,
-                )
-    else:
-        st.info(
-            "No performance rows for the selected date range, so change timeline cannot be rendered."
-        )
 
 
-if __name__ == "__main__":
-    main()
+main()
