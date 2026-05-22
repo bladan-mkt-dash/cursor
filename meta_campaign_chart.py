@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from pathlib import Path
 
 import altair as alt
+import numpy as np
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
@@ -15,7 +17,51 @@ from meta_client import ZM_PRIMARY_CARE_FEB_2026_CAMPAIGN_NAME, fetch_campaign_d
 # Resolves to the same GHL field as "How did you hear about us?" (picklist: Facebook / Instagram).
 GHL_HEAR_ABOUT_FIELD_NAME = "How Did You Hear About Us"
 
+
+def _linear_trend(dates: pd.Series, y: pd.Series) -> pd.Series:
+    """Ordinary least squares line over elapsed time from the first day (seconds since min date)."""
+    yf = y.astype(float)
+    if len(yf) < 2:
+        return yf
+    xd = (dates - dates.min()).dt.total_seconds().astype(float)
+    m, b = np.polyfit(xd.to_numpy(), yf.to_numpy(), 1)
+    return pd.Series(m * xd.to_numpy() + b, index=y.index)
+
+
+def _daily_line_with_trend(
+    frame: pd.DataFrame,
+    *,
+    value_col: str,
+    trend_col: str,
+    y_title: str,
+    chart_title: str,
+    value_format: str,
+):
+    x_enc = alt.X("date:T", title="Date", axis=alt.Axis(format="%b %d"))
+    line = (
+        alt.Chart(frame)
+        .mark_line(point=True)
+        .encode(
+            x=x_enc,
+            y=alt.Y(f"{value_col}:Q", title=y_title),
+            tooltip=[
+                alt.Tooltip("date:T", title="Date", format="%Y-%m-%d"),
+                alt.Tooltip(f"{value_col}:Q", title=y_title, format=value_format),
+            ],
+        )
+    )
+    trend = (
+        alt.Chart(frame)
+        .mark_line(strokeDash=[8, 4], color="#c44e52", strokeWidth=2)
+        .encode(x=x_enc, y=alt.Y(f"{trend_col}:Q", title=y_title))
+    )
+    return (line + trend).properties(height=420, title=chart_title)
+
 load_dotenv(Path(__file__).resolve().parent / ".env")
+
+_today = pd.Timestamp.today().date()
+_latest_in_range = _today - timedelta(days=1)
+_default_start = min(pd.Timestamp("2026-02-01").date(), _latest_in_range)
 
 st.set_page_config(page_title="ZM Primary Care — Meta + GHL", layout="wide")
 st.title("ZM Primary Care — Meta + GHL (Facebook / Instagram)")
@@ -30,8 +76,16 @@ with st.sidebar:
         "Campaign name (exact)",
         value=ZM_PRIMARY_CARE_FEB_2026_CAMPAIGN_NAME,
     )
-    since = st.date_input("Start date", value=pd.Timestamp("2026-02-01").date())
-    until = st.date_input("End date", value=pd.Timestamp.today().date())
+    since = st.date_input(
+        "Start date",
+        value=_default_start,
+        max_value=_latest_in_range,
+    )
+    until = st.date_input(
+        "End date (excludes today)",
+        value=_latest_in_range,
+        max_value=_latest_in_range,
+    )
 
 if not campaign_name.strip():
     st.warning("Enter a campaign name.")
@@ -64,47 +118,36 @@ if not days:
 
 df = pd.DataFrame(days)
 df["date"] = pd.to_datetime(df["date_start"])
+df = df.sort_values("date").reset_index(drop=True)
+df["impressions_trend"] = _linear_trend(df["date"], df["impressions"])
+df["clicks_trend"] = _linear_trend(df["date"], df["clicks"])
+df["spend_trend"] = _linear_trend(df["date"], df["spend"])
 
-impressions_chart = (
-    alt.Chart(df)
-    .mark_line(point=True)
-    .encode(
-        x=alt.X("date:T", title="Date", axis=alt.Axis(format="%b %d")),
-        y=alt.Y("impressions:Q", title="Impressions"),
-        tooltip=[
-            alt.Tooltip("date:T", title="Date", format="%Y-%m-%d"),
-            alt.Tooltip("impressions:Q", title="Impressions", format=","),
-        ],
-    )
-    .properties(height=420, title="Impressions by day")
+impressions_chart = _daily_line_with_trend(
+    df,
+    value_col="impressions",
+    trend_col="impressions_trend",
+    y_title="Impressions",
+    chart_title="Impressions by day",
+    value_format=",",
 )
 
-clicks_chart = (
-    alt.Chart(df)
-    .mark_line(point=True)
-    .encode(
-        x=alt.X("date:T", title="Date", axis=alt.Axis(format="%b %d")),
-        y=alt.Y("clicks:Q", title="Clicks"),
-        tooltip=[
-            alt.Tooltip("date:T", title="Date", format="%Y-%m-%d"),
-            alt.Tooltip("clicks:Q", title="Clicks", format=","),
-        ],
-    )
-    .properties(height=420, title="Clicks by day")
+clicks_chart = _daily_line_with_trend(
+    df,
+    value_col="clicks",
+    trend_col="clicks_trend",
+    y_title="Clicks",
+    chart_title="Clicks by day",
+    value_format=",",
 )
 
-spend_chart = (
-    alt.Chart(df)
-    .mark_line(point=True)
-    .encode(
-        x=alt.X("date:T", title="Date", axis=alt.Axis(format="%b %d")),
-        y=alt.Y("spend:Q", title="Spend ($)"),
-        tooltip=[
-            alt.Tooltip("date:T", title="Date", format="%Y-%m-%d"),
-            alt.Tooltip("spend:Q", title="Spend", format="$,.2f"),
-        ],
-    )
-    .properties(height=420, title="Spend by day")
+spend_chart = _daily_line_with_trend(
+    df,
+    value_col="spend",
+    trend_col="spend_trend",
+    y_title="Spend ($)",
+    chart_title="Spend by day",
+    value_format="$,.2f",
 )
 
 st.altair_chart(impressions_chart, width="stretch")

@@ -7,19 +7,19 @@ From the project directory:
 
 Then open (use **127.0.0.1**, not ``localhost``, if the browser fails — avoids IPv6)::
 
-    http://127.0.0.1:8765/
+    http://127.0.0.1:8847/
 
 Quick “is the server up?” check::
 
-    http://127.0.0.1:8765/ping
+    http://127.0.0.1:8847/ping
 
 Listen on all interfaces (firewall may prompt)::
 
     python google_ads_ghl_report_http.py --all
 
-Optional query string (defaults Q1 2026)::
+Pick dates in the page form, or use the query string (defaults Q1 2026)::
 
-    http://127.0.0.1:8765/?since=2026-01-01&until=2026-03-31
+    http://127.0.0.1:8847/?since=2026-01-01&until=2026-03-31
 
 Use a different port::
 
@@ -32,6 +32,7 @@ from __future__ import annotations
 import html
 import os
 import sys
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -40,7 +41,6 @@ import pandas as pd
 from dotenv import load_dotenv
 
 from ghl_client import (
-    classify_hear_about_wom_vs_google,
     contact_custom_field_value,
     fetch_facebook_instagram_conversions,
     fetch_signup_date_range_committed_yes_contacts,
@@ -48,7 +48,7 @@ from ghl_client import (
 )
 
 # Reuse Google Ads + tag helpers from the Streamlit module (import does not run Streamlit main).
-from google_ads_ghl_conversion_report import (
+from google_ads_ghl_conversion_report_q2_2026 import (
     _contact_has_google_ads_path_tag,
     _fetch_google_ads_daily,
     _hear_about_bucket,
@@ -77,7 +77,25 @@ a { color: #58a6ff; }
 .bar-row { display: flex; align-items: center; gap: 0.5rem; margin: 0.35rem 0; font-size: 0.8rem; }
 .bar-bg { flex: 1; height: 22px; background: #21262d; border-radius: 4px; overflow: hidden; }
 .bar-fill { height: 100%; background: #1f6feb; border-radius: 4px; }
+.range-form { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 0.75rem 1rem; margin-bottom: 0.75rem; padding: 1rem; background: #161b22; border: 1px solid #30363d; border-radius: 8px; }
+.rng-lbl { display: flex; flex-direction: column; gap: 0.35rem; font-size: 0.8rem; color: #8b949e; }
+.rng-lbl span { font-weight: 500; }
+.range-form input[type="date"] { background: #0d1117; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 0.45rem 0.5rem; font-size: 0.95rem; font-family: inherit; }
+.rng-btn { background: #238636; color: #fff; border: 1px solid #2ea043; border-radius: 6px; padding: 0.5rem 1rem; font-size: 0.9rem; font-weight: 600; cursor: pointer; font-family: inherit; }
+.rng-btn:hover { background: #2ea043; }
 """
+
+
+def _coerce_date_range(since: str, until: str) -> tuple[str, str]:
+    """If both parse as YYYY-MM-DD and start > end, swap so APIs get a valid window."""
+    try:
+        ds = datetime.strptime(since.strip()[:10], "%Y-%m-%d").date()
+        du = datetime.strptime(until.strip()[:10], "%Y-%m-%d").date()
+    except (ValueError, IndexError):
+        return since.strip(), until.strip()
+    if ds > du:
+        ds, du = du, ds
+    return ds.isoformat(), du.isoformat()
 
 
 def _build_html(since: str, until: str) -> str:
@@ -87,8 +105,18 @@ def _build_html(since: str, until: str) -> str:
         f"<title>Google Ads + GHL — {html.escape(since)} to {html.escape(until)}</title>",
         f"<style>{CSS}</style></head><body>",
         "<h1>Google Ads + GoHighLevel</h1>",
-        f"<p class='sub'>Range: <strong>{html.escape(since)}</strong> → <strong>{html.escape(until)}</strong> · "
-        "Change dates: <code>?since=YYYY-MM-DD&amp;until=YYYY-MM-DD</code></p>",
+        '<form class="range-form" method="get" action="/">',
+        '<label class="rng-lbl" for="rng-since"><span>Start date</span>',
+        f'<input type="date" name="since" id="rng-since" value="{html.escape(since)}" required /></label>',
+        '<label class="rng-lbl" for="rng-until"><span>End date</span>',
+        f'<input type="date" name="until" id="rng-until" value="{html.escape(until)}" required /></label>',
+        '<button type="submit" class="rng-btn">Apply range</button>',
+        "</form>",
+        "<script>(function(){var s=document.getElementById('rng-since'),t=document.getElementById('rng-until');"
+        "function f(){if(s&&t&&s.value&&t.value){t.min=s.value;s.max=t.value;}}if(s){s.addEventListener('change',f);}"
+        "if(t){t.addEventListener('change',f);}f();})();</script>",
+        f"<p class='sub'>Showing <strong>{html.escape(since)}</strong> → <strong>{html.escape(until)}</strong>."
+        " Optional: <code>?since=YYYY-MM-DD&amp;until=YYYY-MM-DD</code> in the URL.</p>",
     ]
 
     # --- Google Ads ---
@@ -250,6 +278,7 @@ class ReportHandler(BaseHTTPRequestHandler):
         qs = parse_qs(parsed.query)
         since = (qs.get("since") or ["2026-01-01"])[0].strip()
         until = (qs.get("until") or ["2026-03-31"])[0].strip()
+        since, until = _coerce_date_range(since, until)
 
         body = _build_html(since, until).encode("utf-8")
         self.send_response(200)
@@ -261,7 +290,7 @@ class ReportHandler(BaseHTTPRequestHandler):
 
 def _parse_args(argv: list[str]) -> tuple[str, int]:
     host = "127.0.0.1"
-    port = 8765
+    port = 8847
     for a in argv[1:]:
         if a == "--all":
             host = "0.0.0.0"

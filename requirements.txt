@@ -7,4 +7,7 @@ pandas
 facebook-business
 google-analytics-data
 google-ads
+google-auth-oauthlib
+google-auth-httplib2
+google-api-python-client
 matplotlib==3.10.9

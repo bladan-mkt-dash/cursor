@@ -1,8 +1,11 @@
+import html
 import os
+import re
 from datetime import date
 from pathlib import Path
 
 import pandas as pd
+import requests
 from dotenv import load_dotenv
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from google.analytics.data_v1beta.types import (
@@ -59,6 +62,30 @@ def _host_contains_filter(substring: str) -> FilterExpression:
             string_filter=Filter.StringFilter(
                 match_type=Filter.StringFilter.MatchType.CONTAINS,
                 value=substring,
+            ),
+        )
+    )
+
+
+def _full_page_url_contains_filter(substring: str) -> FilterExpression:
+    return FilterExpression(
+        filter=Filter(
+            field_name="fullPageUrl",
+            string_filter=Filter.StringFilter(
+                match_type=Filter.StringFilter.MatchType.CONTAINS,
+                value=substring,
+            ),
+        )
+    )
+
+
+def _page_path_begins_with_filter(prefix: str) -> FilterExpression:
+    return FilterExpression(
+        filter=Filter(
+            field_name="pagePath",
+            string_filter=Filter.StringFilter(
+                match_type=Filter.StringFilter.MatchType.BEGINS_WITH,
+                value=prefix,
             ),
         )
     )
@@ -787,6 +814,170 @@ def get_organic_and_paid_search_sessions_by_quarter(
     df = df.astype({"Channel": ch_order})
     return df.sort_values(["Year", "Quarter_num", "Channel"]).reset_index(
         drop=True
+    )
+
+
+_BLOG_SITE_ORIGIN = "https://fivejourneys.com"
+_BLOG_PAGINATION_PATH = re.compile(r"^/blog/\d+/?$")
+_BLOG_PAGE_PAGINATION_PATH = re.compile(r"^/blog/page/\d+/?$")
+
+
+def _normalize_blog_page_path(page_path: str) -> str:
+    """Strip tel: junk and return a path starting with ``/blog``."""
+    path = (page_path or "").split("tel:")[0].split("?")[0].strip()
+    if not path.startswith("/"):
+        path = f"/{path.lstrip('/')}"
+    return path.rstrip("/") or "/"
+
+
+def _blog_page_path_to_url(page_path: str) -> str:
+    path = _normalize_blog_page_path(page_path)
+    if path == "/blog":
+        return f"{_BLOG_SITE_ORIGIN}/blog/"
+    return f"{_BLOG_SITE_ORIGIN}{path}/"
+
+
+def _is_blog_article_path(page_path: str) -> bool:
+    path = _normalize_blog_page_path(page_path)
+    if path in ("/blog", "/blog/"):
+        return False
+    if _BLOG_PAGINATION_PATH.match(path):
+        return False
+    if _BLOG_PAGE_PAGINATION_PATH.match(path):
+        return False
+    slug = path.removeprefix("/blog/").strip("/")
+    return bool(slug) and not slug.isdigit()
+
+
+_WP_POSTS_API = "https://fivejourneys.com/wp-json/wp/v2/posts"
+
+
+def _fetch_fivejourneys_blog_posts() -> list[dict[str, str]]:
+    """Published posts from WordPress (canonical ``link`` + ``slug`` + title)."""
+    posts: list[dict[str, str]] = []
+    page = 1
+    while page <= 50:
+        resp = requests.get(
+            _WP_POSTS_API,
+            params={
+                "per_page": 100,
+                "page": page,
+                "_fields": "link,slug,title",
+            },
+            timeout=30,
+            headers={"User-Agent": "FiveJourneys-GA4-Report/1.0"},
+        )
+        if resp.status_code != 200:
+            break
+        batch = resp.json()
+        if not batch:
+            break
+        for item in batch:
+            link = (item.get("link") or "").strip()
+            if link and not link.endswith("/"):
+                link += "/"
+            posts.append(
+                {
+                    "slug": item["slug"],
+                    "link": link,
+                    "title": html.unescape(item["title"]["rendered"]),
+                }
+            )
+        page += 1
+    return posts
+
+
+def _slug_from_ga4_page_path(page_path: str) -> str:
+    path = _normalize_blog_page_path(page_path)
+    if path.startswith("/blog/"):
+        return path.removeprefix("/blog/").strip("/").split("/")[0]
+    return path.strip("/").split("/")[0]
+
+
+def get_top_blog_posts_by_views(
+    *,
+    limit: int = 20,
+    start_date: str = "365daysAgo",
+    end_date: str = "today",
+) -> pd.DataFrame:
+    """
+    Top **blog posts** by GA4 **screen page views**, highest first.
+
+    Matches GA4 ``pagePath`` to WordPress post slugs (e.g. ``/how-to-increase-leptin-sensitivity/``
+    and legacy ``/blog/old-slug/``). Returns each post's **canonical URL** from WordPress
+    (listed on https://fivejourneys.com/blog/ but usually ``https://fivejourneys.com/{slug}/``,
+    not ``/blog/2/`` pagination URLs).
+
+    Requires ``GOOGLE_APPLICATION_CREDENTIALS`` and ``GA4_PROPERTY_ID``.
+    """
+    if limit < 1:
+        raise ValueError("limit must be at least 1")
+
+    wp_posts = _fetch_fivejourneys_blog_posts()
+    if not wp_posts:
+        raise RuntimeError("Could not load blog posts from WordPress API")
+
+    by_slug = {p["slug"]: p for p in wp_posts}
+
+    _ensure_ga_credentials()
+    property_id = _strip_env(os.getenv("GA4_PROPERTY_ID"))
+    if not property_id:
+        raise ValueError("Set GA4_PROPERTY_ID in .env")
+
+    client = BetaAnalyticsDataClient()
+    rows = _run_report_paginated(
+        client,
+        property_id=property_id,
+        dimensions=[Dimension(name="pagePath")],
+        metrics=[Metric(name="screenPageViews")],
+        start_date=start_date,
+        end_date=end_date,
+        dimension_filter=None,
+    )
+
+    views_by_slug: dict[str, int] = {}
+    for row in rows:
+        page_path = (
+            row.dimension_values[0].value if row.dimension_values else ""
+        ) or ""
+        slug = _slug_from_ga4_page_path(page_path)
+        if slug not in by_slug:
+            continue
+        views = int(row.metric_values[0].value) if row.metric_values else 0
+        views_by_slug[slug] = views_by_slug.get(slug, 0) + views
+
+    if not views_by_slug:
+        return pd.DataFrame(columns=["Rank", "Post_title", "Page_URL", "Views"])
+
+    ranked = sorted(views_by_slug.items(), key=lambda item: item[1], reverse=True)[
+        :limit
+    ]
+    records: list[dict[str, object]] = []
+    for rank, (slug, views) in enumerate(ranked, start=1):
+        post = by_slug[slug]
+        records.append(
+            {
+                "Rank": rank,
+                "Post_title": post["title"],
+                "Page_URL": post["link"],
+                "Views": views,
+            }
+        )
+
+    return pd.DataFrame(records)
+
+
+def get_top_blog_pages_by_views(
+    *,
+    limit: int = 20,
+    start_date: str = "365daysAgo",
+    end_date: str = "today",
+    articles_only: bool = False,
+) -> pd.DataFrame:
+    """Alias for :func:`get_top_blog_posts_by_views` (``articles_only`` is ignored)."""
+    del articles_only
+    return get_top_blog_posts_by_views(
+        limit=limit, start_date=start_date, end_date=end_date
     )
 
 
