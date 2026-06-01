@@ -52,7 +52,7 @@ from war_room_data import (
     load_website_traffic,
 )
 
-load_dotenv(Path(__file__).resolve().parent / ".env")
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 # Bump when loader logic changes — invalidates @st.cache_data without a server restart.
 WAR_ROOM_LOADER_VERSION = "2026-06-01-v2"
