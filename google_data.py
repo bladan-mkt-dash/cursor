@@ -172,6 +172,104 @@ def _ensure_ga_credentials() -> None:
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(path)
 
 
+def get_ga4_sessions_total(start_date: str, end_date: str) -> int:
+    """
+    Property-wide GA4 **sessions** for ``start_date`` through ``end_date`` inclusive.
+
+    Dates may be ISO ``YYYY-MM-DD`` or GA4 relative strings such as ``today``.
+    """
+    sessions, _ = get_ga4_traffic_totals(start_date, end_date)
+    return sessions
+
+
+def get_ga4_traffic_totals(start_date: str, end_date: str) -> tuple[int, int]:
+    """
+    Property-wide GA4 **sessions** and **total users** for an inclusive date range.
+
+    Dates may be ISO ``YYYY-MM-DD`` or GA4 relative strings such as ``today``.
+    """
+    _ensure_ga_credentials()
+    property_id = _strip_env(os.getenv("GA4_PROPERTY_ID"))
+    if not property_id:
+        raise ValueError("Set GA4_PROPERTY_ID in .env")
+
+    client = BetaAnalyticsDataClient()
+    request = RunReportRequest(
+        property=f"properties/{property_id}",
+        metrics=[Metric(name="sessions"), Metric(name="totalUsers")],
+        date_ranges=[DateRange(start_date=start_date, end_date=end_date)],
+    )
+    response = client.run_report(request)
+    if not response.rows:
+        return 0, 0
+    row = response.rows[0]
+    return (
+        int(row.metric_values[0].value),
+        int(row.metric_values[1].value),
+    )
+
+
+def _page_path_filter_expression(page_paths: list[str]) -> FilterExpression:
+    path_exprs: list[FilterExpression] = []
+    for raw in page_paths:
+        path = raw if raw.startswith("/") else f"/{raw}"
+        path_exprs.append(
+            FilterExpression(
+                filter=Filter(
+                    field_name="pagePath",
+                    string_filter=Filter.StringFilter(
+                        match_type=Filter.StringFilter.MatchType.EXACT,
+                        value=path,
+                    ),
+                )
+            )
+        )
+        if not path.endswith("/"):
+            path_exprs.append(
+                FilterExpression(
+                    filter=Filter(
+                        field_name="pagePath",
+                        string_filter=Filter.StringFilter(
+                            match_type=Filter.StringFilter.MatchType.EXACT,
+                            value=f"{path}/",
+                        ),
+                    )
+                )
+            )
+    if not path_exprs:
+        raise ValueError("page_paths must not be empty")
+    return FilterExpression(or_group=FilterExpressionList(expressions=path_exprs))
+
+
+def get_ga4_screen_page_views_for_paths(
+    page_paths: list[str],
+    start_date: str,
+    end_date: str,
+) -> int:
+    """
+    Sum GA4 **screenPageViews** for exact ``pagePath`` matches over a date range.
+    """
+    if not page_paths:
+        return 0
+
+    _ensure_ga_credentials()
+    property_id = _strip_env(os.getenv("GA4_PROPERTY_ID"))
+    if not property_id:
+        raise ValueError("Set GA4_PROPERTY_ID in .env")
+
+    client = BetaAnalyticsDataClient()
+    rows = _run_report_paginated(
+        client,
+        property_id=property_id,
+        dimensions=[Dimension(name="pagePath")],
+        metrics=[Metric(name="screenPageViews")],
+        start_date=start_date,
+        end_date=end_date,
+        dimension_filter=_page_path_filter_expression(page_paths),
+    )
+    return sum(int(row.metric_values[0].value) for row in rows)
+
+
 def get_ga4_data():
     _ensure_ga_credentials()
     client = BetaAnalyticsDataClient()
@@ -490,6 +588,96 @@ def get_sessions_by_session_default_channel_group(
     if df.empty:
         return df
     return df.sort_values("Sessions", ascending=False).reset_index(drop=True)
+
+
+def get_organic_search_sessions(start_date: str, end_date: str) -> int:
+    """Property **sessions** from the **Organic Search** default channel group."""
+    channels = get_sessions_by_session_default_channel_group(start_date, end_date)
+    if channels.empty:
+        return 0
+    organic = channels.loc[
+        channels["Session_default_channel_group"] == "Organic Search", "Sessions"
+    ]
+    if organic.empty:
+        return 0
+    return int(organic.iloc[0])
+
+
+def get_top_landing_page_by_sessions(
+    start_date: str,
+    end_date: str,
+) -> tuple[str | None, int | None]:
+    """
+    Landing page with the most **sessions** in the date range.
+
+    Returns ``(landing_page_path, sessions)`` or ``(None, None)`` if no data.
+    """
+    _ensure_ga_credentials()
+    property_id = _strip_env(os.getenv("GA4_PROPERTY_ID"))
+    if not property_id:
+        raise ValueError("Set GA4_PROPERTY_ID in .env")
+
+    client = BetaAnalyticsDataClient()
+    rows = _run_report_paginated(
+        client,
+        property_id=property_id,
+        dimensions=[Dimension(name="landingPage")],
+        metrics=[Metric(name="sessions")],
+        start_date=start_date,
+        end_date=end_date,
+        dimension_filter=None,
+    )
+    best_path: str | None = None
+    best_sessions = -1
+    for row in rows:
+        path = (row.dimension_values[0].value if row.dimension_values else "") or ""
+        sessions = int(row.metric_values[0].value) if row.metric_values else 0
+        if sessions > best_sessions:
+            best_sessions = sessions
+            best_path = path or None
+    if best_path is None or best_sessions < 0:
+        return None, None
+    return best_path, best_sessions
+
+
+def get_blog_pageviews_total(start_date: str, end_date: str) -> int:
+    """
+    Sum GA4 **screenPageViews** for Five Journeys blog posts in a date range.
+
+    Matches GA4 ``pagePath`` values to WordPress post slugs (same rules as
+    :func:`get_top_blog_posts_by_views`).
+    """
+    wp_posts = _fetch_fivejourneys_blog_posts()
+    if not wp_posts:
+        raise RuntimeError("Could not load blog posts from WordPress API")
+    by_slug = {p["slug"]: p for p in wp_posts}
+
+    _ensure_ga_credentials()
+    property_id = _strip_env(os.getenv("GA4_PROPERTY_ID"))
+    if not property_id:
+        raise ValueError("Set GA4_PROPERTY_ID in .env")
+
+    client = BetaAnalyticsDataClient()
+    rows = _run_report_paginated(
+        client,
+        property_id=property_id,
+        dimensions=[Dimension(name="pagePath")],
+        metrics=[Metric(name="screenPageViews")],
+        start_date=start_date,
+        end_date=end_date,
+        dimension_filter=None,
+    )
+
+    views_by_slug: dict[str, int] = {}
+    for row in rows:
+        page_path = (row.dimension_values[0].value if row.dimension_values else "") or ""
+        slug = _slug_from_ga4_page_path(page_path)
+        if slug not in by_slug:
+            continue
+        views = int(row.metric_values[0].value) if row.metric_values else 0
+        views_by_slug[slug] = views_by_slug.get(slug, 0) + views
+
+    return sum(views_by_slug.values())
 
 
 def compare_session_default_channel_sessions(

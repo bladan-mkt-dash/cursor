@@ -564,3 +564,37 @@ def summarize_items(df: pd.DataFrame) -> dict[str, Any]:
         "overdue_count": overdue_count,
         "unassigned_count": unassigned,
     }
+
+
+def resolve_board_ids_by_names(
+    names: list[str],
+    *,
+    page_size: int = 100,
+    max_pages: int = 10,
+) -> tuple[dict[str, str], list[str]]:
+    """
+    Resolve board ids by **exact** board name.
+
+    Returns:
+        (name_to_id, missing_names)
+    """
+    wanted = [n.strip() for n in names if n and n.strip()]
+    if not wanted:
+        return {}, []
+
+    catalog: dict[str, str] = {}
+    for page in range(1, max_pages + 1):
+        batch = list_boards(limit=page_size, page=page)
+        if not batch:
+            break
+        for board in batch:
+            name = str(board.get("name") or "").strip()
+            board_id = board.get("id")
+            if name and board_id and name not in catalog:
+                catalog[name] = str(board_id)
+        if len(batch) < page_size:
+            break
+
+    found = {name: catalog[name] for name in wanted if name in catalog}
+    missing = [name for name in wanted if name not in catalog]
+    return found, missing

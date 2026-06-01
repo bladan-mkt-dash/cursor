@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -1741,3 +1742,208 @@ def fetch_cancellation_counts_by_month(
         "truncated_pages": base["truncated_pages"],
         "total_reported": int(base.get("total_reported") or 0),
     }
+
+
+def _event_date_added_ymd(event: dict[str, Any]) -> str | None:
+    return _event_timestamp_ymd(event.get("dateAdded"))
+
+
+def _event_start_time_ymd(event: dict[str, Any]) -> str | None:
+    return _event_timestamp_ymd(event.get("startTime"))
+
+
+def _event_timestamp_ymd(raw: Any) -> str | None:
+    if raw is None or raw == "":
+        return None
+    text = str(raw).strip()
+    if text.isdigit():
+        dt = datetime.fromtimestamp(int(text) / 1000, tz=timezone.utc)
+        return dt.date().isoformat()
+    if len(text) >= 10 and text[4] == "-" and text[7] == "-":
+        return text[:10]
+    return None
+
+
+@dataclass(frozen=True)
+class CalendarFunnelCounts:
+    bookings: int
+    meetings: int
+    calendar_api_errors: int
+
+
+def count_calendar_funnel_events(
+    since: str,
+    until: str,
+    *,
+    location_id: str | None = None,
+) -> CalendarFunnelCounts:
+    """
+    Count calendar funnel events in ``[since, until]`` inclusive (YYYY-MM-DD).
+
+    - **Bookings** — non-deleted events whose ``dateAdded`` falls in range.
+    - **Meetings** — non-deleted events whose ``startTime`` falls in range.
+
+    Uses one calendar scan with a wide ``startTime`` fetch window so future-dated
+    bookings are included.
+    """
+    if location_id and location_id.strip():
+        loc = location_id.strip()
+    else:
+        loc = _location_id()
+    if not loc:
+        raise ValueError("Set GHL_LOCATION_ID in .env")
+
+    since_date = date.fromisoformat(since)
+    until_date = date.fromisoformat(until)
+    window_start = datetime.combine(
+        since_date - timedelta(days=7), datetime.min.time(), tzinfo=timezone.utc
+    )
+    window_end = datetime.combine(
+        until_date + timedelta(days=180), datetime.max.time(), tzinfo=timezone.utc
+    )
+    start_ms = str(int(window_start.timestamp() * 1000))
+    end_ms = str(int(window_end.timestamp() * 1000))
+
+    headers = _request_headers()
+    response = requests.get(
+        f"{BASE_URL}/calendars/",
+        params={"locationId": loc},
+        headers=headers,
+        timeout=60,
+    )
+    response.raise_for_status()
+    calendars = response.json().get("calendars") or []
+
+    allowed_days = {
+        (since_date + timedelta(days=offset)).isoformat()
+        for offset in range((until_date - since_date).days + 1)
+    }
+
+    seen_ids: set[str] = set()
+    bookings = 0
+    meetings = 0
+    api_errors = 0
+
+    for calendar in calendars:
+        calendar_id = calendar.get("id")
+        if not calendar_id:
+            continue
+        events_response = requests.get(
+            f"{BASE_URL}/calendars/events",
+            params={
+                "locationId": loc,
+                "calendarId": calendar_id,
+                "startTime": start_ms,
+                "endTime": end_ms,
+            },
+            headers=headers,
+            timeout=90,
+        )
+        if not events_response.ok:
+            api_errors += 1
+            continue
+        for event in events_response.json().get("events") or []:
+            event_id = event.get("id")
+            if not event_id or str(event_id) in seen_ids:
+                continue
+            seen_ids.add(str(event_id))
+            if event.get("deleted"):
+                continue
+            added_day = _event_date_added_ymd(event)
+            if added_day in allowed_days:
+                bookings += 1
+            meeting_day = _event_start_time_ymd(event)
+            if meeting_day in allowed_days:
+                meetings += 1
+
+    return CalendarFunnelCounts(
+        bookings=bookings,
+        meetings=meetings,
+        calendar_api_errors=api_errors,
+    )
+
+
+def count_calendar_bookings_by_date_added(
+    since: str,
+    until: str,
+    *,
+    location_id: str | None = None,
+) -> tuple[int, int]:
+    """
+    Count non-deleted calendar events whose ``dateAdded`` falls on days in
+    ``[since, until]`` inclusive (YYYY-MM-DD).
+
+    Scans events with ``startTime`` from seven days before ``since`` through
+    180 days after ``until`` so future-dated appointments booked in-range are
+    included.
+
+    Returns:
+        (booking_count, calendar_api_errors)
+    """
+    if location_id and location_id.strip():
+        loc = location_id.strip()
+    else:
+        loc = _location_id()
+    if not loc:
+        raise ValueError("Set GHL_LOCATION_ID in .env")
+
+    since_date = date.fromisoformat(since)
+    until_date = date.fromisoformat(until)
+    window_start = datetime.combine(
+        since_date - timedelta(days=7), datetime.min.time(), tzinfo=timezone.utc
+    )
+    window_end = datetime.combine(
+        until_date + timedelta(days=180), datetime.max.time(), tzinfo=timezone.utc
+    )
+    start_ms = str(int(window_start.timestamp() * 1000))
+    end_ms = str(int(window_end.timestamp() * 1000))
+
+    headers = _request_headers()
+    response = requests.get(
+        f"{BASE_URL}/calendars/",
+        params={"locationId": loc},
+        headers=headers,
+        timeout=60,
+    )
+    response.raise_for_status()
+    calendars = response.json().get("calendars") or []
+
+    allowed_days = {
+        (since_date + timedelta(days=offset)).isoformat()
+        for offset in range((until_date - since_date).days + 1)
+    }
+
+    seen_ids: set[str] = set()
+    booking_count = 0
+    api_errors = 0
+
+    for calendar in calendars:
+        calendar_id = calendar.get("id")
+        if not calendar_id:
+            continue
+        events_response = requests.get(
+            f"{BASE_URL}/calendars/events",
+            params={
+                "locationId": loc,
+                "calendarId": calendar_id,
+                "startTime": start_ms,
+                "endTime": end_ms,
+            },
+            headers=headers,
+            timeout=90,
+        )
+        if not events_response.ok:
+            api_errors += 1
+            continue
+        for event in events_response.json().get("events") or []:
+            event_id = event.get("id")
+            if not event_id or str(event_id) in seen_ids:
+                continue
+            seen_ids.add(str(event_id))
+            if event.get("deleted"):
+                continue
+            added_day = _event_date_added_ymd(event)
+            if added_day in allowed_days:
+                booking_count += 1
+
+    return booking_count, api_errors

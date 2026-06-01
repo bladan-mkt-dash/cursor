@@ -159,6 +159,106 @@ def fetch_last_30_days_insights() -> dict[str, Any]:
     }
 
 
+_LEAD_ACTION_TYPES = frozenset(
+    {
+        "lead",
+        "onsite_conversion.lead_grouped",
+        "offsite_conversion.fb_pixel_lead",
+    }
+)
+
+
+def _lead_count_from_actions(actions: list[dict[str, Any]] | None) -> int:
+    total = 0
+    for action in actions or []:
+        if (action.get("action_type") or "") in _LEAD_ACTION_TYPES:
+            total += int(_parse_float(action.get("value")))
+    return total
+
+
+def fetch_account_daily_insights(
+    *,
+    since: str,
+    until: str,
+) -> dict[str, Any]:
+    """
+    Ad-account daily spend, clicks, and lead actions for an inclusive date range.
+
+    Args:
+        since: YYYY-MM-DD start date.
+        until: YYYY-MM-DD end date.
+
+    Returns:
+        {
+            "daily": list of {
+                "date_start", "spend", "impressions", "clicks", "leads"
+            },
+            "totals": { "spend", "impressions", "clicks", "leads" },
+        }
+    """
+    account = _init_api()
+    fields = [
+        "spend",
+        "impressions",
+        "clicks",
+        "actions",
+        "date_start",
+        "date_stop",
+    ]
+    params: dict[str, Any] = {
+        "time_increment": 1,
+        "time_range": {"since": since, "until": until},
+    }
+
+    raw_rows: list[dict[str, Any]] = []
+    try:
+        for row in account.get_insights(fields=fields, params=params):
+            raw_rows.append(row.export_all_data())
+    except FacebookRequestError as e:
+        body = getattr(e, "body", None) or str(e)
+        raise RuntimeError(f"Meta API error: {body}") from e
+
+    daily: list[dict[str, Any]] = []
+    total_spend = 0.0
+    total_impressions = 0.0
+    total_clicks = 0.0
+    total_leads = 0
+
+    for row in raw_rows:
+        spend = _parse_float(row.get("spend"))
+        impressions = _parse_float(row.get("impressions"))
+        clicks = _parse_float(row.get("clicks"))
+        leads = _lead_count_from_actions(row.get("actions"))
+        date_start = (row.get("date_start") or "").strip()
+        if not date_start:
+            continue
+        daily.append(
+            {
+                "date_start": date_start,
+                "spend": spend,
+                "impressions": int(impressions),
+                "clicks": int(clicks),
+                "leads": leads,
+            }
+        )
+        total_spend += spend
+        total_impressions += impressions
+        total_clicks += clicks
+        total_leads += leads
+
+    daily.sort(key=lambda r: r["date_start"])
+
+    return {
+        "daily": daily,
+        "totals": {
+            "spend": total_spend,
+            "impressions": int(total_impressions),
+            "clicks": int(total_clicks),
+            "leads": total_leads,
+        },
+    }
+
+
 def fetch_campaign_weekly_click_performance(
     campaign_name: str | None = None,
     *,
