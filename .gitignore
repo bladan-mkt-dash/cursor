@@ -8,7 +8,8 @@ get_refresh_token.py
 venv/
 __pycache__/
 
-.streamlit/
+.streamlit/secrets.toml
 outputs/
+embed_pages_cache.json
 __pycache__/
 *.pyc

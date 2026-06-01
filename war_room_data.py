@@ -158,8 +158,14 @@ def compute_vs_prior_avg(
 
 
 def _placeholder_trend(label: str, *, dim_today: bool) -> TrendSeries:
-    """Sparkline shell — wire daily series in a follow-up pass."""
+    """Fallback when daily series could not be loaded."""
     return TrendSeries(label=label, dim_today=dim_today, wired=False)
+
+
+def _google_mtd_spend(df) -> float | None:
+    if df is None or df.empty or "cost" not in df.columns:
+        return None
+    return float(df["cost"].sum())
 
 
 def _sum_optional(*values: float | int | None) -> float | None:
@@ -175,6 +181,66 @@ def _last_n_days_range(*, as_of: date, days: int = 7) -> tuple[str, str]:
         raise ValueError("days must be at least 1")
     start = as_of - timedelta(days=days - 1)
     return start.isoformat(), as_of.isoformat()
+
+
+def _seven_day_dates(as_of: date) -> list[str]:
+    """Ordered ISO dates for the seven-day window ending on ``as_of``."""
+    return [(as_of - timedelta(days=offset)).isoformat() for offset in range(6, -1, -1)]
+
+
+def _iso_date_key(value) -> str:
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d")
+    return str(value)[:10]
+
+
+def _sum_daily_dicts(dates: list[str], *series: dict[str, float]) -> dict[str, float]:
+    return {day: sum(float(values.get(day, 0.0)) for values in series) for day in dates}
+
+
+def _google_daily_dict(df, *, value_col: str, dates: list[str]) -> dict[str, float]:
+    out = {day: 0.0 for day in dates}
+    if df is None or df.empty:
+        return out
+    for _, row in df.iterrows():
+        day = _iso_date_key(row["date"])
+        if day in out:
+            out[day] += float(row[value_col])
+    return out
+
+
+def _meta_daily_dict(daily_rows: list[dict], *, value_key: str, dates: list[str]) -> dict[str, float]:
+    out = {day: 0.0 for day in dates}
+    for row in daily_rows:
+        day = (row.get("date_start") or "")[:10]
+        if day in out:
+            out[day] += float(row.get(value_key) or 0)
+    return out
+
+
+def _ga4_daily_dict(raw: dict[str, int], dates: list[str]) -> dict[str, float]:
+    return {day: float(raw.get(day, 0)) for day in dates}
+
+
+def _build_trend_series(
+    label: str,
+    dates: list[str],
+    values_by_date: dict[str, float],
+    *,
+    today_value: float | None,
+    dim_today: bool,
+) -> TrendSeries:
+    points = [TrendPoint(date=day, value=float(values_by_date.get(day, 0.0))) for day in dates]
+    if dates and today_value is not None:
+        points[-1] = TrendPoint(date=dates[-1], value=float(today_value))
+    wired = len(points) >= 2 and any(point.value > 0 for point in points)
+    return TrendSeries(
+        label=label,
+        points=points,
+        dim_today=dim_today,
+        vs_prior_avg_pct=compute_vs_prior_avg(today_value, points, dim_today=dim_today),
+        wired=wired,
+    )
 
 
 def _cpa(spend: float | None, leads: float | None) -> float | None:
@@ -241,7 +307,7 @@ def load_crm_funnel(*, as_of: date | None = None) -> CrmFunnelMetrics:
     - Signups: **Sign Up Date** custom field in range
     - Bookings: calendar appointments by **dateAdded**
     - Meetings: calendar appointments by **startTime**
-    - Conv. rate: bookings ÷ signups (%)
+    - Conv. rate: signups ÷ bookings (%)
     """
     today = as_of or date.today()
     since, until = _last_n_days_range(as_of=today, days=7)
@@ -280,8 +346,8 @@ def load_crm_funnel(*, as_of: date | None = None) -> CrmFunnelMetrics:
         metrics.errors.append(f"GHL: {exc}")
 
     metrics.conversion_rate = _conversion_rate_pct(
-        float(metrics.bookings_7d) if metrics.bookings_7d is not None else None,
         float(metrics.signups_7d) if metrics.signups_7d is not None else None,
+        float(metrics.bookings_7d) if metrics.bookings_7d is not None else None,
     )
     return metrics
 
@@ -506,6 +572,8 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
     month_start = today.replace(day=1)
     today_iso = today.isoformat()
     month_start_iso = month_start.isoformat()
+    trend_since, trend_until = _last_n_days_range(as_of=today, days=7)
+    trend_dates = _seven_day_dates(today)
 
     metrics = CommandStripMetrics()
     google_today_spend: float | None = None
@@ -514,16 +582,22 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
     meta_today_spend: float | None = None
     meta_today_leads: float | None = None
     meta_mtd_spend: float | None = None
+    google_daily = None
+    meta_daily: list[dict] = []
+    ga4_sessions_by_date: dict[str, int] = {}
 
     try:
-        from google_ads_ghl_paid_cohort import fetch_google_ads_totals
+        from google_ads_ghl_paid_cohort import fetch_google_ads_daily
 
-        google_today = fetch_google_ads_totals(today_iso, today_iso)
-        google_today_spend = google_today.cost
-        google_today_leads = google_today.discovery_calls
-
-        google_mtd = fetch_google_ads_totals(month_start_iso, today_iso)
-        google_mtd_spend = google_mtd.cost
+        google_daily = fetch_google_ads_daily(month_start_iso, today_iso)
+        google_mtd_spend = _google_mtd_spend(google_daily)
+        if google_daily is not None and not google_daily.empty:
+            today_rows = google_daily.loc[
+                google_daily["date"].map(_iso_date_key) == today_iso
+            ]
+            if not today_rows.empty:
+                google_today_spend = float(today_rows["cost"].sum())
+                google_today_leads = float(today_rows["discovery_calls"].sum())
     except Exception as exc:
         metrics.errors.append(f"Google Ads: {exc}")
 
@@ -531,9 +605,10 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
         from meta_client import fetch_account_daily_insights
 
         meta = fetch_account_daily_insights(since=month_start_iso, until=today_iso)
+        meta_daily = meta["daily"]
         meta_mtd_spend = meta["totals"]["spend"]
         today_row = next(
-            (row for row in meta["daily"] if row["date_start"] == today_iso),
+            (row for row in meta_daily if row["date_start"] == today_iso),
             None,
         )
         if today_row:
@@ -581,23 +656,54 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
         metrics.errors.append(f"GHL: {exc}")
 
     try:
-        from google_data import get_ga4_sessions_total
+        from google_data import get_ga4_sessions_by_date, get_ga4_sessions_total
 
         metrics.sessions_today = get_ga4_sessions_total("today", "today")
+        ga4_sessions_by_date = get_ga4_sessions_by_date(trend_since, trend_until)
     except Exception as exc:
         metrics.errors.append(f"GA4: {exc}")
 
-    metrics.spend_trend = _placeholder_trend(
+    google_spend_7d = _google_daily_dict(google_daily, value_col="cost", dates=trend_dates)
+    google_leads_7d = _google_daily_dict(
+        google_daily,
+        value_col="discovery_calls",
+        dates=trend_dates,
+    )
+    meta_spend_7d = _meta_daily_dict(meta_daily, value_key="spend", dates=trend_dates)
+    meta_leads_7d = _meta_daily_dict(meta_daily, value_key="leads", dates=trend_dates)
+    spend_by_date = _sum_daily_dicts(trend_dates, google_spend_7d, meta_spend_7d)
+    leads_by_date = _sum_daily_dicts(trend_dates, google_leads_7d, meta_leads_7d)
+    sessions_by_date = _ga4_daily_dict(ga4_sessions_by_date, trend_dates)
+
+    metrics.spend_trend = _build_trend_series(
         "Ad spend",
-        dim_today=True,  # includes Meta; today may be incomplete
+        trend_dates,
+        spend_by_date,
+        today_value=metrics.spend_today,
+        dim_today=True,
     )
-    metrics.leads_trend = _placeholder_trend(
+    metrics.leads_trend = _build_trend_series(
         "Leads",
-        dim_today=True,  # includes Meta lead actions
+        trend_dates,
+        leads_by_date,
+        today_value=metrics.leads_today,
+        dim_today=True,
     )
-    metrics.sessions_trend = _placeholder_trend(
+    metrics.sessions_trend = _build_trend_series(
         "GA4 sessions",
-        dim_today=True,  # GA4 intraday is partial
+        trend_dates,
+        sessions_by_date,
+        today_value=float(metrics.sessions_today)
+        if metrics.sessions_today is not None
+        else None,
+        dim_today=True,
     )
+
+    if not metrics.spend_trend.wired:
+        metrics.spend_trend = _placeholder_trend("Ad spend", dim_today=True)
+    if not metrics.leads_trend.wired:
+        metrics.leads_trend = _placeholder_trend("Leads", dim_today=True)
+    if not metrics.sessions_trend.wired:
+        metrics.sessions_trend = _placeholder_trend("GA4 sessions", dim_today=True)
 
     return metrics

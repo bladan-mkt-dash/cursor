@@ -209,6 +209,40 @@ def get_ga4_traffic_totals(start_date: str, end_date: str) -> tuple[int, int]:
     )
 
 
+def get_ga4_sessions_by_date(start_date: str, end_date: str) -> dict[str, int]:
+    """
+    Property-wide GA4 **sessions** keyed by ``YYYY-MM-DD`` for an inclusive range.
+
+    Dates may be ISO ``YYYY-MM-DD`` or GA4 relative strings such as ``today``.
+    """
+    _ensure_ga_credentials()
+    property_id = _strip_env(os.getenv("GA4_PROPERTY_ID"))
+    if not property_id:
+        raise ValueError("Set GA4_PROPERTY_ID in .env")
+
+    client = BetaAnalyticsDataClient()
+    rows = _run_report_paginated(
+        client,
+        property_id=property_id,
+        dimensions=[Dimension(name="date")],
+        metrics=[Metric(name="sessions")],
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+    out: dict[str, int] = {}
+    for row in rows:
+        raw_date = row.dimension_values[0].value if row.dimension_values else ""
+        if not raw_date:
+            continue
+        if len(raw_date) == 8 and raw_date.isdigit():
+            iso = f"{raw_date[:4]}-{raw_date[4:6]}-{raw_date[6:8]}"
+        else:
+            iso = raw_date[:10]
+        out[iso] = out.get(iso, 0) + int(row.metric_values[0].value)
+    return out
+
+
 def _page_path_filter_expression(page_paths: list[str]) -> FilterExpression:
     path_exprs: list[FilterExpression] = []
     for raw in page_paths:

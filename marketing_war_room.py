@@ -24,8 +24,11 @@ Needs response scope (marketing-only, not a full inbox):
 
 from __future__ import annotations
 
+import html
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
 
 import plotly.graph_objects as go
 import streamlit as st
@@ -51,6 +54,9 @@ from war_room_data import (
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
+# Bump when loader logic changes — invalidates @st.cache_data without a server restart.
+WAR_ROOM_LOADER_VERSION = "2026-06-01-v2"
+
 COLORS = {
     "accent": "#5DA68A",
     "accent_dark": "#264540",
@@ -67,13 +73,37 @@ COLORS = {
 
 
 def _inject_styles() -> None:
+    panel_keys = (
+        "war-room-command-strip",
+        "war-room-paid-media",
+        "war-room-crm-funnel",
+        "war-room-website-traffic",
+        "war-room-organic-social",
+        "war-room-content-seo",
+        "war-room-team-ops",
+        "war-room-needs-response",
+        "war-room-alerts",
+    )
+    panel_rules = "\n".join(
+        f"""
+        div.st-key-{key}[data-testid="stVerticalBlock"] {{
+            background: {COLORS["panel_bg"]} !important;
+            border: 1px solid rgba(93, 166, 138, 0.35) !important;
+            border-radius: 12px !important;
+            box-shadow: 0 1px 3px rgba(38, 69, 64, 0.08) !important;
+            padding: 0.85rem 1rem !important;
+            margin-bottom: 0.25rem;
+            overflow: visible !important;
+        }}"""
+        for key in panel_keys
+    )
     st.markdown(
         f"""
         <style>
         .stApp {{ background: {COLORS["page_bg"]}; }}
         .block-container {{
-            padding-top: 0.75rem;
-            padding-bottom: 0.75rem;
+            padding-top: 1rem;
+            padding-bottom: 1rem;
             max-width: 1600px;
         }}
         [data-testid="stMetric"] {{
@@ -84,26 +114,24 @@ def _inject_styles() -> None:
             border: 1px solid rgba(93,166,138,0.12);
         }}
         [data-testid="stMetricLabel"] {{
-            color: {COLORS["accent_dark"]};
+            color: {COLORS["accent_dark"]} !important;
             font-weight: 600;
             font-size: 0.78rem;
         }}
         [data-testid="stMetricValue"] {{
-            color: {COLORS["accent"]};
+            color: {COLORS["accent"]} !important;
             font-size: 1.35rem;
         }}
-        div[data-testid="stVerticalBlockBorderWrapper"] {{
-            background: {COLORS["panel_bg"]};
-            border-radius: 12px;
-            border-color: rgba(93,166,138,0.22) !important;
-            box-shadow: 0 1px 3px rgba(38,69,64,0.05);
+        [data-testid="stCaptionContainer"] p,
+        [data-testid="stCaptionContainer"] {{
+            color: {COLORS["muted"]} !important;
         }}
         .war-room-header {{
             display: flex;
             align-items: baseline;
             justify-content: space-between;
             gap: 1rem;
-            margin-bottom: 0.5rem;
+            margin-bottom: 0.75rem;
         }}
         .war-room-header h1 {{
             color: {COLORS["accent_dark"]};
@@ -114,6 +142,22 @@ def _inject_styles() -> None:
             color: {COLORS["muted"]};
             font-size: 0.85rem;
             text-align: right;
+        }}
+        .war-room-panel-header {{
+            margin: 0.75rem 0 0.35rem 0;
+        }}
+        .war-room-panel-title {{
+            color: {COLORS["accent_dark"]};
+            font-size: 1.15rem;
+            font-weight: 700;
+            line-height: 1.3;
+            margin: 0 0 0.2rem 0;
+        }}
+        .war-room-panel-caption {{
+            color: {COLORS["muted"]};
+            font-size: 0.82rem;
+            line-height: 1.35;
+            margin: 0;
         }}
         .war-room-placeholder {{
             color: {COLORS["muted"]};
@@ -127,7 +171,7 @@ def _inject_styles() -> None:
             border-radius: 8px;
             color: {COLORS["muted"]};
             font-size: 0.72rem;
-            height: 56px;
+            height: 72px;
             display: flex;
             align-items: center;
             justify-content: center;
@@ -138,6 +182,7 @@ def _inject_styles() -> None:
             font-size: 0.72rem;
             margin-top: 0.15rem;
         }}
+        {panel_rules}
         </style>
         """,
         unsafe_allow_html=True,
@@ -156,8 +201,22 @@ def _placeholder_note(text: str) -> None:
 
 
 def _panel_header(title: str, caption: str) -> None:
-    st.subheader(title)
-    st.caption(caption)
+    st.markdown(
+        f"""
+        <div class="war-room-panel-header">
+            <h3 class="war-room-panel-title">{html.escape(title)}</h3>
+            <p class="war-room-panel-caption">{html.escape(caption)}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+@contextmanager
+def _panel(title: str, caption: str, key: str) -> Iterator[None]:
+    _panel_header(title, caption)
+    with st.container(border=True, key=key):
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -166,7 +225,7 @@ def _panel_header(title: str, caption: str) -> None:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _load_command_strip() -> CommandStripMetrics:
+def _load_command_strip(_loader_version: str = WAR_ROOM_LOADER_VERSION) -> CommandStripMetrics:
     """Stage 2: aggregate top-line KPIs from all connected sources."""
     return load_command_strip()
 
@@ -276,11 +335,11 @@ def _sparkline_figure(trend: TrendSeries) -> go.Figure | None:
         )
         fig.add_trace(
             go.Scatter(
-                x=x[-1:],
-                y=y[-1:],
+                x=x[-2:],
+                y=y[-2:],
                 mode="lines+markers",
-                line=dict(color="rgba(93,166,138,0.35)", width=2, dash="dot"),
-                marker=dict(size=5, color="rgba(93,166,138,0.35)"),
+                line=dict(color="rgba(93,166,138,0.45)", width=2, dash="dot"),
+                marker=dict(size=5, color="rgba(93,166,138,0.45)"),
                 hoverinfo="skip",
             )
         )
@@ -296,11 +355,11 @@ def _sparkline_figure(trend: TrendSeries) -> go.Figure | None:
         )
 
     fig.update_layout(
-        height=56,
-        margin=dict(l=2, r=2, t=2, b=2),
+        height=72,
+        margin=dict(l=4, r=4, t=4, b=4),
         showlegend=False,
         xaxis=dict(visible=False, fixedrange=True),
-        yaxis=dict(visible=False, fixedrange=True),
+        yaxis=dict(visible=False, fixedrange=True, rangemode="tozero"),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         dragmode=False,
@@ -372,12 +431,11 @@ def _render_header(last_refresh: datetime) -> None:
 
 
 def _render_command_strip(data: CommandStripMetrics) -> None:
-    with st.container(border=True):
-        _panel_header(
-            "Command strip",
-            "Cross-channel snapshot · today + MTD · Google Ads + Meta + GHL + GA4",
-        )
-
+    with _panel(
+        "Command strip",
+        "Cross-channel snapshot · today + MTD · Google Ads + Meta + GHL + GA4",
+        "war-room-command-strip",
+    ):
         st.caption(
             "Trend row · 7-day sparklines on spend, leads, and sessions. "
             "Today is dimmed on Meta- and GA4-backed series (intraday may be incomplete)."
@@ -424,11 +482,11 @@ def _render_command_strip(data: CommandStripMetrics) -> None:
 
 
 def _render_paid_media(data: PaidMediaMetrics) -> None:
-    with st.container(border=True):
-        _panel_header(
-            "Paid media",
-            f"Google Ads + Meta · {data.period_since} – {data.period_until} (7 days)",
-        )
+    with _panel(
+        "Paid media",
+        f"Google Ads + Meta · {data.period_since} – {data.period_until} (7 days)",
+        "war-room-paid-media",
+    ):
         _metric_row(
             [
                 ("Google spend", _fmt_currency(data.google_spend_7d)),
@@ -450,11 +508,11 @@ def _render_paid_media(data: PaidMediaMetrics) -> None:
 
 
 def _render_crm_funnel(data: CrmFunnelMetrics) -> None:
-    with st.container(border=True):
-        _panel_header(
-            "CRM & funnel",
-            f"GoHighLevel · {data.period_since} – {data.period_until} (7 days)",
-        )
+    with _panel(
+        "CRM & funnel",
+        f"GoHighLevel · {data.period_since} – {data.period_until} (7 days)",
+        "war-room-crm-funnel",
+    ):
         _metric_row(
             [
                 ("Signups", _fmt_count(data.signups_7d)),
@@ -466,7 +524,7 @@ def _render_crm_funnel(data: CrmFunnelMetrics) -> None:
         st.caption(
             "Signups = Sign Up Date · Bookings = appointment dateAdded · "
             "Meetings = appointment startTime · "
-            "Conv. rate = bookings ÷ signups (same 7-day window, not cohort-matched)"
+            "Conv. rate = signups ÷ bookings (same 7-day window, not cohort-matched)"
         )
         if (
             data.conversion_rate is not None
@@ -475,8 +533,7 @@ def _render_crm_funnel(data: CrmFunnelMetrics) -> None:
             and data.bookings_7d
         ):
             st.caption(
-                "Conv. rate above 100% is normal here — bookings often tie to contacts "
-                "who signed up outside this window."
+                "Conv. rate above 100% means more signups than bookings in this window."
             )
         if data.notes:
             for note in data.notes:
@@ -487,11 +544,11 @@ def _render_crm_funnel(data: CrmFunnelMetrics) -> None:
 
 
 def _render_website_traffic(data: WebsiteTrafficMetrics) -> None:
-    with st.container(border=True):
-        _panel_header(
-            "Website & traffic",
-            f"GA4 · {data.period_since} – {data.period_until} (7 days)",
-        )
+    with _panel(
+        "Website & traffic",
+        f"GA4 · {data.period_since} – {data.period_until} (7 days)",
+        "war-room-website-traffic",
+    ):
         _metric_row(
             [
                 ("Sessions", _fmt_count(data.sessions_7d)),
@@ -519,12 +576,12 @@ def _fmt_delta(value: int | None) -> str:
 
 
 def _render_organic_social(data: OrganicSocialMetrics) -> None:
-    with st.container(border=True):
-        page = f" · {data.page_name}" if data.page_name else ""
-        _panel_header(
-            "Organic social",
-            f"Instagram{page} · {data.period_since} – {data.period_until} (7 days)",
-        )
+    page = f" · {data.page_name}" if data.page_name else ""
+    with _panel(
+        "Organic social",
+        f"Instagram{page} · {data.period_since} – {data.period_until} (7 days)",
+        "war-room-organic-social",
+    ):
         _metric_row(
             [
                 ("IG reach", _fmt_count(data.ig_reach_7d)),
@@ -548,11 +605,11 @@ def _render_organic_social(data: OrganicSocialMetrics) -> None:
 
 
 def _render_content_seo(data: ContentSeoMetrics) -> None:
-    with st.container(border=True):
-        _panel_header(
-            "Content & SEO",
-            f"GA4 · {data.period_since} – {data.period_until} (7 days)",
-        )
+    with _panel(
+        "Content & SEO",
+        f"GA4 · {data.period_since} – {data.period_until} (7 days)",
+        "war-room-content-seo",
+    ):
         _metric_row(
             [
                 ("Organic sessions", _fmt_count(data.organic_sessions_7d)),
@@ -577,11 +634,11 @@ def _render_content_seo(data: ContentSeoMetrics) -> None:
 
 
 def _render_team_ops(data: TeamOpsMetrics) -> None:
-    with st.container(border=True):
-        _panel_header(
-            "Team & projects",
-            "Monday.com · Sam New To-Do List · Je New To-Do List · Communication Plan",
-        )
+    with _panel(
+        "Team & projects",
+        "Monday.com · Sam New To-Do List · Je New To-Do List · Communication Plan",
+        "war-room-team-ops",
+    ):
         _metric_row(
             [
                 ("Open tasks", _fmt_count(data.open_tasks)),
@@ -603,11 +660,11 @@ def _render_team_ops(data: TeamOpsMetrics) -> None:
 
 
 def _render_needs_response(data: dict) -> None:
-    with st.container(border=True):
-        _panel_header(
-            "Needs response",
-            "Marketing-only · Gmail label queue + Google Chat spaces (not general inbox)",
-        )
+    with _panel(
+        "Needs response",
+        "Marketing-only · Gmail label queue + Google Chat spaces (not general inbox)",
+        "war-room-needs-response",
+    ):
         _metric_row(
             [
                 ("Gmail (marketing)", _fmt(data["gmail_count"])),
@@ -630,8 +687,11 @@ def _render_needs_response(data: dict) -> None:
 
 
 def _render_alerts() -> None:
-    with st.container(border=True):
-        _panel_header("Alerts", "Thresholds, anomalies, stale feeds")
+    with _panel(
+        "Alerts",
+        "Thresholds, anomalies, stale feeds",
+        "war-room-alerts",
+    ):
         st.info("No alerts configured yet.")
         _placeholder_note("Stage 10 — add rules (e.g. CPA spike, booking drop, overdue tasks).")
 
@@ -665,7 +725,7 @@ def main() -> None:
         command = _load_command_strip()
     _render_command_strip(command)
 
-    col_left, col_mid, col_right = st.columns(3, gap="small")
+    col_left, col_mid, col_right = st.columns(3, gap="medium")
     with st.spinner("Loading panels…"):
         paid = _load_paid_media()
         crm = _load_crm_funnel()
@@ -677,7 +737,7 @@ def main() -> None:
     with col_right:
         _render_website_traffic(traffic)
 
-    col_a, col_b, col_c = st.columns(3, gap="small")
+    col_a, col_b, col_c = st.columns(3, gap="medium")
     with st.spinner("Loading lower panels…"):
         organic = _load_organic_social()
         content = _load_content_seo()
@@ -689,7 +749,7 @@ def main() -> None:
     with col_c:
         _render_team_ops(team)
 
-    col_needs, col_alerts = st.columns([3, 2], gap="small")
+    col_needs, col_alerts = st.columns([3, 2], gap="medium")
     with col_needs:
         _render_needs_response(_load_needs_response())
     with col_alerts:

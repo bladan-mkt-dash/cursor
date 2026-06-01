@@ -1,11 +1,12 @@
 """GHL calendar embed pages on fivejourneys.com + GA4 monthly views + GHL bookings."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
 import xml.etree.ElementTree as ET
-from collections import Counter, defaultdict
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,6 +20,18 @@ load_dotenv(_PROJECT_DIR / ".env")
 
 BASE = "https://fivejourneys.com"
 NS = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+EMBED_CACHE_PATH = _PROJECT_DIR / "embed_pages_cache.json"
+EMBED_CACHE_TTL = timedelta(hours=24)
+SITEMAP_CANDIDATES = (
+    f"{BASE}/sitemap_index.xml",
+    f"{BASE}/sitemap.xml",
+    f"{BASE}/wp-sitemap.xml",
+    f"{BASE}/page-sitemap.xml",
+)
 FOOTER_BOOKING_WIDGET = "vqsYIK9VZZvgZb8vrhP8"
 IFRAME_BOOKING = re.compile(
     r'<iframe[^>]+(?:src|data-src|nitro-lazy-src)=["\']([^"\']*widget/booking[^"\']*)["\']',
@@ -44,16 +57,134 @@ BOOKINGS_BY_MONTH = {
 }
 
 
-def fetch_sitemap_urls(session: requests.Session) -> list[str]:
-    root = ET.fromstring(session.get(f"{BASE}/sitemap_index.xml", timeout=30).content)
+def _looks_like_xml(content: bytes) -> bool:
+    head = content.lstrip()[:200]
+    return head.startswith(b"<?xml") or head.startswith(b"<")
+
+
+def _parse_xml(content: bytes, *, source: str) -> ET.Element:
+    if not content.strip():
+        raise ValueError(f"Empty response from {source}")
+    if not _looks_like_xml(content):
+        preview = content.lstrip()[:80].decode("utf-8", errors="replace")
+        raise ValueError(
+            f"Expected XML from {source}, got HTML or other content: {preview!r}…"
+        )
+    try:
+        return ET.fromstring(content)
+    except ET.ParseError as exc:
+        raise ValueError(f"Invalid XML from {source}: {exc}") from exc
+
+
+def _fetch_sitemap_document(session: requests.Session, url: str) -> ET.Element:
+    response = session.get(url, timeout=30)
+    response.raise_for_status()
+    return _parse_xml(response.content, source=url)
+
+
+def fetch_urls_via_wp_json(session: requests.Session) -> list[str]:
+    """Fallback when sitemap endpoints return NitroPack HTML instead of XML."""
     urls: set[str] = set()
-    for sm in root.findall(".//sm:loc", NS):
-        sroot = ET.fromstring(session.get(sm.text.strip(), timeout=30).content)
-        for loc in sroot.findall(".//sm:loc", NS):
-            u = loc.text.strip()
-            if u.startswith(BASE):
-                urls.add(u)
+    for post_type in ("pages", "posts"):
+        page = 1
+        total_pages = 1
+        while page <= total_pages:
+            response = session.get(
+                f"{BASE}/wp-json/wp/v2/{post_type}",
+                params={"per_page": 100, "page": page, "_fields": "link"},
+                headers={"Accept": "application/json"},
+                timeout=30,
+            )
+            if response.status_code in {400, 404}:
+                break
+            response.raise_for_status()
+            try:
+                batch = response.json()
+            except ValueError as exc:
+                raise ValueError(
+                    f"WordPress API returned non-JSON for {post_type} page {page}: {exc}"
+                ) from exc
+            if not batch:
+                break
+            for item in batch:
+                link = (item.get("link") or "").strip().rstrip("/")
+                if link.startswith(BASE):
+                    urls.add(link)
+            total_pages = max(total_pages, int(response.headers.get("X-WP-TotalPages", page)))
+            page += 1
+    if not urls:
+        raise ValueError("Could not discover site URLs from sitemap or WordPress API")
     return sorted(urls)
+
+
+def fetch_sitemap_urls(session: requests.Session) -> list[str]:
+    for index_url in SITEMAP_CANDIDATES:
+        try:
+            root = _fetch_sitemap_document(session, index_url)
+        except Exception:
+            continue
+
+        urls: set[str] = set()
+        locs = root.findall(".//sm:loc", NS)
+        if not locs:
+            locs = [el for el in root.iter() if el.tag.endswith("loc")]
+        if not locs:
+            continue
+
+        first = (locs[0].text or "").strip()
+        if first.endswith(".xml"):
+            for sm in locs:
+                sm_url = (sm.text or "").strip()
+                if not sm_url.endswith(".xml"):
+                    continue
+                try:
+                    sroot = _fetch_sitemap_document(session, sm_url)
+                except Exception:
+                    continue
+                for loc in sroot.findall(".//sm:loc", NS) or [
+                    el for el in sroot.iter() if el.tag.endswith("loc")
+                ]:
+                    u = (loc.text or "").strip().rstrip("/")
+                    if u.startswith(BASE):
+                        urls.add(u)
+        else:
+            for loc in locs:
+                u = (loc.text or "").strip().rstrip("/")
+                if u.startswith(BASE):
+                    urls.add(u)
+
+        if urls:
+            return sorted(urls)
+
+    return fetch_urls_via_wp_json(session)
+
+
+def _page_fetch_url(url: str) -> str:
+    return f"{url}?nonitro=1" if "?" not in url else f"{url}&nonitro=1"
+
+
+def _load_embed_cache() -> list[dict] | None:
+    if not EMBED_CACHE_PATH.is_file():
+        return None
+    try:
+        payload = json.loads(EMBED_CACHE_PATH.read_text(encoding="utf-8"))
+        cached_at = datetime.fromisoformat(payload["cached_at"])
+        if cached_at.tzinfo is None:
+            cached_at = cached_at.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) - cached_at > EMBED_CACHE_TTL:
+            return None
+        pages = payload.get("pages")
+        return pages if isinstance(pages, list) and pages else None
+    except Exception:
+        return None
+
+
+def _save_embed_cache(pages: list[dict]) -> None:
+    payload = {
+        "cached_at": datetime.now(timezone.utc).isoformat(),
+        "pages": pages,
+    }
+    EMBED_CACHE_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def classify_page(html: str) -> dict | None:
@@ -74,24 +205,41 @@ def classify_page(html: str) -> dict | None:
     }
 
 
-def discover_embed_pages() -> list[dict]:
+def discover_embed_pages(*, force_refresh: bool = False) -> list[dict]:
+    if not force_refresh:
+        cached = _load_embed_cache()
+        if cached:
+            return cached
+
     session = requests.Session()
-    session.headers["User-Agent"] = "Mozilla/5.0 (compatible; GHL-calendar-report/1.0)"
+    session.headers.update(
+        {
+            "User-Agent": BROWSER_USER_AGENT,
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+    )
     urls = fetch_sitemap_urls(session)
     found: list[dict] = []
     with ThreadPoolExecutor(max_workers=8) as ex:
-        futs = {ex.submit(session.get, u, timeout=25): u for u in urls}
+        futs = {
+            ex.submit(session.get, _page_fetch_url(u), timeout=25): u for u in urls
+        }
         for fut in as_completed(futs):
             url = futs[fut]
             try:
                 r = fut.result()
+                r.raise_for_status()
                 info = classify_page(r.text)
             except Exception:
                 continue
             if info:
                 path = urlparse(url).path or "/"
                 found.append({"url": url, "path": path, **info})
-    return sorted(found, key=lambda x: x["path"])
+
+    result = sorted(found, key=lambda x: x["path"])
+    if result:
+        _save_embed_cache(result)
+    return result
 
 
 def ga4_monthly_views(page_paths: list[str]) -> dict[str, int]:
