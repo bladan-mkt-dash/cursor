@@ -1,7 +1,7 @@
 """
 Digital Channel Dashboard on localhost — live Google Ads, Meta, and GoHighLevel data.
 
-    streamlit run digital_channel_live_dashboard.py --server.port 8850
+    streamlit run DC-Live-Dash/digital_channel_live_dashboard.py --server.port 8850
 
 Open:
 
@@ -26,7 +26,7 @@ from digital_channel_live_data import (
     scorecard_metrics,
 )
 
-load_dotenv(Path(__file__).resolve().parent / ".env")
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 COLORS = {
     "accent": "#5DA68A",

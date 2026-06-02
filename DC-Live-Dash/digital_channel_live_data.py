@@ -13,8 +13,14 @@ Replaces the Google Sheet **Data** tab as the source of truth. Metrics mapping:
 
 from __future__ import annotations
 
+import sys
 from datetime import date, timedelta
+from pathlib import Path
 from typing import Any
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 import pandas as pd
 from facebook_business.exceptions import FacebookRequestError
