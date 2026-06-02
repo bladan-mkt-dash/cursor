@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 
 from digital_channel_live_data import (
     DEFAULT_SINCE,
+    clear_ghl_leads_day_cache,
     load_live_campaign_data,
     monthly_campaign_summary,
     scorecard_metrics,
@@ -37,6 +38,9 @@ COLORS = {
 }
 
 MONTH_ORDER = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+CHANNEL_GOOGLE = "Google Ads"
+CHANNEL_META = "FB/IG"
 
 
 def _inject_styles() -> None:
@@ -125,6 +129,48 @@ def _line_chart(df: pd.DataFrame, y_cols: list[str], title: str, y_label: str) -
     return fig
 
 
+def _cpl_over_time_chart(monthly: pd.DataFrame) -> go.Figure | None:
+    """Monthly CPL (spend ÷ leads) for the current filter selection."""
+    if monthly.empty:
+        return None
+
+    plot_df = monthly.copy()
+    plot_df["cpl"] = plot_df.apply(
+        lambda r: r["spend"] / r["leads"] if r["leads"] and r["leads"] > 0 else pd.NA,
+        axis=1,
+    )
+    plot_df["month_label"] = plot_df["month"].dt.strftime("%b %Y")
+    plot_df = plot_df.dropna(subset=["cpl"])
+    if plot_df.empty:
+        return None
+
+    fig = px.line(
+        plot_df,
+        x="month_label",
+        y="cpl",
+        markers=True,
+        title="CPL Over Time",
+        color_discrete_sequence=[COLORS["2024"]],
+    )
+    fig.update_layout(
+        height=320,
+        margin=dict(l=20, r=20, t=50, b=20),
+        showlegend=False,
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Roboto, sans-serif", color=COLORS["accent_dark"]),
+        xaxis_title="",
+        yaxis_title="CPL ($)",
+    )
+    fig.update_yaxes(tickformat="$,.0f")
+    fig.update_traces(
+        line=dict(width=2.5, color=COLORS["2024"]),
+        marker=dict(size=7),
+        hovertemplate="%{x}<br>CPL: $%{y:,.2f}<extra></extra>",
+    )
+    return fig
+
+
 def _spend_click_correlation(df: pd.DataFrame) -> go.Figure | None:
     if df.empty:
         return None
@@ -182,14 +228,61 @@ def _creative_allocation_pie(df: pd.DataFrame) -> go.Figure | None:
     return fig
 
 
-def _weighted_scorecard_metrics(df: pd.DataFrame) -> dict[str, float | None]:
+def _scorecard_leads_total(
+    df: pd.DataFrame,
+    *,
+    selected_channels: list[str],
+    all_channels: list[str],
+    selected_campaigns: list[str],
+    campaign_pool: list[str],
+    lead_summary: dict[str, int],
+) -> float:
+    """
+    Headline lead count: all new GHL contacts when both channels and all campaigns
+    are in view; channel totals for a single channel; otherwise allocated row sum.
+    """
+    all_channels_selected = set(selected_channels) >= set(all_channels)
+    all_campaigns_selected = (
+        len(selected_campaigns) == len(campaign_pool) if campaign_pool else True
+    )
+    if all_channels_selected and all_campaigns_selected:
+        if selected_channels == [CHANNEL_GOOGLE]:
+            return float(lead_summary.get("google_leads") or 0)
+        if selected_channels == [CHANNEL_META]:
+            return float(lead_summary.get("meta_leads") or 0)
+        if all_channels_selected and len(all_channels) > 1:
+            total = float(lead_summary.get("total_new_contacts") or 0)
+            if total > 0:
+                return total
+    row_leads = float(df["leads"].sum())
+    if row_leads > 0:
+        return row_leads
+    return float(lead_summary.get("total_new_contacts") or 0)
+
+
+def _weighted_scorecard_metrics(
+    df: pd.DataFrame,
+    *,
+    selected_channels: list[str],
+    all_channels: list[str],
+    selected_campaigns: list[str],
+    campaign_pool: list[str],
+    lead_summary: dict[str, int],
+) -> dict[str, float | None]:
     """Scorecard totals with properly weighted averages for rate metrics."""
     if df.empty:
         return {k: None for k in scorecard_metrics(df).keys()}
 
     spend = df["spend"].sum()
     clicks = df["clicks"].sum()
-    leads = df["leads"].sum()
+    leads = _scorecard_leads_total(
+        df,
+        selected_channels=selected_channels,
+        all_channels=all_channels,
+        selected_campaigns=selected_campaigns,
+        campaign_pool=campaign_pool,
+        lead_summary=lead_summary,
+    )
     dcs = df["dcs"].sum()
     conversions = df["conversions"].sum()
 
@@ -207,10 +300,10 @@ def _weighted_scorecard_metrics(df: pd.DataFrame) -> dict[str, float | None]:
     }
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def _load_data(since: str, until: str) -> tuple[pd.DataFrame, tuple[str, ...]]:
-    df, notes = load_live_campaign_data(since=since, until=until)
-    return df, tuple(notes)
+@st.cache_data(ttl=86400, show_spinner=False)
+def _load_data(since: str, until: str) -> tuple[pd.DataFrame, tuple[str, ...], dict[str, int]]:
+    df, notes, lead_summary = load_live_campaign_data(since=since, until=until)
+    return df, tuple(notes), lead_summary
 
 
 def main() -> None:
@@ -223,8 +316,11 @@ def main() -> None:
 
     st.title("Digital Channel Dashboard")
     st.caption(
-        "Live data from **Google Ads**, **Meta**, and **GoHighLevel** "
-        "(replicates the Google Sheet Dashboard tab — not the Data tab)."
+        "Live data from **Google Ads**, **Meta**, and **GoHighLevel**. "
+        "Leads = new GHL contacts (Meta: meta lead tag / Meta pixel; "
+        "Google: dc thru g-ad tag / Google Tag). "
+        "**First load** for a wide date range can take a few minutes while GHL "
+        "lead data is pulled day-by-day; **repeat loads use cache** and are much faster."
     )
 
     today = date.today()
@@ -247,13 +343,25 @@ def main() -> None:
             st.error("Start date must be on or before end date.")
             st.stop()
 
-        if st.button("Refresh data"):
+        if st.button("Refresh data", help="Reload ads + GHL. Keeps cached GHL daily lead files."):
             _load_data.clear()
             st.rerun()
 
-    with st.spinner("Loading Google Ads, Meta, and GoHighLevel…"):
+        if st.button(
+            "Hard refresh GHL leads",
+            help="Clear cached GHL daily lead files and reload (use if lead counts look wrong).",
+        ):
+            clear_ghl_leads_day_cache()
+            _load_data.clear()
+            st.rerun()
+
+    load_label = (
+        "Loading Google Ads, Meta, and GoHighLevel… "
+        "(GHL leads may take several minutes on first load for a wide range)"
+    )
+    with st.spinner(load_label):
         try:
-            raw_df, notes = _load_data(since.isoformat(), until.isoformat())
+            raw_df, notes, lead_summary = _load_data(since.isoformat(), until.isoformat())
         except Exception as exc:
             st.error(f"Could not load live data.\n\n{exc}")
             st.stop()
@@ -316,7 +424,14 @@ def main() -> None:
 
     df = raw_df.loc[mask].copy()
     monthly = monthly_campaign_summary(df)
-    scores = _weighted_scorecard_metrics(df)
+    scores = _weighted_scorecard_metrics(
+        df,
+        selected_channels=selected_channels,
+        all_channels=channels,
+        selected_campaigns=selected_campaigns,
+        campaign_pool=campaign_pool,
+        lead_summary=lead_summary,
+    )
 
     st.markdown("##### Paid media performance")
     _metric_row(
@@ -368,10 +483,11 @@ def main() -> None:
 
     c3, c4 = st.columns(2)
     with c3:
-        st.plotly_chart(
-            _line_chart(monthly, ["leads"], "Lead Acquisition Over Time", "Leads"),
-            use_container_width=True,
-        )
+        cpl_chart = _cpl_over_time_chart(monthly)
+        if cpl_chart:
+            st.plotly_chart(cpl_chart, use_container_width=True)
+        else:
+            st.info("CPL over time unavailable (no leads in the selected range).")
     with c4:
         st.plotly_chart(
             _line_chart(

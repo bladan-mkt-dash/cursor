@@ -4,7 +4,9 @@ Build Digital Channel Dashboard rows from live Google Ads, Meta, and GoHighLevel
 Replaces the Google Sheet **Data** tab as the source of truth. Metrics mapping:
 
 - **Spend / clicks / impressions** — Google Ads & Meta campaign insights (daily → month-end rows).
-- **Leads** — Meta lead actions; Google Ads ``metrics.conversions`` (discovery-call conversions).
+- **Leads** — GHL new contacts (``dateAdded``): Meta = ``meta lead`` tag and/or Meta pixel
+  (``fbp`` / ``fbc``); Google = ``dc thru g-ad`` tag and/or Google Tag (``gaClientId``).
+  Campaign rows receive channel-month totals allocated by spend share.
 - **DCs** — Google Ads conversions by month; Meta = GHL Facebook/Instagram contacts (date added),
   allocated to campaigns by spend share within channel-month.
 - **Conversions (new patients)** — GHL committed members with Sign Up Date in range, classified
@@ -14,6 +16,9 @@ Replaces the Google Sheet **Data** tab as the source of truth. Metrics mapping:
 from __future__ import annotations
 
 import sys
+import json
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -34,6 +39,7 @@ from ghl_client import (
     contact_custom_field_value,
     fetch_facebook_instagram_conversions,
     fetch_signup_date_range_committed_yes_contacts,
+    load_contacts_for_calendar_day,
     resolve_hear_about_us_custom_field_id,
 )
 from google_ads_ghl_paid_cohort import (
@@ -41,12 +47,14 @@ from google_ads_ghl_paid_cohort import (
     _google_ads_login_customer_id,
     _google_ads_yaml_path,
 )
-from meta_client import _init_api, _lead_count_from_actions, _parse_float
+from meta_client import _init_api, _parse_float
 
 CHANNEL_GOOGLE = "Google Ads"
 CHANNEL_META = "FB/IG"
 
-DEFAULT_SINCE = "2024-01-01"
+DEFAULT_SINCE = "2025-01-01"
+_GHL_LEADS_CACHE_DIR = _PROJECT_ROOT / ".cache" / "ghl_daily_leads"
+_GHL_LEADS_FETCH_WORKERS = 8
 
 _GADS_CHANNEL_TO_CREATIVE = {
     "SEARCH": "Text",
@@ -163,7 +171,7 @@ def fetch_google_ads_campaign_daily(since: str, until: str) -> pd.DataFrame:
                         "spend": float(row.metrics.cost_micros or 0) / 1_000_000.0,
                         "clicks": int(row.metrics.clicks or 0),
                         "impressions": int(row.metrics.impressions or 0),
-                        "leads": float(row.metrics.conversions or 0),
+                        "leads": 0.0,
                         "dcs": float(row.metrics.conversions or 0),
                     }
                 )
@@ -189,9 +197,55 @@ def fetch_google_ads_campaign_daily(since: str, until: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def fetch_meta_campaign_daily(since: str, until: str) -> pd.DataFrame:
-    """Daily campaign metrics from Meta (spend, clicks, lead actions)."""
-    account = _init_api()
+_META_INSIGHTS_CHUNK_DAYS = 31
+_META_INSIGHTS_MAX_RETRIES = 3
+_META_EMPTY_DAILY_COLUMNS = [
+    "date",
+    "channel",
+    "campaign",
+    "creative_type",
+    "fb_ig_type",
+    "spend",
+    "clicks",
+    "impressions",
+    "leads",
+    "dcs",
+]
+
+
+def _meta_api_error_message(exc: FacebookRequestError) -> str:
+    body = getattr(exc, "body", None)
+    if callable(body):
+        try:
+            return str(body())
+        except Exception:
+            pass
+    api_msg = getattr(exc, "api_error_message", None)
+    if callable(api_msg):
+        try:
+            return str(api_msg())
+        except Exception:
+            pass
+    return str(exc)
+
+
+def _insights_date_chunks(
+    since: str, until: str, *, chunk_days: int = _META_INSIGHTS_CHUNK_DAYS
+) -> list[tuple[str, str]]:
+    start = date.fromisoformat(since)
+    end = date.fromisoformat(until)
+    chunks: list[tuple[str, str]] = []
+    cursor = start
+    while cursor <= end:
+        chunk_end = min(cursor + timedelta(days=chunk_days - 1), end)
+        chunks.append((cursor.isoformat(), chunk_end.isoformat()))
+        cursor = chunk_end + timedelta(days=1)
+    return chunks
+
+
+def _meta_campaign_daily_rows(
+    account: Any, *, since: str, until: str
+) -> list[dict[str, Any]]:
     fields = [
         "campaign_name",
         "campaign_id",
@@ -209,48 +263,70 @@ def fetch_meta_campaign_daily(since: str, until: str) -> pd.DataFrame:
         "limit": 500,
     }
     rows: list[dict[str, Any]] = []
-    try:
-        for row in account.get_insights(fields=fields, params=params):
-            data = row.export_all_data()
-            campaign_name = (data.get("campaign_name") or "").strip()
-            date_start = (data.get("date_start") or "").strip()
-            if not campaign_name or not date_start:
-                continue
-            objective = (data.get("objective") or "").strip()
-            rows.append(
-                {
-                    "date": pd.to_datetime(date_start),
-                    "channel": CHANNEL_META,
-                    "campaign": campaign_name,
-                    "creative_type": _meta_creative_type(campaign_name, objective),
-                    "fb_ig_type": _meta_fb_ig_type(objective, campaign_name),
-                    "spend": _parse_float(data.get("spend")),
-                    "clicks": int(_parse_float(data.get("clicks"))),
-                    "impressions": int(_parse_float(data.get("impressions"))),
-                    "leads": _lead_count_from_actions(data.get("actions")),
-                    "dcs": 0.0,
-                }
+    for row in account.get_insights(fields=fields, params=params):
+        data = row.export_all_data()
+        campaign_name = (data.get("campaign_name") or "").strip()
+        date_start = (data.get("date_start") or "").strip()
+        if not campaign_name or not date_start:
+            continue
+        objective = (data.get("objective") or "").strip()
+        rows.append(
+            {
+                "date": pd.to_datetime(date_start),
+                "channel": CHANNEL_META,
+                "campaign": campaign_name,
+                "creative_type": _meta_creative_type(campaign_name, objective),
+                "fb_ig_type": _meta_fb_ig_type(objective, campaign_name),
+                "spend": _parse_float(data.get("spend")),
+                "clicks": int(_parse_float(data.get("clicks"))),
+                "impressions": int(_parse_float(data.get("impressions"))),
+                "leads": 0.0,
+                "dcs": 0.0,
+            }
+        )
+    return rows
+
+
+def fetch_meta_campaign_daily(since: str, until: str) -> pd.DataFrame:
+    """Daily campaign metrics from Meta (spend, clicks); fetched in monthly chunks."""
+    account = _init_api()
+    rows: list[dict[str, Any]] = []
+    chunks = _insights_date_chunks(since, until)
+    errors: list[str] = []
+
+    for chunk_since, chunk_until in chunks:
+        last_exc: FacebookRequestError | None = None
+        for attempt in range(_META_INSIGHTS_MAX_RETRIES):
+            try:
+                rows.extend(
+                    _meta_campaign_daily_rows(
+                        account, since=chunk_since, until=chunk_until
+                    )
+                )
+                last_exc = None
+                break
+            except FacebookRequestError as exc:
+                last_exc = exc
+                if attempt + 1 < _META_INSIGHTS_MAX_RETRIES:
+                    time.sleep(2**attempt)
+        if last_exc is not None:
+            errors.append(
+                f"{chunk_since}→{chunk_until}: {_meta_api_error_message(last_exc)}"
             )
-    except FacebookRequestError as exc:
-        body = getattr(exc, "body", None) or str(exc)
-        raise RuntimeError(f"Meta API error: {body}") from exc
+
+    if errors and not rows:
+        raise RuntimeError(
+            "Meta API error (all insight chunks failed):\n" + "\n".join(errors)
+        )
 
     if not rows:
-        return pd.DataFrame(
-            columns=[
-                "date",
-                "channel",
-                "campaign",
-                "creative_type",
-                "fb_ig_type",
-                "spend",
-                "clicks",
-                "impressions",
-                "leads",
-                "dcs",
-            ]
-        )
-    return pd.DataFrame(rows)
+        return pd.DataFrame(columns=_META_EMPTY_DAILY_COLUMNS)
+
+    out = pd.DataFrame(rows)
+    if errors:
+        # Partial data is still useful; callers can surface errors via notes if needed.
+        out.attrs["meta_partial_errors"] = errors
+    return out
 
 
 def _ghl_channel_for_hear_about(raw: str) -> str | None:
@@ -269,13 +345,250 @@ def _ghl_channel_for_hear_about(raw: str) -> str | None:
     return None
 
 
-def fetch_ghl_channel_monthly(since: str, until: str) -> tuple[pd.DataFrame, list[str]]:
+META_LEAD_TAG = "meta lead"
+GOOGLE_LEAD_TAG = "dc thru g-ad"
+
+
+def _contact_tag_names(contact: dict[str, Any]) -> list[str]:
+    out: list[str] = []
+    for tag in contact.get("tags") or []:
+        if isinstance(tag, str):
+            name = tag
+        else:
+            name = str((tag or {}).get("name") or "")
+        name = name.strip()
+        if name:
+            out.append(name)
+    return out
+
+
+def _contact_has_tag(contact: dict[str, Any], tag_name: str) -> bool:
+    target = (tag_name or "").strip().casefold()
+    if not target:
+        return False
+    return any(t.casefold() == target for t in _contact_tag_names(contact))
+
+
+def _contact_attribution_dicts(contact: dict[str, Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for key in ("attributionSource", "lastAttributionSource"):
+        val = contact.get(key)
+        if isinstance(val, dict):
+            out.append(val)
+    return out
+
+
+def _contact_fired_meta_pixel(contact: dict[str, Any]) -> bool:
+    for attr in _contact_attribution_dicts(contact):
+        if attr.get("fbp") or attr.get("fbc"):
+            return True
+    return False
+
+
+def _contact_fired_google_tag(contact: dict[str, Any]) -> bool:
+    for attr in _contact_attribution_dicts(contact):
+        if attr.get("gaClientId"):
+            return True
+    return False
+
+
+def _is_meta_lead_contact(contact: dict[str, Any]) -> bool:
+    return _contact_has_tag(contact, META_LEAD_TAG) or _contact_fired_meta_pixel(contact)
+
+
+def _is_google_lead_contact(contact: dict[str, Any]) -> bool:
+    return _contact_has_tag(contact, GOOGLE_LEAD_TAG) or _contact_fired_google_tag(contact)
+
+
+def _calendar_days_inclusive(since: str, until: str) -> list[str]:
+    start = date.fromisoformat(since)
+    end = date.fromisoformat(until)
+    days: list[str] = []
+    cursor = start
+    while cursor <= end:
+        days.append(cursor.isoformat())
+        cursor += timedelta(days=1)
+    return days
+
+
+def _ghl_day_cache_path(day: str) -> Path:
+    return _GHL_LEADS_CACHE_DIR / f"{day}.json"
+
+
+def _ghl_day_cache_is_fresh(day: str, *, today: date | None = None) -> bool:
+    """Past days are cached indefinitely; today and yesterday always refresh."""
+    today = today or date.today()
+    age_days = (today - date.fromisoformat(day)).days
+    return age_days > 1
+
+
+def _classify_day_contacts(
+    contacts: list[dict[str, Any]],
+) -> tuple[int, int, int]:
+    total = len(contacts)
+    meta = sum(1 for contact in contacts if _is_meta_lead_contact(contact))
+    google = sum(1 for contact in contacts if _is_google_lead_contact(contact))
+    return total, meta, google
+
+
+def _fetch_day_lead_counts(day: str) -> dict[str, Any]:
+    """Load or fetch lead counts for one calendar day (disk-cached)."""
+    cache_path = _ghl_day_cache_path(day)
+    if cache_path.is_file() and _ghl_day_cache_is_fresh(day):
+        return json.loads(cache_path.read_text(encoding="utf-8"))
+
+    contacts, truncated = load_contacts_for_calendar_day(day)
+    total, meta, google = _classify_day_contacts(contacts)
+    payload = {
+        "date": day,
+        "total": total,
+        "meta": meta,
+        "google": google,
+        "truncated": truncated,
+    }
+    _GHL_LEADS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(payload), encoding="utf-8")
+    return payload
+
+
+def clear_ghl_leads_day_cache() -> None:
+    """Remove cached daily GHL lead files (used by dashboard hard refresh)."""
+    if not _GHL_LEADS_CACHE_DIR.is_dir():
+        return
+    for path in _GHL_LEADS_CACHE_DIR.glob("*.json"):
+        path.unlink(missing_ok=True)
+
+
+def _fetch_ghl_leads_by_date_added(since: str, until: str) -> dict[str, Any]:
+    """Classify new GHL contacts by date added into total / Meta / Google lead counts."""
+    days = _calendar_days_inclusive(since, until)
+    day_rows: list[dict[str, Any]] = []
+    truncated = False
+
+    pending = [
+        day
+        for day in days
+        if not (_ghl_day_cache_path(day).is_file() and _ghl_day_cache_is_fresh(day))
+    ]
+    for day in days:
+        if day not in pending:
+            day_rows.append(json.loads(_ghl_day_cache_path(day).read_text(encoding="utf-8")))
+
+    if pending:
+        workers = min(_GHL_LEADS_FETCH_WORKERS, len(pending))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_fetch_day_lead_counts, day): day for day in pending}
+            for future in as_completed(futures):
+                day_rows.append(future.result())
+
+    meta_by_month: dict[str, int] = {}
+    google_by_month: dict[str, int] = {}
+    total_by_month: dict[str, int] = {}
+    meta_total = google_total = total_new = 0
+
+    for row in day_rows:
+        day = row["date"]
+        month_key = day[:7] + "-01"
+        total = int(row.get("total") or 0)
+        meta = int(row.get("meta") or 0)
+        google = int(row.get("google") or 0)
+        truncated = truncated or bool(row.get("truncated"))
+
+        total_by_month[month_key] = total_by_month.get(month_key, 0) + total
+        meta_by_month[month_key] = meta_by_month.get(month_key, 0) + meta
+        google_by_month[month_key] = google_by_month.get(month_key, 0) + google
+        total_new += total
+        meta_total += meta
+        google_total += google
+
+    monthly: list[dict[str, Any]] = []
+    for period in pd.period_range(
+        start=pd.Timestamp(since).to_period("M"),
+        end=pd.Timestamp(until).to_period("M"),
+        freq="M",
+    ):
+        month_start = period.to_timestamp().strftime("%Y-%m-%d")
+        monthly.append(
+            {
+                "month_start": month_start,
+                "total_new_contacts": int(total_by_month.get(month_start, 0)),
+                "meta_leads": int(meta_by_month.get(month_start, 0)),
+                "google_leads": int(google_by_month.get(month_start, 0)),
+            }
+        )
+
+    cache_note = (
+        f"GHL leads: loaded {len(pending)} day(s) from API, "
+        f"{len(days) - len(pending)} from cache."
+        if pending
+        else f"GHL leads: all {len(days)} day(s) served from cache."
+    )
+
+    return {
+        "since": since,
+        "until": until,
+        "contacts_loaded": total_new,
+        "total_new_contacts": total_new,
+        "meta_leads": meta_total,
+        "google_leads": google_total,
+        "monthly": monthly,
+        "truncated_pages": truncated,
+        "total_reported": total_new,
+        "cache_note": cache_note,
+        "days_fetched_live": len(pending),
+    }
+
+
+def fetch_ghl_channel_monthly(
+    since: str, until: str
+) -> tuple[pd.DataFrame, dict[str, Any], list[str]]:
     """
     Channel-month GHL funnel metrics not available at campaign level in ads APIs.
 
-    Returns a frame with columns: month, channel, dcs, conversions
+    Returns a frame with columns: month, channel, leads, dcs, conversions
     """
     notes: list[str] = []
+    lead_summary: dict[str, Any] = {
+        "total_new_contacts": 0,
+        "meta_leads": 0,
+        "google_leads": 0,
+    }
+
+    leads_by_month_channel: dict[tuple[pd.Timestamp, str], float] = {}
+    try:
+        ghl_leads = _fetch_ghl_leads_by_date_added(since, until)
+        lead_summary = {
+            "total_new_contacts": int(ghl_leads.get("total_new_contacts") or 0),
+            "meta_leads": int(ghl_leads.get("meta_leads") or 0),
+            "google_leads": int(ghl_leads.get("google_leads") or 0),
+        }
+        if ghl_leads.get("truncated_pages"):
+            notes.append(
+                "GHL date-added search hit pagination cap on at least one day; "
+                "lead counts may be low."
+            )
+        cache_note = ghl_leads.get("cache_note")
+        if cache_note:
+            notes.append(str(cache_note))
+        live_days = int(ghl_leads.get("days_fetched_live") or 0)
+        if live_days > 30:
+            notes.append(
+                f"First load for {live_days} days can take several minutes "
+                "(GHL requires one API call per day). Later loads reuse cache."
+            )
+        for row in ghl_leads.get("monthly") or []:
+            ms = (row.get("month_start") or "")[:10]
+            if not ms:
+                continue
+            month = pd.Timestamp(ms).to_period("M").to_timestamp()
+            meta_n = float(row.get("meta_leads") or 0)
+            google_n = float(row.get("google_leads") or 0)
+            if meta_n:
+                leads_by_month_channel[(month, CHANNEL_META)] = meta_n
+            if google_n:
+                leads_by_month_channel[(month, CHANNEL_GOOGLE)] = google_n
+    except Exception as exc:
+        notes.append(f"GHL lead counts skipped: {exc}")
 
     # Meta DCs proxy: FB/IG contacts by date added
     meta_dcs_by_month: dict[str, float] = {}
@@ -339,6 +652,7 @@ def fetch_ghl_channel_monthly(since: str, until: str) -> tuple[pd.DataFrame, lis
             {
                 "month": month,
                 "channel": CHANNEL_META,
+                "leads": leads_by_month_channel.get((month, CHANNEL_META), 0.0),
                 "dcs": meta_dcs_by_month.get(month, 0.0),
                 "conversions": conv_by_month_channel.get((month, CHANNEL_META), 0.0),
             }
@@ -347,12 +661,13 @@ def fetch_ghl_channel_monthly(since: str, until: str) -> tuple[pd.DataFrame, lis
             {
                 "month": month,
                 "channel": CHANNEL_GOOGLE,
+                "leads": leads_by_month_channel.get((month, CHANNEL_GOOGLE), 0.0),
                 "dcs": 0.0,
                 "conversions": conv_by_month_channel.get((month, CHANNEL_GOOGLE), 0.0),
             }
         )
 
-    return pd.DataFrame(records), notes
+    return pd.DataFrame(records), lead_summary, notes
 
 
 def _aggregate_to_month_end(df: pd.DataFrame) -> pd.DataFrame:
@@ -382,11 +697,12 @@ def _aggregate_to_month_end(df: pd.DataFrame) -> pd.DataFrame:
 def _allocate_ghl_metrics(
     df: pd.DataFrame, ghl_monthly: pd.DataFrame
 ) -> pd.DataFrame:
-    """Spread channel-month GHL DCs & conversions across campaigns by spend share."""
+    """Spread channel-month GHL leads, DCs & conversions across campaigns by spend share."""
     if df.empty:
         return df
 
     out = df.copy()
+    out["leads"] = 0.0
     out["conversions"] = 0.0
 
     for (month, channel), ghl_row in ghl_monthly.groupby(["month", "channel"]):
@@ -396,8 +712,17 @@ def _allocate_ghl_metrics(
             continue
 
         total_spend = chunk["spend"].sum()
+        channel_leads = float(ghl_row["leads"].sum())
         channel_dcs = float(ghl_row["dcs"].sum())
         channel_conv = float(ghl_row["conversions"].sum())
+
+        if channel_leads > 0:
+            if total_spend > 0:
+                weights = chunk["spend"] / total_spend
+                out.loc[mask, "leads"] = weights * channel_leads
+            else:
+                share = channel_leads / len(chunk)
+                out.loc[mask, "leads"] = share
 
         if channel == CHANNEL_GOOGLE:
             # Google DCs already come from Ads conversions at campaign level.
@@ -457,33 +782,61 @@ def _add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
 def load_live_campaign_data(
     since: str | None = None,
     until: str | None = None,
-) -> tuple[pd.DataFrame, list[str]]:
+) -> tuple[pd.DataFrame, list[str], dict[str, int]]:
     """
     Fetch and normalize paid-media rows for the Digital Channel Dashboard.
 
     Returns:
-        (dataframe matching DATA_COLUMNS schema, list of warning/info notes)
+        (dataframe matching DATA_COLUMNS schema, list of warning/info notes,
+         GHL lead summary with total_new_contacts, meta_leads, google_leads)
     """
     today = date.today()
     until_eff = until or (today - timedelta(days=1)).isoformat()
     since_eff = since or DEFAULT_SINCE
     notes: list[str] = [
         f"Google Ads + Meta insights: {since_eff} → {until_eff} (Meta excludes today).",
+        "GHL leads: all new contacts (date added); Meta = meta lead tag and/or Meta pixel; "
+        "Google = dc thru g-ad tag and/or Google Tag (gaClientId).",
         "GHL DCs (Meta): Facebook/Instagram contacts by date added.",
         "GHL conversions: committed members with Sign Up Date + hear-about attribution.",
         "Campaign-level GHL metrics are allocated by spend share within channel-month.",
     ]
 
     gads_daily = fetch_google_ads_campaign_daily(since_eff, until_eff)
-    meta_daily = fetch_meta_campaign_daily(since_eff, until_eff)
+    try:
+        meta_daily = fetch_meta_campaign_daily(since_eff, until_eff)
+        partial_meta_errors = meta_daily.attrs.get("meta_partial_errors") or []
+        if partial_meta_errors:
+            notes.append(
+                "Meta insights partially loaded (some date chunks failed); "
+                "FB/IG spend may be incomplete."
+            )
+            for err in partial_meta_errors[:3]:
+                notes.append(f"Meta chunk error: {err}")
+            if len(partial_meta_errors) > 3:
+                notes.append(
+                    f"… and {len(partial_meta_errors) - 3} more Meta chunk errors."
+                )
+    except Exception as exc:
+        notes.append(f"Meta campaign insights skipped: {exc}")
+        meta_daily = pd.DataFrame(columns=_META_EMPTY_DAILY_COLUMNS)
+
     daily = pd.concat([gads_daily, meta_daily], ignore_index=True)
 
     monthly_ads = _aggregate_to_month_end(daily)
-    ghl_monthly, ghl_notes = fetch_ghl_channel_monthly(since_eff, until_eff)
+    ghl_monthly, lead_summary, ghl_notes = fetch_ghl_channel_monthly(
+        since_eff, until_eff
+    )
     notes.extend(ghl_notes)
+    notes.append(
+        "GHL new contacts in range: "
+        f"{lead_summary.get('total_new_contacts', 0):,} total · "
+        f"{lead_summary.get('meta_leads', 0):,} Meta · "
+        f"{lead_summary.get('google_leads', 0):,} Google."
+    )
 
     if monthly_ads.empty:
-        return pd.DataFrame(columns=DATA_COLUMNS), notes
+        return pd.DataFrame(columns=DATA_COLUMNS), notes, lead_summary
 
     merged = _allocate_ghl_metrics(monthly_ads, ghl_monthly)
     merged = _add_derived_columns(merged)
@@ -494,10 +847,11 @@ def load_live_campaign_data(
 
     result = merged[DATA_COLUMNS].copy()
     result["month"] = result["date"].dt.to_period("M").dt.to_timestamp()
-    return result, notes
+    return result, notes, lead_summary
 
 
 __all__ = [
+    "clear_ghl_leads_day_cache",
     "load_live_campaign_data",
     "monthly_campaign_summary",
     "scorecard_metrics",
