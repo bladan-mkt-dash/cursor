@@ -11,5 +11,6 @@ __pycache__/
 .streamlit/secrets.toml
 outputs/
 embed_pages_cache.json
+.cache/
 __pycache__/
 *.pyc

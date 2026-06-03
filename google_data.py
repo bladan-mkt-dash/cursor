@@ -1,7 +1,7 @@
 import html
 import os
 import re
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -672,6 +672,77 @@ def get_top_landing_page_by_sessions(
     if best_path is None or best_sessions < 0:
         return None, None
     return best_path, best_sessions
+
+
+def _blog_stem_page_filter() -> FilterExpression:
+    """GA4 pages under ``https://fivejourneys.com/blog/`` (``pagePath`` begins with ``/blog``)."""
+    return _page_path_begins_with_filter("/blog")
+
+
+def get_blog_stem_metrics(start_date: str, end_date: str) -> dict[str, float]:
+    """
+    GA4 totals for pages whose path starts with ``/blog`` (blog index, pagination, etc.).
+
+    Returns screenPageViews, activeUsers, sessions, averageSessionDuration (seconds),
+    bounceRate (0–1).
+    """
+    _ensure_ga_credentials()
+    property_id = _strip_env(os.getenv("GA4_PROPERTY_ID"))
+    if not property_id:
+        raise ValueError("Set GA4_PROPERTY_ID in .env")
+
+    client = BetaAnalyticsDataClient()
+    request = RunReportRequest(
+        property=f"properties/{property_id}",
+        metrics=[
+            Metric(name="screenPageViews"),
+            Metric(name="activeUsers"),
+            Metric(name="sessions"),
+            Metric(name="averageSessionDuration"),
+            Metric(name="bounceRate"),
+        ],
+        date_ranges=[DateRange(start_date=start_date, end_date=end_date)],
+        dimension_filter=_blog_stem_page_filter(),
+    )
+    response = client.run_report(request)
+    if not response.rows:
+        return {
+            "screenPageViews": 0.0,
+            "activeUsers": 0.0,
+            "sessions": 0.0,
+            "averageSessionDuration": 0.0,
+            "bounceRate": 0.0,
+        }
+    mv = response.rows[0].metric_values
+    return {
+        "screenPageViews": float(mv[0].value),
+        "activeUsers": float(mv[1].value),
+        "sessions": float(mv[2].value),
+        "averageSessionDuration": float(mv[3].value),
+        "bounceRate": float(mv[4].value),
+    }
+
+
+def count_blog_posts_published(start_date: str, end_date: str) -> int:
+    """Count WordPress posts published in ``[start_date, end_date]`` (inclusive, YYYY-MM-DD)."""
+    end_exclusive = date.fromisoformat(end_date) + timedelta(days=1)
+    resp = requests.get(
+        _WP_POSTS_API,
+        params={
+            "after": f"{start_date}T00:00:00",
+            "before": f"{end_exclusive.isoformat()}T00:00:00",
+            "per_page": 1,
+            "status": "publish",
+        },
+        timeout=30,
+        headers={"User-Agent": "FiveJourneys-GA4-Report/1.0"},
+    )
+    if resp.status_code != 200:
+        return 0
+    total = resp.headers.get("X-WP-Total")
+    if total is not None:
+        return int(total)
+    return len(resp.json())
 
 
 def get_blog_pageviews_total(start_date: str, end_date: str) -> int:

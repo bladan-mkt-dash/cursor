@@ -1,0 +1,4 @@
+# Local-only (see repo .gitignore). Fixes "empty host" in some clients when opening the app URL.
+[server]
+address = "127.0.0.1"
+port = 8502

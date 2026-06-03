@@ -514,6 +514,129 @@ def contact_created_utc_date_str(contact: dict[str, Any]) -> str | None:
     return dt.strftime("%Y-%m-%d")
 
 
+META_LEAD_TAG = "meta lead"
+GOOGLE_LEAD_TAG = "dc thru g-ad"
+
+
+def contact_tag_names(contact: dict[str, Any]) -> list[str]:
+    """Normalized tag names from a GHL contact (strings or ``{name: ...}`` objects)."""
+    out: list[str] = []
+    for tag in contact.get("tags") or []:
+        if isinstance(tag, str):
+            name = tag
+        else:
+            name = str((tag or {}).get("name") or "")
+        name = name.strip()
+        if name:
+            out.append(name)
+    return out
+
+
+def contact_has_tag(contact: dict[str, Any], tag_name: str) -> bool:
+    target = (tag_name or "").strip().casefold()
+    if not target:
+        return False
+    return any(t.casefold() == target for t in contact_tag_names(contact))
+
+
+def _contact_attribution_dicts(contact: dict[str, Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for key in ("attributionSource", "lastAttributionSource"):
+        val = contact.get(key)
+        if isinstance(val, dict):
+            out.append(val)
+    return out
+
+
+def contact_fired_meta_pixel(contact: dict[str, Any]) -> bool:
+    """True when GHL attribution captured a Meta pixel signal (``fbp`` / ``fbc``)."""
+    for attr in _contact_attribution_dicts(contact):
+        if attr.get("fbp") or attr.get("fbc"):
+            return True
+    return False
+
+
+def contact_fired_google_tag(contact: dict[str, Any]) -> bool:
+    """True when GHL attribution captured Google Tag / gtag (``gaClientId``)."""
+    for attr in _contact_attribution_dicts(contact):
+        if attr.get("gaClientId"):
+            return True
+    return False
+
+
+def is_meta_lead_contact(contact: dict[str, Any]) -> bool:
+    """Meta lead = ``meta lead`` tag or Meta pixel fired on the contact."""
+    return contact_has_tag(contact, META_LEAD_TAG) or contact_fired_meta_pixel(contact)
+
+
+def is_google_lead_contact(contact: dict[str, Any]) -> bool:
+    """Google lead = ``dc thru g-ad`` tag or Google Tag fired on the contact."""
+    return contact_has_tag(contact, GOOGLE_LEAD_TAG) or contact_fired_google_tag(contact)
+
+
+def fetch_leads_by_date_added(
+    since: str,
+    until: str,
+    *,
+    location_id: str | None = None,
+) -> dict[str, Any]:
+    """
+    Classify new GHL contacts (``dateAdded`` in range) for paid-channel lead counts.
+
+    - **Total leads** — every contact created in the window.
+    - **Meta leads** — ``meta lead`` tag and/or Meta pixel (``fbp`` / ``fbc``).
+    - **Google leads** — ``dc thru g-ad`` tag and/or Google Tag (``gaClientId``).
+
+    Returns monthly roll-ups keyed by month-start timestamp (``YYYY-MM-01``) plus totals.
+    """
+    contacts, truncated = fetch_contacts_date_added_complete(
+        since, until, location_id=location_id
+    )
+    total_reported = len(contacts)
+
+    meta_by_month: dict[str, int] = {}
+    google_by_month: dict[str, int] = {}
+    total_by_month: dict[str, int] = {}
+    meta_total = google_total = 0
+
+    for contact in contacts:
+        created = contact_created_utc_date_str(contact)
+        if not created:
+            continue
+        month_key = created[:7] + "-01"
+        total_by_month[month_key] = total_by_month.get(month_key, 0) + 1
+
+        if is_meta_lead_contact(contact):
+            meta_by_month[month_key] = meta_by_month.get(month_key, 0) + 1
+            meta_total += 1
+        if is_google_lead_contact(contact):
+            google_by_month[month_key] = google_by_month.get(month_key, 0) + 1
+            google_total += 1
+
+    monthly: list[dict[str, Any]] = []
+    for month_start, _ in _month_periods_inclusive(since, until):
+        monthly.append(
+            {
+                "month_start": month_start,
+                "total_new_contacts": int(total_by_month.get(month_start, 0)),
+                "meta_leads": int(meta_by_month.get(month_start, 0)),
+                "google_leads": int(google_by_month.get(month_start, 0)),
+            }
+        )
+
+    return {
+        "since": since,
+        "until": until,
+        "contacts_loaded": len(contacts),
+        "total_new_contacts": len(contacts),
+        "meta_leads": meta_total,
+        "google_leads": google_total,
+        "monthly": monthly,
+        "truncated_pages": truncated,
+        "total_reported": total_reported,
+    }
+
+
 def _calendar_dates_inclusive(since: str, until: str) -> list[str]:
     """Inclusive ``YYYY-MM-DD`` strings from ``since`` through ``until``."""
     a = datetime.strptime(since, "%Y-%m-%d").date()
@@ -765,6 +888,248 @@ def search_contacts_date_added_range(
         truncated = True
 
     return out, truncated, total_reported
+
+
+# GHL returns HTTP 400 around page ~101 for large ``dateAdded`` windows.
+_GHL_DATE_ADDED_MAX_PAGES = 100
+_GHL_DATE_ADDED_MIN_SPLIT_MS = 60_000
+
+
+def _search_contacts_date_added_ms_range(
+    start_ms: int,
+    end_ms: int,
+    *,
+    location_id: str | None = None,
+    page_limit: int = 100,
+    max_pages: int = _GHL_DATE_ADDED_MAX_PAGES,
+) -> tuple[list[dict[str, Any]], bool]:
+    """
+    Page through contacts for an exact ``dateAdded`` millisecond window.
+
+    Returns ``(contacts, truncated)`` where ``truncated`` is True when the page
+    cap was hit (more rows likely exist).
+    """
+    contacts, truncated, _ = _search_contacts_date_added_ms_range_reported(
+        start_ms,
+        end_ms,
+        location_id=location_id,
+        page_limit=page_limit,
+        max_pages=max_pages,
+    )
+    return contacts, truncated
+
+
+def _search_contacts_date_added_ms_range_reported(
+    start_ms: int,
+    end_ms: int,
+    *,
+    location_id: str | None = None,
+    page_limit: int = 100,
+    max_pages: int = _GHL_DATE_ADDED_MAX_PAGES,
+) -> tuple[list[dict[str, Any]], bool, int]:
+    """Like ``_search_contacts_date_added_ms_range`` but also returns API ``total``."""
+    if location_id and location_id.strip():
+        location_id = location_id.strip()
+    else:
+        location_id = _location_id()
+    if not location_id:
+        raise ValueError("Set GHL_LOCATION_ID in .env")
+
+    filters: list[dict[str, Any]] = [
+        {
+            "field": "dateAdded",
+            "operator": "range",
+            "value": {"gte": start_ms, "lte": end_ms},
+        }
+    ]
+
+    out: list[dict[str, Any]] = []
+    total_reported = 0
+    for p in range(1, max_pages + 1):
+        payload: dict[str, Any] = {
+            "locationId": location_id,
+            "pageLimit": page_limit,
+            "page": p,
+            "filters": filters,
+        }
+        data = _ghl_post_json("/contacts/search", payload)
+        batch = data.get("contacts")
+        if batch is None:
+            inner = data.get("data")
+            batch = inner if isinstance(inner, list) else []
+        if not isinstance(batch, list):
+            batch = []
+        if p == 1:
+            tr = data.get("total")
+            if isinstance(tr, int):
+                total_reported = tr
+            elif isinstance(tr, str) and tr.isdigit():
+                total_reported = int(tr)
+        out.extend(batch)
+        if not batch or len(batch) < page_limit:
+            return out, False, total_reported
+    return out, True, total_reported
+
+
+def _fetch_contacts_date_added_ms_adaptive(
+    start_ms: int,
+    end_ms: int,
+    *,
+    location_id: str | None = None,
+    depth: int = 0,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Recursively split oversized ``dateAdded`` windows that exceed GHL page limits."""
+    if end_ms < start_ms:
+        return [], False
+
+    try:
+        batch, truncated = _search_contacts_date_added_ms_range(
+            start_ms, end_ms, location_id=location_id
+        )
+    except RuntimeError:
+        if (
+            depth > 24
+            or end_ms - start_ms <= _GHL_DATE_ADDED_MIN_SPLIT_MS
+        ):
+            raise
+        mid = (start_ms + end_ms) // 2
+        left, t_left = _fetch_contacts_date_added_ms_adaptive(
+            start_ms, mid, location_id=location_id, depth=depth + 1
+        )
+        right, t_right = _fetch_contacts_date_added_ms_adaptive(
+            mid + 1, end_ms, location_id=location_id, depth=depth + 1
+        )
+        merged = {str(c.get("id") or ""): c for c in left + right if c.get("id")}
+        return list(merged.values()), t_left or t_right
+
+    if truncated and end_ms - start_ms > _GHL_DATE_ADDED_MIN_SPLIT_MS:
+        mid = (start_ms + end_ms) // 2
+        left, t_left = _fetch_contacts_date_added_ms_adaptive(
+            start_ms, mid, location_id=location_id, depth=depth + 1
+        )
+        right, t_right = _fetch_contacts_date_added_ms_adaptive(
+            mid + 1, end_ms, location_id=location_id, depth=depth + 1
+        )
+        merged = {str(c.get("id") or ""): c for c in left + right if c.get("id")}
+        return list(merged.values()), t_left or t_right
+
+    return batch, truncated
+
+
+def _calendar_day_chunks(since: str, until: str) -> list[tuple[str, str]]:
+    """Inclusive daily ``YYYY-MM-DD`` windows from ``since`` through ``until``."""
+    range_start = datetime.strptime(since, "%Y-%m-%d").date()
+    range_end = datetime.strptime(until, "%Y-%m-%d").date()
+    chunks: list[tuple[str, str]] = []
+    cursor = range_start
+    while cursor <= range_end:
+        chunks.append((cursor.isoformat(), cursor.isoformat()))
+        cursor += timedelta(days=1)
+    return chunks
+
+
+def _hourly_ms_chunks(start_ms: int, end_ms: int) -> list[tuple[int, int]]:
+    """Split a millisecond window into one-hour slices (inclusive)."""
+    chunks: list[tuple[int, int]] = []
+    hour_ms = 3_600_000
+    cursor = start_ms
+    while cursor <= end_ms:
+        chunk_end = min(cursor + hour_ms - 1, end_ms)
+        chunks.append((cursor, chunk_end))
+        cursor = chunk_end + 1
+    return chunks
+
+
+def _load_contacts_for_day_ms(
+    start_ms: int,
+    end_ms: int,
+    *,
+    location_id: str | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """
+    Load one calendar day of ``dateAdded`` contacts.
+
+    Tries the full day first, then hourly windows, then recursive splits for
+    bulk-import spikes that exceed GHL's ~100 page pagination cap.
+    """
+    page_limit = 100
+    page_cap = _GHL_DATE_ADDED_MAX_PAGES * page_limit
+
+    try:
+        probe, truncated_probe, total_reported = (
+            _search_contacts_date_added_ms_range_reported(
+                start_ms, end_ms, location_id=location_id, max_pages=1
+            )
+        )
+    except RuntimeError:
+        probe, truncated_probe, total_reported = [], False, 0
+
+    needs_split = total_reported > page_cap or (
+        len(probe) >= page_limit and total_reported > page_limit
+    )
+
+    if not needs_split:
+        if len(probe) < page_limit:
+            return probe, False
+        try:
+            batch, truncated, _ = _search_contacts_date_added_ms_range_reported(
+                start_ms, end_ms, location_id=location_id
+            )
+            if not truncated:
+                return batch, False
+        except RuntimeError:
+            pass
+
+    combined: dict[str, dict[str, Any]] = {}
+    day_truncated = needs_split or truncated_probe
+    for hour_start, hour_end in _hourly_ms_chunks(start_ms, end_ms):
+        hour_batch, hour_truncated = _fetch_contacts_date_added_ms_adaptive(
+            hour_start, hour_end, location_id=location_id
+        )
+        day_truncated = day_truncated or hour_truncated
+        for contact in hour_batch:
+            cid = str(contact.get("id") or "")
+            if cid:
+                combined[cid] = contact
+    return list(combined.values()), day_truncated
+
+
+def fetch_contacts_date_added_complete(
+    since: str,
+    until: str,
+    *,
+    location_id: str | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """
+    Load all contacts created in ``[since, until]`` (inclusive calendar dates).
+
+    Uses daily windows and recursively splits any window that hits GHL's deep
+    pagination limit (~100 pages), which otherwise returns HTTP 400 and yields
+    zero leads in downstream dashboards.
+    """
+    combined: dict[str, dict[str, Any]] = {}
+    truncated = False
+    for chunk_since, chunk_until in _calendar_day_chunks(since, until):
+        start_ms, end_ms = _inclusive_utc_range_ms(chunk_since, chunk_until)
+        batch, part_truncated = _load_contacts_for_day_ms(
+            start_ms, end_ms, location_id=location_id
+        )
+        truncated = truncated or part_truncated
+        for contact in batch:
+            cid = str(contact.get("id") or "")
+            if cid:
+                combined[cid] = contact
+    return list(combined.values()), truncated
+
+
+def load_contacts_for_calendar_day(
+    day: str,
+    *,
+    location_id: str | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """All contacts whose ``dateAdded`` falls on ``day`` (``YYYY-MM-DD``, UTC)."""
+    start_ms, end_ms = _inclusive_utc_range_ms(day, day)
+    return _load_contacts_for_day_ms(start_ms, end_ms, location_id=location_id)
 
 
 def classify_hear_about_wom_vs_google(raw: str) -> str | None:
