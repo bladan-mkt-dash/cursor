@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -2228,14 +2229,14 @@ def count_calendar_funnel_events(
     )
 
 
-def count_calendar_bookings_by_date_added(
+def _calendar_bookings_in_date_added_range(
     since: str,
     until: str,
     *,
     location_id: str | None = None,
-) -> tuple[int, int]:
+) -> tuple[list[dict[str, Any]], int]:
     """
-    Count non-deleted calendar events whose ``dateAdded`` falls on days in
+    Non-deleted calendar events whose ``dateAdded`` falls on days in
     ``[since, until]`` inclusive (YYYY-MM-DD).
 
     Scans events with ``startTime`` from seven days before ``since`` through
@@ -2243,7 +2244,7 @@ def count_calendar_bookings_by_date_added(
     included.
 
     Returns:
-        (booking_count, calendar_api_errors)
+        (booking_events, calendar_api_errors)
     """
     if location_id and location_id.strip():
         loc = location_id.strip()
@@ -2279,7 +2280,7 @@ def count_calendar_bookings_by_date_added(
     }
 
     seen_ids: set[str] = set()
-    booking_count = 0
+    bookings: list[dict[str, Any]] = []
     api_errors = 0
 
     for calendar in calendars:
@@ -2309,6 +2310,154 @@ def count_calendar_bookings_by_date_added(
                 continue
             added_day = _event_date_added_ymd(event)
             if added_day in allowed_days:
-                booking_count += 1
+                bookings.append(event)
 
-    return booking_count, api_errors
+    return bookings, api_errors
+
+
+def count_calendar_bookings_by_date_added(
+    since: str,
+    until: str,
+    *,
+    location_id: str | None = None,
+) -> tuple[int, int]:
+    """
+    Count non-deleted calendar events whose ``dateAdded`` falls on days in
+    ``[since, until]`` inclusive (YYYY-MM-DD).
+
+    Returns:
+        (booking_count, calendar_api_errors)
+    """
+    bookings, api_errors = _calendar_bookings_in_date_added_range(
+        since, until, location_id=location_id
+    )
+    return len(bookings), api_errors
+
+
+def _normalize_hear_about_label(raw: str) -> str:
+    text = (raw or "").strip()
+    return text if text else "(Not set)"
+
+
+def _hear_about_rows_from_counter(counter: Counter[str]) -> list[dict[str, Any]]:
+    return [
+        {"source": label, "count": int(count)}
+        for label, count in counter.most_common()
+    ]
+
+
+def fetch_contact_by_id(
+    contact_id: str,
+    *,
+    location_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Load a single contact by id (returns None if the API call fails)."""
+    if not (contact_id or "").strip():
+        return None
+    if location_id and location_id.strip():
+        loc = location_id.strip()
+    else:
+        loc = _location_id()
+    if not loc:
+        raise ValueError("Set GHL_LOCATION_ID in .env")
+    try:
+        data = _ghl_get_json(
+            f"/contacts/{contact_id.strip()}",
+            params={"locationId": loc},
+            timeout=60,
+        )
+    except (RuntimeError, requests.RequestException):
+        return None
+    contact = data.get("contact")
+    if isinstance(contact, dict):
+        return contact
+    if isinstance(data, dict) and data.get("id"):
+        return data
+    return None
+
+
+def fetch_bookings_by_hear_about_us(
+    since: str,
+    until: str,
+    *,
+    location_id: str | None = None,
+    field_name: str = HEAR_ABOUT_US_FIELD_NAME,
+) -> dict[str, Any]:
+    """
+    Calendar bookings (``dateAdded`` in range) grouped by the linked contact's
+    **How did you hear about us?** custom field value.
+    """
+    hear_id = resolve_hear_about_us_custom_field_id(location_id, field_name=field_name)
+    bookings, api_errors = _calendar_bookings_in_date_added_range(
+        since, until, location_id=location_id
+    )
+
+    by_source: Counter[str] = Counter()
+    contact_cache: dict[str, dict[str, Any] | None] = {}
+    missing_contact_link = 0
+    contact_lookup_failures = 0
+
+    for event in bookings:
+        contact_id = event.get("contactId")
+        if not contact_id:
+            missing_contact_link += 1
+            by_source["(No contact linked)"] += 1
+            continue
+        cid = str(contact_id)
+        if cid not in contact_cache:
+            contact_cache[cid] = fetch_contact_by_id(cid, location_id=location_id)
+        contact = contact_cache[cid]
+        if not contact:
+            contact_lookup_failures += 1
+            by_source["(Contact not found)"] += 1
+            continue
+        label = _normalize_hear_about_label(contact_custom_field_value(contact, hear_id))
+        by_source[label] += 1
+
+    return {
+        "since": since,
+        "until": until,
+        "field_id": hear_id,
+        "field_name": field_name,
+        "rows": _hear_about_rows_from_counter(by_source),
+        "total_bookings": len(bookings),
+        "calendar_api_errors": api_errors,
+        "missing_contact_link": missing_contact_link,
+        "contact_lookup_failures": contact_lookup_failures,
+        "unique_contacts": len(contact_cache),
+    }
+
+
+def fetch_committed_yes_by_hear_about_us(
+    since: str,
+    until: str,
+    *,
+    location_id: str | None = None,
+    field_name: str = HEAR_ABOUT_US_FIELD_NAME,
+) -> dict[str, Any]:
+    """
+    Contacts with **Sign Up Date** in range and **Committed?** = **Yes**, grouped
+    by **How did you hear about us?**
+    """
+    hear_id = resolve_hear_about_us_custom_field_id(location_id, field_name=field_name)
+    cohort = fetch_signup_date_range_committed_yes_contacts(
+        since, until, location_id=location_id
+    )
+    contacts = cohort["contacts"]
+
+    by_source: Counter[str] = Counter()
+    for contact in contacts:
+        label = _normalize_hear_about_label(contact_custom_field_value(contact, hear_id))
+        by_source[label] += 1
+
+    return {
+        "since": since,
+        "until": until,
+        "field_id": hear_id,
+        "field_name": field_name,
+        "rows": _hear_about_rows_from_counter(by_source),
+        "total_committed": len(contacts),
+        "truncated_pages": bool(cohort.get("truncated_pages")),
+        "excluded_not_committed_yes": int(cohort.get("excluded_not_committed_yes") or 0),
+        "signup_matches_loaded": int(cohort.get("signup_matches_loaded") or 0),
+    }

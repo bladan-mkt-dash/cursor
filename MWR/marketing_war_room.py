@@ -1,20 +1,24 @@
 """
 Marketing War Room — single-screen operational pulse.
 
-Run:
+Run (from this folder):
   streamlit run marketing_war_room.py
+
+Or from the repo root:
+  streamlit run MWR/marketing_war_room.py
 
 Build in stages (suggested order):
   1. Layout shell, styling, refresh controls
   2. Command strip — top-line KPIs across all channels
-  3. Paid media — Google Ads + Meta (spend, leads, CPA)
+  3. Paid media — Google Ads + Meta (spend, leads, CPL)
   4. CRM & funnel — GHL signups, bookings, conversions
   5. Website & traffic — GA4 sessions, channels, embed pages
   6. Organic social — Instagram / Meta engagement
   7. Content & SEO — blog traffic, organic search trends
-  8. Team & projects — Monday.com board activity          ← you are here
-  9. Needs response — marketing-only Gmail + Google Chat queue
-  10. Alerts — thresholds, anomalies, stale-data warnings
+  8. Team & projects — Monday.com board activity
+  9. Discovery Call & Conversion Drivers — GHL hear-about bar charts
+  10. Needs response — marketing-only Gmail + Google Chat queue
+  11. Alerts — thresholds, anomalies, stale-data warnings
 
 Needs response scope (marketing-only, not a full inbox):
   - Gmail: unread in a dedicated label/filter (e.g. Marketing/Action)
@@ -25,10 +29,15 @@ Needs response scope (marketing-only, not a full inbox):
 from __future__ import annotations
 
 import html
+import sys
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 import plotly.graph_objects as go
 import streamlit as st
@@ -37,7 +46,9 @@ from dotenv import load_dotenv
 from war_room_data import (
     CommandStripMetrics,
     ContentSeoMetrics,
+    ConversionDriversMetrics,
     CrmFunnelMetrics,
+    HearAboutCountRow,
     OrganicSocialMetrics,
     PaidMediaMetrics,
     TeamOpsMetrics,
@@ -45,17 +56,21 @@ from war_room_data import (
     WebsiteTrafficMetrics,
     load_command_strip,
     load_content_seo,
+    load_conversion_drivers,
     load_crm_funnel,
     load_organic_social,
     load_paid_media,
     load_team_ops,
     load_website_traffic,
 )
+from ghl_client import HEAR_ABOUT_US_FIELD_NAME  # noqa: E402 — after war_room_data reloads ghl_client
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 # Bump when loader logic changes — invalidates @st.cache_data without a server restart.
-WAR_ROOM_LOADER_VERSION = "2026-06-01-v2"
+WAR_ROOM_LOADER_VERSION = "2026-06-04-conversion-drivers-v2"
+
+SPARKLINE_HEIGHT_PX = 44
 
 COLORS = {
     "accent": "#5DA68A",
@@ -75,6 +90,7 @@ COLORS = {
 def _inject_styles() -> None:
     panel_keys = (
         "war-room-command-strip",
+        "war-room-conversion-drivers",
         "war-room-paid-media",
         "war-room-crm-funnel",
         "war-room-website-traffic",
@@ -109,18 +125,31 @@ def _inject_styles() -> None:
         [data-testid="stMetric"] {{
             background: white;
             border-radius: 10px;
-            padding: 0.5rem 0.75rem;
+            padding: 0.45rem 0.6rem;
             box-shadow: 0 1px 2px rgba(38,69,64,0.06);
             border: 1px solid rgba(93,166,138,0.12);
+            min-width: 0;
+            overflow: hidden;
         }}
         [data-testid="stMetricLabel"] {{
             color: {COLORS["accent_dark"]} !important;
             font-weight: 600;
-            font-size: 0.78rem;
+            font-size: 0.72rem;
+            line-height: 1.25;
         }}
-        [data-testid="stMetricValue"] {{
+        [data-testid="stMetricValue"],
+        [data-testid="stMetricValue"] > div {{
             color: {COLORS["accent"]} !important;
-            font-size: 1.35rem;
+            font-size: 1rem !important;
+            line-height: 1.2 !important;
+            font-weight: 600;
+            overflow-wrap: anywhere;
+            word-break: break-word;
+        }}
+        [data-testid="stMetricDelta"],
+        [data-testid="stMetricDelta"] > div {{
+            font-size: 0.68rem !important;
+            line-height: 1.2 !important;
         }}
         [data-testid="stCaptionContainer"] p,
         [data-testid="stCaptionContainer"] {{
@@ -168,19 +197,27 @@ def _inject_styles() -> None:
         .war-room-sparkline-placeholder {{
             background: rgba(107, 124, 147, 0.08);
             border: 1px dashed rgba(107, 124, 147, 0.35);
-            border-radius: 8px;
+            border-radius: 6px;
             color: {COLORS["muted"]};
-            font-size: 0.72rem;
-            height: 72px;
+            font-size: 0.68rem;
+            height: {SPARKLINE_HEIGHT_PX}px;
             display: flex;
             align-items: center;
             justify-content: center;
-            margin-top: 0.35rem;
+            margin-top: 0.2rem;
+        }}
+        div[data-testid="stPlotlyChart"] {{
+            margin-top: 0.15rem;
+            margin-bottom: 0;
+        }}
+        div[data-testid="stPlotlyChart"] iframe {{
+            max-height: {SPARKLINE_HEIGHT_PX}px !important;
         }}
         .war-room-trend-label {{
             color: {COLORS["muted"]};
             font-size: 0.72rem;
-            margin-top: 0.15rem;
+            margin-top: 0.1rem;
+            margin-bottom: 0;
         }}
         {panel_rules}
         </style>
@@ -222,6 +259,14 @@ def _panel(title: str, caption: str, key: str) -> Iterator[None]:
 # ---------------------------------------------------------------------------
 # Data loaders — wire these up in later stages
 # ---------------------------------------------------------------------------
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_conversion_drivers(
+    _loader_version: str = WAR_ROOM_LOADER_VERSION,
+) -> ConversionDriversMetrics:
+    """Discovery Call & Conversion Drivers — GHL hear-about breakdowns (7 days)."""
+    return load_conversion_drivers()
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -311,7 +356,13 @@ def _fmt_pct(value: float | None) -> str:
 def _fmt_vs_prior_avg(pct: float | None) -> str | None:
     if pct is None:
         return None
-    return f"{pct:+.0f}% vs 6d avg"
+    return f"{pct:+.0f}% vs prior 7d"
+
+
+def _fmt_vs_prior_mtd(pct: float | None) -> str | None:
+    if pct is None:
+        return None
+    return f"{pct:+.0f}% vs prior MTD"
 
 
 def _sparkline_figure(trend: TrendSeries) -> go.Figure | None:
@@ -339,7 +390,7 @@ def _sparkline_figure(trend: TrendSeries) -> go.Figure | None:
                 y=y[-2:],
                 mode="lines+markers",
                 line=dict(color="rgba(93,166,138,0.45)", width=2, dash="dot"),
-                marker=dict(size=5, color="rgba(93,166,138,0.45)"),
+                marker=dict(size=4, color="rgba(93,166,138,0.45)"),
                 hoverinfo="skip",
             )
         )
@@ -355,8 +406,8 @@ def _sparkline_figure(trend: TrendSeries) -> go.Figure | None:
         )
 
     fig.update_layout(
-        height=72,
-        margin=dict(l=4, r=4, t=4, b=4),
+        height=SPARKLINE_HEIGHT_PX,
+        margin=dict(l=2, r=2, t=2, b=2),
         showlegend=False,
         xaxis=dict(visible=False, fixedrange=True),
         yaxis=dict(visible=False, fixedrange=True, rangemode="tozero"),
@@ -375,7 +426,12 @@ def _render_sparkline(trend: TrendSeries) -> None:
             unsafe_allow_html=True,
         )
         return
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        height=SPARKLINE_HEIGHT_PX,
+        config={"displayModeBar": False},
+    )
 
 
 def _render_trend_metric(
@@ -397,8 +453,59 @@ def _render_trend_metric(
         )
 
 
+def _horizontal_bar_figure(
+    rows: list[HearAboutCountRow],
+    *,
+    title: str,
+) -> go.Figure | None:
+    if not rows:
+        return None
+    ordered = sorted(rows, key=lambda r: r.count)
+    fig = go.Figure(
+        go.Bar(
+            x=[r.count for r in ordered],
+            y=[r.source for r in ordered],
+            orientation="h",
+            marker=dict(color=COLORS["accent"]),
+            text=[f"{r.count:,}" for r in ordered],
+            textposition="outside",
+            cliponaxis=False,
+            hoverinfo="skip",
+        )
+    )
+    bar_height = 26
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=13, color=COLORS["accent_dark"])),
+        height=max(140, min(380, bar_height * len(ordered) + 48)),
+        margin=dict(l=4, r=52, t=36, b=4),
+        showlegend=False,
+        xaxis=dict(title="", fixedrange=True, showgrid=True, gridcolor="rgba(107,124,147,0.15)"),
+        yaxis=dict(title="", automargin=True, fixedrange=True),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        dragmode=False,
+    )
+    return fig
+
+
+def _render_hear_about_bar_chart(
+    rows: list[HearAboutCountRow],
+    *,
+    title: str,
+    total: int | None,
+) -> None:
+    fig = _horizontal_bar_figure(rows, title=title)
+    if fig is None:
+        st.caption("No records in this window.")
+        return
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    if total is not None:
+        st.caption(f"Total: {total:,}")
+
+
 def _clear_caches() -> None:
     _load_command_strip.clear()
+    _load_conversion_drivers.clear()
     _load_paid_media.clear()
     _load_crm_funnel.clear()
     _load_website_traffic.clear()
@@ -422,7 +529,7 @@ def _render_header(last_refresh: datetime) -> None:
             <h1>Marketing War Room</h1>
             <div class="war-room-status">
                 Last refresh · {ts}<br>
-                Single-screen pulse · 8 of 10 panels live
+                Single-screen pulse · 9 of 11 panels live
             </div>
         </div>
         """,
@@ -431,48 +538,104 @@ def _render_header(last_refresh: datetime) -> None:
 
 
 def _render_command_strip(data: CommandStripMetrics) -> None:
+    period = (
+        f"{data.period_since} – {data.period_until}"
+        if data.period_since and data.period_until
+        else "last 7 days"
+    )
     with _panel(
         "Command strip",
-        "Cross-channel snapshot · today + MTD · Google Ads + Meta + GHL + GA4",
+        f"Cross-channel snapshot · {period} + MTD · Google Ads + Meta + GHL + GA4",
         "war-room-command-strip",
     ):
         st.caption(
-            "Trend row · 7-day sparklines on spend, leads, and sessions. "
+            "All headline counts are 7-day totals (same window as sparklines). "
             "Today is dimmed on Meta- and GA4-backed series (intraday may be incomplete)."
         )
 
         trend_spend, trend_leads, trend_sessions = st.columns(3, gap="small")
         with trend_spend:
             _render_trend_metric(
-                "Ad spend (today)",
-                _fmt_currency(data.spend_today),
+                "Ad spend (7d)",
+                _fmt_currency(data.spend_7d),
                 data.spend_trend,
-                trend_caption="7d trend · Google Ads + Meta · today dimmed",
+                trend_caption="Daily spend · Google Ads + Meta · today dimmed",
             )
         with trend_leads:
             _render_trend_metric(
-                "Leads (today)",
-                _fmt_count(data.leads_today),
+                "Leads (7d)",
+                _fmt_count(data.leads_7d),
                 data.leads_trend,
-                trend_caption="7d trend · Google Ads + Meta · today dimmed",
+                trend_caption="Daily leads · Google Ads + Meta · today dimmed",
             )
         with trend_sessions:
             _render_trend_metric(
-                "GA4 sessions (today)",
-                _fmt_count(data.sessions_today),
+                "GA4 sessions (7d)",
+                _fmt_count(data.sessions_7d),
                 data.sessions_trend,
-                trend_caption="7d trend · GA4 · today dimmed",
+                trend_caption="Daily sessions · GA4 · today dimmed",
             )
 
-        st.caption("Snapshot row · today counts without trend (sparse daily signal).")
+        st.caption(f"GHL funnel · {period} · deltas vs prior 7d (MTD vs same days last month)")
         snap_a, snap_b, snap_c = st.columns(3, gap="small")
         with snap_a:
-            st.metric("GHL signups (today)", _fmt_count(data.signups_today))
+            st.metric(
+                "GHL signups (7d)",
+                _fmt_count(data.signups_7d),
+                delta=_fmt_vs_prior_avg(data.signups_7d_vs_prior_pct),
+                delta_color="normal",
+            )
         with snap_b:
-            st.metric("Bookings (today)", _fmt_count(data.bookings_today))
+            st.metric(
+                "Bookings (7d)",
+                _fmt_count(data.bookings_7d),
+                delta=_fmt_vs_prior_avg(data.bookings_7d_vs_prior_pct),
+                delta_color="normal",
+            )
         with snap_c:
-            st.metric("Ad spend (MTD)", _fmt_currency(data.ad_spend_mtd))
+            st.metric(
+                "Ad spend (MTD)",
+                _fmt_currency(data.ad_spend_mtd),
+                delta=_fmt_vs_prior_mtd(data.ad_spend_mtd_vs_prior_pct),
+                delta_color="normal",
+            )
 
+        if data.notes:
+            for note in data.notes:
+                st.caption(note)
+        if data.errors:
+            for err in data.errors:
+                st.warning(err)
+
+
+def _render_conversion_drivers(data: ConversionDriversMetrics) -> None:
+    period = (
+        f"{data.period_since} – {data.period_until}"
+        if data.period_since and data.period_until
+        else "last 7 days"
+    )
+    with _panel(
+        "Discovery Call & Conversion Drivers",
+        f"GoHighLevel · {HEAR_ABOUT_US_FIELD_NAME} · {period}",
+        "war-room-conversion-drivers",
+    ):
+        st.caption(
+            "Bookings = calendar events by date added · "
+            "Committed = Sign Up Date in range with Committed? = Yes"
+        )
+        col_bookings, col_committed = st.columns(2, gap="medium")
+        with col_bookings:
+            _render_hear_about_bar_chart(
+                data.bookings_by_source,
+                title="Bookings by How did you hear?",
+                total=data.total_bookings,
+            )
+        with col_committed:
+            _render_hear_about_bar_chart(
+                data.committed_by_source,
+                title="Committed by How did you hear?",
+                total=data.total_committed,
+            )
         if data.notes:
             for note in data.notes:
                 st.caption(note)
@@ -492,12 +655,12 @@ def _render_paid_media(data: PaidMediaMetrics) -> None:
                 ("Google spend", _fmt_currency(data.google_spend_7d)),
                 ("Meta spend", _fmt_currency(data.meta_spend_7d)),
                 ("Leads", _fmt_count(data.leads_7d)),
-                ("CPA", _fmt_currency(data.cpa_7d)),
+                ("CPL", _fmt_currency(data.cpa_7d)),
             ]
         )
         st.caption(
             "Leads = Google Ads conversions + Meta lead actions · "
-            "CPA = combined spend ÷ leads"
+            "CPL = combined spend ÷ leads"
         )
         if data.notes:
             for note in data.notes:
@@ -724,6 +887,10 @@ def main() -> None:
     with st.spinner("Loading command strip…"):
         command = _load_command_strip()
     _render_command_strip(command)
+
+    with st.spinner("Loading Discovery Call & Conversion Drivers…"):
+        conversion = _load_conversion_drivers()
+    _render_conversion_drivers(conversion)
 
     col_left, col_mid, col_right = st.columns(3, gap="medium")
     with st.spinner("Loading panels…"):

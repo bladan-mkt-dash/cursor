@@ -2,8 +2,28 @@
 
 from __future__ import annotations
 
+import calendar
+import importlib
+import sys
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+# Streamlit keeps imported modules in memory across reruns; reload when helpers
+# were added to ghl_client.py after the server started.
+import ghl_client as _ghl_client
+
+if not hasattr(_ghl_client, "fetch_bookings_by_hear_about_us"):
+    _ghl_client = importlib.reload(_ghl_client)
+
+from ghl_client import (  # noqa: E402
+    fetch_bookings_by_hear_about_us,
+    fetch_committed_yes_by_hear_about_us,
+)
 
 
 @dataclass
@@ -24,13 +44,36 @@ class TrendSeries:
 
 
 @dataclass
+class HearAboutCountRow:
+    source: str
+    count: int
+
+
+@dataclass
+class ConversionDriversMetrics:
+    period_since: str = ""
+    period_until: str = ""
+    bookings_by_source: list[HearAboutCountRow] = field(default_factory=list)
+    committed_by_source: list[HearAboutCountRow] = field(default_factory=list)
+    total_bookings: int | None = None
+    total_committed: int | None = None
+    errors: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
 class CommandStripMetrics:
-    spend_today: float | None = None
-    leads_today: float | None = None
-    signups_today: int | None = None
-    sessions_today: int | None = None
-    bookings_today: int | None = None
+    period_since: str = ""
+    period_until: str = ""
+    spend_7d: float | None = None
+    leads_7d: float | None = None
+    signups_7d: int | None = None
+    sessions_7d: int | None = None
+    bookings_7d: int | None = None
     ad_spend_mtd: float | None = None
+    signups_7d_vs_prior_pct: float | None = None
+    bookings_7d_vs_prior_pct: float | None = None
+    ad_spend_mtd_vs_prior_pct: float | None = None
     spend_trend: TrendSeries | None = None
     leads_trend: TrendSeries | None = None
     sessions_trend: TrendSeries | None = None
@@ -188,6 +231,32 @@ def _seven_day_dates(as_of: date) -> list[str]:
     return [(as_of - timedelta(days=offset)).isoformat() for offset in range(6, -1, -1)]
 
 
+def _prior_seven_day_dates(as_of: date) -> list[str]:
+    """Ordered ISO dates for the seven-day window immediately before the current 7d window."""
+    return [(as_of - timedelta(days=offset)).isoformat() for offset in range(13, 6, -1)]
+
+
+def _sum_for_dates(values_by_date: dict[str, float], dates: list[str]) -> float:
+    return sum(float(values_by_date.get(day, 0.0)) for day in dates)
+
+
+def _pct_vs_prior_period(current: float | None, prior: float | None) -> float | None:
+    if current is None or prior is None or prior == 0:
+        return None
+    return (current - prior) / prior * 100.0
+
+
+def _prior_month_mtd_range(as_of: date) -> tuple[str, str]:
+    """Same day-of-month span in the previous calendar month (for MTD comparisons)."""
+    if as_of.month == 1:
+        prior_start = date(as_of.year - 1, 12, 1)
+    else:
+        prior_start = date(as_of.year, as_of.month - 1, 1)
+    last_day = calendar.monthrange(prior_start.year, prior_start.month)[1]
+    prior_end = prior_start.replace(day=min(as_of.day, last_day))
+    return prior_start.isoformat(), prior_end.isoformat()
+
+
 def _iso_date_key(value) -> str:
     if hasattr(value, "strftime"):
         return value.strftime("%Y-%m-%d")
@@ -254,7 +323,7 @@ def load_paid_media(*, as_of: date | None = None) -> PaidMediaMetrics:
     Paid media panel — account-level Google Ads + Meta for the last 7 days.
 
     Leads = Google Ads conversions (discovery calls) + Meta lead actions.
-    CPA = combined spend ÷ combined leads.
+    CPL = combined spend ÷ combined leads.
     """
     today = as_of or date.today()
     since, until = _last_n_days_range(as_of=today, days=7)
@@ -416,22 +485,29 @@ def load_website_traffic(*, as_of: date | None = None) -> WebsiteTrafficMetrics:
 
 def load_organic_social(*, as_of: date | None = None) -> OrganicSocialMetrics:
     """Organic social panel — Instagram reach, engagement, followers, top post (7 days)."""
-    from meta_organic_client import fetch_organic_social_7d
+    today = as_of or date.today()
+    since, until = _last_n_days_range(as_of=today, days=7)
+    metrics = OrganicSocialMetrics(period_since=since, period_until=until)
 
-    snap = fetch_organic_social_7d(as_of=as_of)
-    return OrganicSocialMetrics(
-        period_since=snap.period_since,
-        period_until=snap.period_until,
-        ig_reach_7d=snap.ig_reach_7d,
-        ig_engagement_7d=snap.ig_engagement_7d,
-        follower_delta_7d=snap.follower_delta_7d,
-        top_post=snap.top_post,
-        top_post_engagement=snap.top_post_engagement,
-        posts_in_period=snap.posts_in_period,
-        page_name=snap.page_name,
-        errors=list(snap.errors),
-        notes=list(snap.notes),
-    )
+    try:
+        from meta_organic_client import fetch_organic_social_7d
+
+        snap = fetch_organic_social_7d(as_of=as_of)
+        metrics.period_since = snap.period_since
+        metrics.period_until = snap.period_until
+        metrics.ig_reach_7d = snap.ig_reach_7d
+        metrics.ig_engagement_7d = snap.ig_engagement_7d
+        metrics.follower_delta_7d = snap.follower_delta_7d
+        metrics.top_post = snap.top_post
+        metrics.top_post_engagement = snap.top_post_engagement
+        metrics.posts_in_period = snap.posts_in_period
+        metrics.page_name = snap.page_name
+        metrics.errors.extend(snap.errors)
+        metrics.notes.extend(snap.notes)
+    except Exception as exc:
+        metrics.errors.append(f"Instagram organic: {exc}")
+
+    return metrics
 
 
 def load_content_seo(*, as_of: date | None = None) -> ContentSeoMetrics:
@@ -562,6 +638,7 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
     """
     Aggregate cross-channel KPIs for the command strip.
 
+    Headline metrics use the same rolling 7-day window as the sparklines.
     Sources:
       - Ad spend / leads: Google Ads + Meta (account level)
       - Signups: GHL Sign Up Date custom field
@@ -570,18 +647,20 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
     """
     today = as_of or date.today()
     month_start = today.replace(day=1)
-    today_iso = today.isoformat()
     month_start_iso = month_start.isoformat()
+    today_iso = today.isoformat()
     trend_since, trend_until = _last_n_days_range(as_of=today, days=7)
+    prior_since, prior_until = _last_n_days_range(as_of=today - timedelta(days=7), days=7)
+    prior_mtd_since, prior_mtd_until = _prior_month_mtd_range(today)
     trend_dates = _seven_day_dates(today)
+    prior_dates = _prior_seven_day_dates(today)
+    compare_dates = prior_dates + trend_dates
 
-    metrics = CommandStripMetrics()
-    google_today_spend: float | None = None
-    google_today_leads: float | None = None
+    metrics = CommandStripMetrics(period_since=trend_since, period_until=trend_until)
     google_mtd_spend: float | None = None
-    meta_today_spend: float | None = None
-    meta_today_leads: float | None = None
     meta_mtd_spend: float | None = None
+    google_prior_mtd_spend: float | None = None
+    meta_prior_mtd_spend: float | None = None
     google_daily = None
     meta_daily: list[dict] = []
     ga4_sessions_by_date: dict[str, int] = {}
@@ -589,38 +668,37 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
     try:
         from google_ads_ghl_paid_cohort import fetch_google_ads_daily
 
-        google_daily = fetch_google_ads_daily(month_start_iso, today_iso)
-        google_mtd_spend = _google_mtd_spend(google_daily)
-        if google_daily is not None and not google_daily.empty:
-            today_rows = google_daily.loc[
-                google_daily["date"].map(_iso_date_key) == today_iso
-            ]
-            if not today_rows.empty:
-                google_today_spend = float(today_rows["cost"].sum())
-                google_today_leads = float(today_rows["discovery_calls"].sum())
+        google_daily = fetch_google_ads_daily(prior_since, today_iso)
+        google_mtd_spend = _google_mtd_spend(
+            fetch_google_ads_daily(month_start_iso, today_iso)
+        )
+        google_prior_mtd_spend = _google_mtd_spend(
+            fetch_google_ads_daily(prior_mtd_since, prior_mtd_until)
+        )
     except Exception as exc:
         metrics.errors.append(f"Google Ads: {exc}")
 
     try:
         from meta_client import fetch_account_daily_insights
 
-        meta = fetch_account_daily_insights(since=month_start_iso, until=today_iso)
+        meta = fetch_account_daily_insights(since=prior_since, until=today_iso)
         meta_daily = meta["daily"]
-        meta_mtd_spend = meta["totals"]["spend"]
-        today_row = next(
-            (row for row in meta_daily if row["date_start"] == today_iso),
-            None,
+        meta_mtd = fetch_account_daily_insights(since=month_start_iso, until=today_iso)
+        meta_mtd_spend = meta_mtd["totals"]["spend"]
+        meta_prior_mtd = fetch_account_daily_insights(
+            since=prior_mtd_since,
+            until=prior_mtd_until,
         )
-        if today_row:
-            meta_today_spend = today_row["spend"]
-            meta_today_leads = float(today_row["leads"])
+        meta_prior_mtd_spend = meta_prior_mtd["totals"]["spend"]
         metrics.notes.append("Meta daily totals may lag until the day completes.")
     except Exception as exc:
         metrics.errors.append(f"Meta: {exc}")
 
-    metrics.spend_today = _sum_optional(google_today_spend, meta_today_spend)
-    metrics.leads_today = _sum_optional(google_today_leads, meta_today_leads)
     metrics.ad_spend_mtd = _sum_optional(google_mtd_spend, meta_mtd_spend)
+    metrics.ad_spend_mtd_vs_prior_pct = _pct_vs_prior_period(
+        metrics.ad_spend_mtd,
+        _sum_optional(google_prior_mtd_spend, meta_prior_mtd_spend),
+    )
 
     try:
         from ghl_client import (
@@ -636,68 +714,115 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
             )
         contacts, truncated, total_signups = search_contacts_custom_field_date_range(
             sign_up_field_id,
-            today_iso,
-            today_iso,
+            trend_since,
+            trend_until,
         )
-        metrics.signups_today = total_signups or len(contacts)
+        metrics.signups_7d = total_signups or len(contacts)
         if truncated:
             metrics.notes.append("GHL signups count may be incomplete (pagination cap).")
 
         bookings, calendar_errors = count_calendar_bookings_by_date_added(
-            today_iso,
-            today_iso,
+            trend_since,
+            trend_until,
         )
-        metrics.bookings_today = bookings
+        metrics.bookings_7d = bookings
         if calendar_errors:
             metrics.notes.append(
                 f"GHL bookings: {calendar_errors} calendar(s) failed to load."
+            )
+
+        prior_contacts, prior_truncated, prior_signups = search_contacts_custom_field_date_range(
+            sign_up_field_id,
+            prior_since,
+            prior_until,
+        )
+        prior_bookings, prior_calendar_errors = count_calendar_bookings_by_date_added(
+            prior_since,
+            prior_until,
+        )
+        metrics.signups_7d_vs_prior_pct = _pct_vs_prior_period(
+            float(metrics.signups_7d) if metrics.signups_7d is not None else None,
+            float(prior_signups or len(prior_contacts)),
+        )
+        metrics.bookings_7d_vs_prior_pct = _pct_vs_prior_period(
+            float(metrics.bookings_7d) if metrics.bookings_7d is not None else None,
+            float(prior_bookings) if prior_bookings is not None else None,
+        )
+        if prior_truncated:
+            metrics.notes.append("Prior-period GHL signups may be incomplete (pagination cap).")
+        if prior_calendar_errors:
+            metrics.notes.append(
+                f"Prior-period GHL bookings: {prior_calendar_errors} calendar(s) failed."
             )
     except Exception as exc:
         metrics.errors.append(f"GHL: {exc}")
 
     try:
-        from google_data import get_ga4_sessions_by_date, get_ga4_sessions_total
+        from google_data import get_ga4_sessions_by_date
 
-        metrics.sessions_today = get_ga4_sessions_total("today", "today")
-        ga4_sessions_by_date = get_ga4_sessions_by_date(trend_since, trend_until)
+        ga4_sessions_by_date = get_ga4_sessions_by_date(prior_since, trend_until)
     except Exception as exc:
         metrics.errors.append(f"GA4: {exc}")
 
-    google_spend_7d = _google_daily_dict(google_daily, value_col="cost", dates=trend_dates)
-    google_leads_7d = _google_daily_dict(
+    google_spend = _google_daily_dict(google_daily, value_col="cost", dates=compare_dates)
+    google_leads = _google_daily_dict(
         google_daily,
         value_col="discovery_calls",
-        dates=trend_dates,
+        dates=compare_dates,
     )
-    meta_spend_7d = _meta_daily_dict(meta_daily, value_key="spend", dates=trend_dates)
-    meta_leads_7d = _meta_daily_dict(meta_daily, value_key="leads", dates=trend_dates)
-    spend_by_date = _sum_daily_dicts(trend_dates, google_spend_7d, meta_spend_7d)
-    leads_by_date = _sum_daily_dicts(trend_dates, google_leads_7d, meta_leads_7d)
+    meta_spend = _meta_daily_dict(meta_daily, value_key="spend", dates=compare_dates)
+    meta_leads = _meta_daily_dict(meta_daily, value_key="leads", dates=compare_dates)
+    spend_by_date = _sum_daily_dicts(trend_dates, google_spend, meta_spend)
+    leads_by_date = _sum_daily_dicts(trend_dates, google_leads, meta_leads)
     sessions_by_date = _ga4_daily_dict(ga4_sessions_by_date, trend_dates)
+    spend_all = _sum_daily_dicts(compare_dates, google_spend, meta_spend)
+
+    metrics.spend_7d = _sum_for_dates(spend_by_date, trend_dates)
+    metrics.leads_7d = _sum_for_dates(leads_by_date, trend_dates)
+    metrics.sessions_7d = int(_sum_for_dates(sessions_by_date, trend_dates))
+
+    prior_spend_7d = _sum_for_dates(spend_all, prior_dates)
+    prior_leads_7d = _sum_for_dates(
+        _sum_daily_dicts(prior_dates, google_leads, meta_leads),
+        prior_dates,
+    )
+    prior_sessions_7d = int(
+        _sum_for_dates(_ga4_daily_dict(ga4_sessions_by_date, prior_dates), prior_dates)
+    )
 
     metrics.spend_trend = _build_trend_series(
         "Ad spend",
         trend_dates,
         spend_by_date,
-        today_value=metrics.spend_today,
+        today_value=None,
         dim_today=True,
     )
     metrics.leads_trend = _build_trend_series(
         "Leads",
         trend_dates,
         leads_by_date,
-        today_value=metrics.leads_today,
+        today_value=None,
         dim_today=True,
     )
     metrics.sessions_trend = _build_trend_series(
         "GA4 sessions",
         trend_dates,
         sessions_by_date,
-        today_value=float(metrics.sessions_today)
-        if metrics.sessions_today is not None
-        else None,
+        today_value=None,
         dim_today=True,
     )
+    if metrics.spend_trend:
+        metrics.spend_trend.vs_prior_avg_pct = _pct_vs_prior_period(
+            metrics.spend_7d, prior_spend_7d
+        )
+    if metrics.leads_trend:
+        metrics.leads_trend.vs_prior_avg_pct = _pct_vs_prior_period(
+            metrics.leads_7d, prior_leads_7d
+        )
+    if metrics.sessions_trend:
+        metrics.sessions_trend.vs_prior_avg_pct = _pct_vs_prior_period(
+            float(metrics.sessions_7d), float(prior_sessions_7d)
+        )
 
     if not metrics.spend_trend.wired:
         metrics.spend_trend = _placeholder_trend("Ad spend", dim_today=True)
@@ -705,5 +830,62 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
         metrics.leads_trend = _placeholder_trend("Leads", dim_today=True)
     if not metrics.sessions_trend.wired:
         metrics.sessions_trend = _placeholder_trend("GA4 sessions", dim_today=True)
+
+    return metrics
+
+
+def _rows_from_ghl_payload(rows: list[dict]) -> list[HearAboutCountRow]:
+    return [
+        HearAboutCountRow(source=str(row.get("source") or "(Not set)"), count=int(row.get("count") or 0))
+        for row in rows
+    ]
+
+
+def load_conversion_drivers(*, as_of: date | None = None) -> ConversionDriversMetrics:
+    """
+    Discovery Call & Conversion Drivers — GHL bookings and committed members
+    grouped by **How did you hear about us?** (last 7 days).
+    """
+    today = as_of or date.today()
+    since, until = _last_n_days_range(as_of=today, days=7)
+    metrics = ConversionDriversMetrics(period_since=since, period_until=until)
+
+    try:
+        bookings = fetch_bookings_by_hear_about_us(since, until)
+        metrics.bookings_by_source = _rows_from_ghl_payload(bookings.get("rows") or [])
+        metrics.total_bookings = int(bookings.get("total_bookings") or 0)
+        if bookings.get("calendar_api_errors"):
+            metrics.notes.append(
+                f"Bookings: {bookings['calendar_api_errors']} calendar(s) failed to load."
+            )
+        if bookings.get("missing_contact_link"):
+            metrics.notes.append(
+                f"{bookings['missing_contact_link']} booking(s) had no linked contact."
+            )
+        if bookings.get("contact_lookup_failures"):
+            metrics.notes.append(
+                f"{bookings['contact_lookup_failures']} contact(s) could not be loaded from GHL."
+            )
+    except Exception as exc:
+        metrics.errors.append(f"GHL bookings: {exc}")
+
+    try:
+        committed = fetch_committed_yes_by_hear_about_us(since, until)
+        metrics.committed_by_source = _rows_from_ghl_payload(committed.get("rows") or [])
+        metrics.total_committed = int(committed.get("total_committed") or 0)
+        if committed.get("truncated_pages"):
+            metrics.notes.append(
+                "Committed cohort may be incomplete (GHL pagination cap on sign-up search)."
+            )
+        excluded = int(committed.get("excluded_not_committed_yes") or 0)
+        if excluded:
+            metrics.notes.append(
+                f"{excluded} contact(s) with sign-up in range excluded (Committed? ≠ Yes)."
+            )
+        metrics.notes.append(
+            "Committed = Sign Up Date in range and Committed? = Yes."
+        )
+    except Exception as exc:
+        metrics.errors.append(f"GHL committed: {exc}")
 
     return metrics
