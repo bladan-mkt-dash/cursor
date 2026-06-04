@@ -12,19 +12,28 @@ from ghl_client import contact_custom_field_value, fetch_signup_date_range_commi
 
 setup()
 
-from tracker_config import column_for_month
+from tracker_config import active_layout, column_for_month
 from tracker_sheets import write_columns
 
 # GHL **Location Preference** (contact.location_preference)
 LOCATION_FIELD_ID = "U4qminML7Yiync8OaxNz"
 
 TIERS = ("Standard", "Silver", "Gold", "Platinum")
-TIER_ROWS = {
-    "Boston": {"Standard": 185, "Silver": 186, "Gold": 187, "Platinum": 188},
-    "Newton": {"Standard": 193, "Silver": 194, "Gold": 195, "Platinum": 196},
-}
-TOTAL_ROW = {"Boston": 189, "Newton": 197}
-AVG_ROW = {"Boston": 190, "Newton": 198}
+
+
+def _tier_rows() -> dict[str, dict[str, int]]:
+    lay = active_layout()
+    return {"Boston": lay.ghl_boston, "Newton": lay.ghl_newton}
+
+
+def _total_rows() -> dict[str, int]:
+    lay = active_layout()
+    return {"Boston": lay.ghl_boston_total, "Newton": lay.ghl_newton_total}
+
+
+def _avg_rows() -> dict[str, int]:
+    lay = active_layout()
+    return {"Boston": lay.ghl_boston_avg, "Newton": lay.ghl_newton_avg}
 
 # Legacy multi-month backfill (Mar–May 2026)
 BACKFILL_MONTHS = ((2026, 3), (2026, 4), (2026, 5))
@@ -86,13 +95,18 @@ def fetch_month_counts(year: int, month: int) -> dict[str, Counter[str]]:
 def build_col_updates(year: int, month: int) -> dict[int, str]:
     counts = fetch_month_counts(year, month)
     col_updates: dict[int, str] = {}
+    tier_rows = _tier_rows()
+    total_rows = _total_rows()
+    avg_rows = _avg_rows()
     for location in ("Boston", "Newton"):
         tier_counts = counts.get(location, Counter())
         total = sum(tier_counts.get(t, 0) for t in TIERS)
-        for tier, row in TIER_ROWS[location].items():
+        for tier, row in tier_rows[location].items():
             col_updates[row] = _fmt_tier(tier_counts.get(tier, 0))
-        col_updates[TOTAL_ROW[location]] = str(total) if total else ""
-        col_updates[AVG_ROW[location]] = _avg_per_week(total, year, month, location=location) if total else ""
+        col_updates[total_rows[location]] = str(total) if total else ""
+        col_updates[avg_rows[location]] = (
+            _avg_per_week(total, year, month, location=location) if total else ""
+        )
     return col_updates
 
 
@@ -100,8 +114,9 @@ def run_month(year: int, month: int, *, dry_run: bool = False) -> int:
     col = column_for_month(year, month)
     print(f"Fetching GHL members for {year}-{month:02d} (column {col})...")
     col_updates = build_col_updates(year, month)
-    b_total = col_updates.get(TOTAL_ROW["Boston"], "")
-    n_total = col_updates.get(TOTAL_ROW["Newton"], "")
+    total_rows = _total_rows()
+    b_total = col_updates.get(total_rows["Boston"], "")
+    n_total = col_updates.get(total_rows["Newton"], "")
     print(f"  Boston total={b_total}, Newton total={n_total}")
     for row in sorted(col_updates):
         print(f"    {col}{row}: {col_updates[row]}")

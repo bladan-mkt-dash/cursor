@@ -13,7 +13,7 @@ from _bootstrap import setup
 
 setup()
 
-from tracker_config import column_for_month, month_period_utc, prior_column
+from tracker_config import active_layout, column_for_month, month_period_utc, prior_column
 from tracker_sheets import read_int_cell, write_column
 
 GRAPH = "v21.0"
@@ -30,30 +30,18 @@ def set_period(year: int, month: int) -> None:
     _PERIOD_YEAR, _PERIOD_MONTH = year, month
     MAY_START, MAY_END, MAY_INSIGHTS_UNTIL = month_period_utc(year, month)
 
-FB_ROWS = {
-    8: "contents",
-    9: "posts_stories",
-    10: "reels",
-    11: "views",
-    12: "viewers",
-    13: "interactions",
-    14: "link_clicks",
-    15: "visits",
-    16: "new_followers",
-    17: "fb_followers",
-}
-IG_ROWS = {
-    32: "contents",
-    33: "posts_stories",
-    34: "reels",
-    35: "views",
-    36: "reach",
-    37: "interactions",
-    38: "link_clicks",
-    39: "visits",
-    40: "new_followers",
-    41: "ig_followers",
-}
+def _fb_rows() -> dict[int, str]:
+    rows = active_layout().fb_rows
+    if not rows:
+        raise RuntimeError("Meta FB rows not configured for this tracker layout")
+    return rows
+
+
+def _ig_rows() -> dict[int, str]:
+    rows = active_layout().ig_rows
+    if not rows:
+        raise RuntimeError("Meta IG rows not configured for this tracker layout")
+    return rows
 
 
 def token() -> str:
@@ -543,18 +531,20 @@ def run_month(year: int, month: int, *, dry_run: bool = False) -> int:
     print(f"Fetching Instagram Five Journeys for {year}-{month:02d}…")
     ig = fetch_ig_metrics(ig_id, page_token)
 
+    fb_rows = _fb_rows()
+    ig_rows = _ig_rows()
     updates: dict[int, str] = {}
-    for row, key in FB_ROWS.items():
+    for row, key in fb_rows.items():
         updates[row] = _fmt(fb[key])
-    for row, key in IG_ROWS.items():
+    for row, key in ig_rows.items():
         unavailable = key in ("link_clicks", "visits")
         updates[row] = _fmt_metric(ig[key], unavailable=unavailable)
 
-    print(f"\nFacebook (rows 8–17) → column {col}:")
-    for row in range(8, 18):
+    print(f"\nFacebook → column {col}:")
+    for row in sorted(fb_rows):
         print(f"  {col}{row}: {updates[row]}")
-    print(f"\nInstagram (rows 32–41) → column {col}:")
-    for row in range(32, 42):
+    print(f"\nInstagram → column {col}:")
+    for row in sorted(ig_rows):
         print(f"  {col}{row}: {updates[row]}")
 
     if dry_run:
@@ -562,7 +552,7 @@ def run_month(year: int, month: int, *, dry_run: bool = False) -> int:
         return 0
 
     write_column(col, updates)
-    print(f"Updated Meta Five Journeys rows 8–17 and 32–41, column {col}.")
+    print(f"Updated Meta Five Journeys ({len(updates)} cells), column {col}.")
     return 0
 
 

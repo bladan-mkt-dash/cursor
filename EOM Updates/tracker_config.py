@@ -1,25 +1,46 @@
-"""Shared config for 2026 Digital Cross-Channel Tracker → Monthly Tracker sheet."""
+"""Shared config for Digital Cross-Channel Tracker → Monthly Tracker sheet."""
 
 from __future__ import annotations
 
 import calendar
 from datetime import date, datetime, timedelta, timezone
 
-# 2026 Digital Cross-Channel Tracker
-SPREADSHEET_ID = "1F7Lq0IBrOWolov5vEx5ztcBsZTbZCKfalQ1bwHuqakc"
-SHEET = "Monthly Tracker"
-TRACKER_YEAR = 2026
-# Jan 2026 = column H (see sheet header row)
-JAN_2026_COLUMN = "H"
+from tracker_layout import LAYOUTS, TrackerLayout
+
+_layout: TrackerLayout = LAYOUTS[2026]
+
+SPREADSHEET_ID = _layout.spreadsheet_id
+SHEET = _layout.sheet
+TRACKER_YEAR = _layout.version
+JAN_COLUMN = _layout.jan_column
+
+
+def configure_tracker(version: int) -> TrackerLayout:
+    """Select 2025 or 2026 spreadsheet + row layout."""
+    global _layout, SPREADSHEET_ID, SHEET, TRACKER_YEAR, JAN_COLUMN
+    if version not in LAYOUTS:
+        raise ValueError(f"Unknown tracker version {version}; use 2024, 2025, or 2026")
+    _layout = LAYOUTS[version]
+    SPREADSHEET_ID = _layout.spreadsheet_id
+    SHEET = _layout.sheet
+    TRACKER_YEAR = _layout.version
+    JAN_COLUMN = _layout.jan_column
+    return _layout
+
+
+def active_layout() -> TrackerLayout:
+    return _layout
 
 
 def column_for_month(year: int, month: int) -> str:
-    """Return sheet column letter for a calendar month on the 2026 tracker."""
-    if year != TRACKER_YEAR:
-        raise ValueError(f"Column map is only defined for {TRACKER_YEAR}, got {year}")
+    """Return sheet column letter for a calendar month (Jan = column H)."""
+    if year != _layout.version:
+        raise ValueError(
+            f"Column map for tracker {_layout.version} does not include year {year}"
+        )
     if not 1 <= month <= 12:
         raise ValueError("month must be 1–12")
-    base = ord(JAN_2026_COLUMN) - ord("A")
+    base = ord(JAN_COLUMN) - ord("A")
     return chr(ord("A") + base + month - 1)
 
 
@@ -63,9 +84,20 @@ def month_period_dates(year: int, month: int) -> tuple[date, date]:
 
 
 def parse_month_arg(value: str) -> tuple[int, int]:
-    """Accept ``2026-06`` or ``6`` (year defaults to TRACKER_YEAR)."""
+    """Accept ``2026-06`` or ``6`` (year defaults to active tracker year)."""
     value = value.strip()
     if "-" in value:
         y, m = value.split("-", 1)
         return int(y), int(m)
     return TRACKER_YEAR, int(value)
+
+
+def iter_months(year_from: int, month_from: int, year_to: int, month_to: int):
+    """Yield (year, month) inclusive."""
+    y, m = year_from, month_from
+    while (y, m) <= (year_to, month_to):
+        yield y, m
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1

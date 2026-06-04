@@ -10,16 +10,8 @@ from google_data import count_blog_posts_published, get_blog_stem_metrics
 
 setup()
 
-from tracker_config import column_for_month, month_date_range
+from tracker_config import active_layout, column_for_month, month_date_range
 from tracker_sheets import write_columns
-
-ROW_BLOGS_PUBLISHED = 108
-ROW_PAGEVIEWS = 109
-ROW_USERS = 110
-ROW_SESSIONS = 111
-ROW_VIEWS_PER_USER = 112
-ROW_AVG_SESSION_DURATION = 113
-ROW_BOUNCE_RATE = 114
 
 BACKFILL_MONTHS = ((2026, 3), (2026, 4), (2026, 5))
 
@@ -44,6 +36,7 @@ def _fmt_duration(seconds: float) -> str:
 
 
 def _month_to_updates(start: str, end: str) -> dict[int, str]:
+    b = active_layout().blog
     ga = get_blog_stem_metrics(start, end)
     pageviews = ga["screenPageViews"]
     users = ga["activeUsers"]
@@ -51,13 +44,13 @@ def _month_to_updates(start: str, end: str) -> dict[int, str]:
     views_per_user = pageviews / sessions if sessions else 0.0
     blogs = count_blog_posts_published(start, end)
     return {
-        ROW_BLOGS_PUBLISHED: _fmt_int(blogs),
-        ROW_PAGEVIEWS: _fmt_int(pageviews),
-        ROW_USERS: _fmt_int(users),
-        ROW_SESSIONS: _fmt_int(sessions),
-        ROW_VIEWS_PER_USER: _fmt_ratio(views_per_user),
-        ROW_AVG_SESSION_DURATION: _fmt_duration(ga["averageSessionDuration"]),
-        ROW_BOUNCE_RATE: _fmt_bounce(ga["bounceRate"]),
+        b.published: _fmt_int(blogs),
+        b.pageviews: _fmt_int(pageviews),
+        b.users: _fmt_int(users),
+        b.sessions: _fmt_int(sessions),
+        b.views_per_user: _fmt_ratio(views_per_user),
+        b.avg_session_duration: _fmt_duration(ga["averageSessionDuration"]),
+        b.bounce_rate: _fmt_bounce(ga["bounceRate"]),
     }
 
 
@@ -66,11 +59,12 @@ def run_month(year: int, month: int, *, dry_run: bool = False) -> int:
     start, end = month_date_range(year, month)
     print(f"Fetching 5J Blog (/blog*) for {year}-{month:02d} ({start} .. {end})...")
     updates = _month_to_updates(start, end)
+    b = active_layout().blog
     print(
-        f"  published={updates[ROW_BLOGS_PUBLISHED]} pageviews={updates[ROW_PAGEVIEWS]} "
-        f"users={updates[ROW_USERS]} sessions={updates[ROW_SESSIONS]}"
+        f"  published={updates[b.published]} pageviews={updates[b.pageviews]} "
+        f"users={updates[b.users]} sessions={updates[b.sessions]}"
     )
-    for row in range(108, 115):
+    for row in sorted(updates):
         print(f"  {col}{row}: {updates[row]}")
 
     if dry_run:
@@ -78,7 +72,7 @@ def run_month(year: int, month: int, *, dry_run: bool = False) -> int:
         return 0
 
     write_columns({col: updates})
-    print(f"Updated 5J Blog rows 108–114, column {col}.")
+    print(f"Updated 5J Blog ({len(updates)} cells), column {col}.")
     return 0
 
 

@@ -35,6 +35,32 @@ def _load_token_info() -> dict | None:
     return json.loads(YOUTUBE_TOKEN_PATH.read_text(encoding="utf-8"))
 
 
+def _credentials_from_env() -> Credentials | None:
+    refresh = (os.getenv("YOUTUBE_REFRESH_TOKEN") or "").strip()
+    client_id = (
+        os.getenv("YOUTUBE_OAUTH_CLIENT_ID")
+        or os.getenv("GOOGLE_OAUTH_CLIENT_ID")
+        or ""
+    ).strip()
+    client_secret = (
+        os.getenv("YOUTUBE_OAUTH_CLIENT_SECRET")
+        or os.getenv("GOOGLE_OAUTH_CLIENT_SECRET")
+        or ""
+    ).strip()
+    if not (refresh and client_id and client_secret):
+        return None
+    creds = Credentials(
+        token=None,
+        refresh_token=refresh,
+        client_id=client_id,
+        client_secret=client_secret,
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=SCOPES,
+    )
+    creds.refresh(Request())
+    return creds
+
+
 def get_credentials(*, allow_interactive: bool = False) -> Credentials:
     creds: Credentials | None = None
     info = _load_token_info()
@@ -48,6 +74,10 @@ def get_credentials(*, allow_interactive: bool = False) -> Credentials:
 
     if creds and creds.valid:
         return creds
+
+    env_creds = _credentials_from_env()
+    if env_creds and env_creds.valid:
+        return env_creds
 
     if not allow_interactive:
         raise RuntimeError(
@@ -161,10 +191,14 @@ def fetch_channel_month_analytics(
     channel: str,
     start: date,
     end: date,
-) -> dict[str, int]:
+    *,
+    include_watch_time: bool = False,
+) -> dict[str, float]:
     """Channel-level totals for an inclusive calendar month (Analytics API)."""
     ya = _youtube_analytics(creds)
     metrics = "views,engagedViews,likes,subscribersGained"
+    if include_watch_time:
+        metrics += ",estimatedMinutesWatched,averageViewDuration"
     last_err: HttpError | None = None
     for ids in _analytics_ids_candidates(channel):
         try:
@@ -180,9 +214,9 @@ def fetch_channel_month_analytics(
             )
             headers = [h["name"] for h in resp.get("columnHeaders") or []]
             row = (resp.get("rows") or [[0] * len(headers)])[0]
-            out: dict[str, int] = {}
+            out: dict[str, float] = {}
             for name, value in zip(headers, row):
-                out[name] = int(float(value or 0))
+                out[name] = float(value or 0)
             return out
         except HttpError as exc:
             last_err = exc
@@ -192,8 +226,8 @@ def fetch_channel_month_analytics(
 
 
 def fetch_channel_month_metrics(
-    creds: Credentials, year: int, month: int
-) -> dict[str, int]:
+    creds: Credentials, year: int, month: int, *, legacy_layout: bool = False
+) -> dict[str, int | float]:
     """Channel metrics for an inclusive calendar month."""
     channel = resolve_channel_id(creds)
     import sys
@@ -209,16 +243,22 @@ def fetch_channel_month_metrics(
         end_exclusive = date(year + 1, 1, 1)
     else:
         end_exclusive = date(year, month + 1, 1)
-    analytics = fetch_channel_month_analytics(creds, channel, start, end)
+    analytics = fetch_channel_month_analytics(
+        creds, channel, start, end, include_watch_time=legacy_layout
+    )
     videos = count_videos_published(creds, channel, start, end_exclusive)
-    return {
+    out: dict[str, int | float] = {
         "channel_id": channel,
         "videos_published": videos,
-        "views": analytics.get("views", 0),
-        "engaged_views": analytics.get("engagedViews", 0),
-        "likes": analytics.get("likes", 0),
-        "new_subscribers": analytics.get("subscribersGained", 0),
+        "views": int(analytics.get("views", 0)),
+        "engaged_views": int(analytics.get("engagedViews", 0)),
+        "likes": int(analytics.get("likes", 0)),
+        "new_subscribers": int(analytics.get("subscribersGained", 0)),
     }
+    if legacy_layout:
+        out["watch_minutes"] = float(analytics.get("estimatedMinutesWatched", 0))
+        out["avg_view_seconds"] = float(analytics.get("averageViewDuration", 0))
+    return out
 
 
 def fetch_may_2026_metrics(creds: Credentials) -> dict[str, int]:
