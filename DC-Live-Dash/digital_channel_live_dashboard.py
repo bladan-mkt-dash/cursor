@@ -21,6 +21,8 @@ from dotenv import load_dotenv
 
 from digital_channel_live_data import (
     DEFAULT_SINCE,
+    MEMBERSHIP_LEVELS,
+    apply_membership_conversion_filter,
     clear_ghl_leads_day_cache,
     load_live_campaign_data,
     monthly_campaign_summary,
@@ -301,9 +303,13 @@ def _weighted_scorecard_metrics(
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def _load_data(since: str, until: str) -> tuple[pd.DataFrame, tuple[str, ...], dict[str, int]]:
-    df, notes, lead_summary = load_live_campaign_data(since=since, until=until)
-    return df, tuple(notes), lead_summary
+def _load_data(
+    since: str, until: str
+) -> tuple[pd.DataFrame, tuple[str, ...], dict[str, int], pd.DataFrame]:
+    df, notes, lead_summary, conv_by_level = load_live_campaign_data(
+        since=since, until=until
+    )
+    return df, tuple(notes), lead_summary, conv_by_level
 
 
 def main() -> None:
@@ -320,7 +326,9 @@ def main() -> None:
         "Leads = new GHL contacts (Meta: meta lead tag / Meta pixel; "
         "Google: dc thru g-ad tag / Google Tag). "
         "**First load** for a wide date range can take a few minutes while GHL "
-        "lead data is pulled day-by-day; **repeat loads use cache** and are much faster."
+        "lead data is pulled day-by-day; **repeat loads use cache** and are much faster. "
+        "**New patients** use GHL **Committed?** = Yes, **Sign Up Date** (by month), and "
+        "**Membership Level** (slicer)."
     )
 
     today = date.today()
@@ -361,7 +369,9 @@ def main() -> None:
     )
     with st.spinner(load_label):
         try:
-            raw_df, notes, lead_summary = _load_data(since.isoformat(), until.isoformat())
+            raw_df, notes, lead_summary, conv_by_level_df = _load_data(
+                since.isoformat(), until.isoformat()
+            )
         except Exception as exc:
             st.error(f"Could not load live data.\n\n{exc}")
             st.stop()
@@ -411,6 +421,19 @@ def main() -> None:
             help="Meta campaign objective bucket (Lead Gen, Traffic, etc.).",
         )
 
+        membership_options = list(MEMBERSHIP_LEVELS)
+        selected_membership_levels = st.multiselect(
+            "Membership level",
+            membership_options,
+            default=membership_options,
+            help=(
+                "New patients (conversions): GHL Committed? = Yes, Sign Up Date in range, "
+                "filtered by Membership Level (Standard, Silver, Gold, Platinum)."
+            ),
+        )
+        if not selected_membership_levels:
+            selected_membership_levels = membership_options
+
     mask = (
         raw_df["channel"].isin(selected_channels)
         & (raw_df["campaign"].isin(selected_campaigns))
@@ -423,6 +446,9 @@ def main() -> None:
         mask &= meta_type_mask
 
     df = raw_df.loc[mask].copy()
+    df = apply_membership_conversion_filter(
+        df, conv_by_level_df, selected_membership_levels
+    )
     monthly = monthly_campaign_summary(df)
     scores = _weighted_scorecard_metrics(
         df,
