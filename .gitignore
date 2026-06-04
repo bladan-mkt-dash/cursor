@@ -1,5 +1,6 @@
 # Security / Credentials
 .env
+.env.backup*
 *.json
 google-ads.yaml
 get_refresh_token.py
