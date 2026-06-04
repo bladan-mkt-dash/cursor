@@ -27,23 +27,8 @@ from woocommerce_client import (
 
 setup()
 
-from tracker_config import column_for_month
+from tracker_config import active_layout, column_for_month
 from tracker_sheets import write_columns
-
-ROW_HOME_VIEWS = 147
-ROW_HOME_USERS = 148
-ROW_CHECKOUT_VIEWS = 149
-ROW_CHECKOUT_USERS = 150
-ROW_AVG_TIME = 151
-ROW_BOUNCE = 152
-ROW_GROSS = 153
-ROW_ITEMS = 154
-ROW_ORDERS = 155
-ROW_NET = 156
-ROW_AVG_NET_ORDER = 157
-ROW_ITEMS_PER_ORDER = 158
-ROW_ORDERS_REFUNDED = 159
-ROW_REFUNDED_AMOUNT = 160
 
 BACKFILL_MONTHS = ((2026, 3), (2026, 4), (2026, 5))
 
@@ -184,18 +169,26 @@ def _fmt_ratio(n: float) -> str:
     return f"{n:.1f}" if abs(n - round(n)) < 0.05 else f"{n:.2f}"
 
 
+def _fmt_avg_time(seconds: float) -> str:
+    # 2025 tracker uses decimal minutes; 2024/2026 use H:MM:SS in the sheet.
+    if active_layout().version == 2025:
+        return f"{seconds / 60.0:.2f}"
+    return _fmt_duration(seconds)
+
+
 def build_col_updates(year: int, month: int, *, sales_only: bool = False) -> dict[int, str]:
+    w = active_layout().woo
     updates: dict[int, str] = {}
     if not sales_only:
         ga = fetch_ga4_shop_metrics(year, month)
         updates.update(
             {
-                ROW_HOME_VIEWS: _fmt_int(ga.home_views),
-                ROW_HOME_USERS: _fmt_int(ga.home_users),
-                ROW_CHECKOUT_VIEWS: _fmt_int(ga.checkout_views),
-                ROW_CHECKOUT_USERS: _fmt_int(ga.checkout_users),
-                ROW_AVG_TIME: _fmt_duration(ga.avg_time_seconds),
-                ROW_BOUNCE: _fmt_bounce(ga.bounce_rate),
+                w.home_views: _fmt_int(ga.home_views),
+                w.home_users: _fmt_int(ga.home_users),
+                w.checkout_views: _fmt_int(ga.checkout_views),
+                w.checkout_users: _fmt_int(ga.checkout_users),
+                w.avg_time: _fmt_avg_time(ga.avg_time_seconds),
+                w.bounce: _fmt_bounce(ga.bounce_rate),
             }
         )
 
@@ -203,14 +196,14 @@ def build_col_updates(year: int, month: int, *, sales_only: bool = False) -> dic
         wc: WooCommerceMonthStats = fetch_month_order_stats(year, month)
         updates.update(
             {
-                ROW_GROSS: _fmt_money(wc.gross_sales),
-                ROW_ITEMS: _fmt_int(wc.items_purchased),
-                ROW_ORDERS: _fmt_int(wc.orders),
-                ROW_NET: _fmt_money(wc.net_sales),
-                ROW_AVG_NET_ORDER: _fmt_money(wc.avg_net_order_value),
-                ROW_ITEMS_PER_ORDER: _fmt_ratio(wc.avg_items_per_order),
-                ROW_ORDERS_REFUNDED: _fmt_int(wc.orders_refunded),
-                ROW_REFUNDED_AMOUNT: _fmt_money(wc.refunded_amount),
+                w.gross: _fmt_money(wc.gross_sales),
+                w.items: _fmt_int(wc.items_purchased),
+                w.orders: _fmt_int(wc.orders),
+                w.net: _fmt_money(wc.net_sales),
+                w.avg_net_order: _fmt_money(wc.avg_net_order_value),
+                w.items_per_order: _fmt_ratio(wc.avg_items_per_order),
+                w.orders_refunded: _fmt_int(wc.orders_refunded),
+                w.refunded_amount: _fmt_money(wc.refunded_amount),
             }
         )
     return updates
@@ -228,8 +221,9 @@ def run_month(
     col = column_for_month(year, month)
     print(f"Fetching eCommerce for {year}-{month:02d} (column {col})...")
     updates = build_col_updates(year, month, sales_only=sales_only)
+    w = active_layout().woo
     print(
-        f"  home views={updates.get(ROW_HOME_VIEWS)}, orders={updates.get(ROW_ORDERS, '(Woo N/A)')}"
+        f"  home views={updates.get(w.home_views)}, orders={updates.get(w.orders, '(Woo N/A)')}"
     )
 
     if dry_run:

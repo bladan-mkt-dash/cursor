@@ -19,55 +19,39 @@ from google_data import _ensure_ga_credentials, _run_report_paginated, _strip_en
 
 setup()
 
-from tracker_config import column_for_month, month_date_range
+from tracker_config import active_layout, column_for_month, month_date_range
 from tracker_sheets import write_columns
-
-# 5J Website section (Monthly Tracker) — row numbers from sheet layout
-ROW_UNIQUE_PAGEVIEWS = 83
-ROW_USERS = 84
-ROW_SESSIONS = 85
-ROW_SESSIONS_PER_USER = 86
-ROW_VIEWS_PER_SESSION = 87
-ROW_SCROLLED_USERS = 88
-ROW_AVG_SESSION_DURATION = 89
-ROW_BOUNCE_RATE = 90
-# ROW 91 = traffic section header (skip)
-ROW_ORGANIC_SEARCH = 92
-ROW_DIRECT = 93
-ROW_DISPLAY = 94
-ROW_CROSS_NETWORK = 95
-ROW_EMAIL = 96
-ROW_REFERRAL = 97
-ROW_PAID_SOCIAL = 98
-ROW_ORGANIC_SOCIAL = 99
-ROW_PAID_SEARCH = 100
-ROW_PAID_ORGANIC_OTHER = 101
-
-# Rows 102–107 / 115 were accidentally written by an earlier row-offset bug; clear J–L.
-# Rows 108–114 are 5J Blog (see _fetch_ga_blog_tracker.py) — do not clear here.
-CLEAR_JKL_ROWS = tuple(range(102, 108)) + (115,)
 
 BACKFILL_MONTHS = ((2026, 3), (2026, 4), (2026, 5))
 
-# Sheet label -> GA4 sessionDefaultChannelGroup (exact)
-CHANNEL_MAP: dict[int, str] = {
-    ROW_ORGANIC_SEARCH: "Organic Search",
-    ROW_DIRECT: "Direct",
-    ROW_DISPLAY: "Display",
-    ROW_CROSS_NETWORK: "Cross-network",
-    ROW_EMAIL: "Email",
-    ROW_REFERRAL: "Referral",
-    ROW_PAID_SOCIAL: "Paid Social",
-    ROW_ORGANIC_SOCIAL: "Organic Social",
-    ROW_PAID_SEARCH: "Paid Search",
-    ROW_PAID_ORGANIC_OTHER: "Paid Other",
-}
+# Rows 102–107 / 115 were accidentally written on 2026 tracker; clear J–L only there.
+CLEAR_JKL_ROWS = tuple(range(102, 108)) + (115,)
+
+
+def _channel_map() -> dict[int, str]:
+    w = active_layout().website
+    mapping: dict[int, str] = {
+        w.organic_search: "Organic Search",
+        w.direct: "Direct",
+        w.email: "Email",
+        w.referral: "Referral",
+        w.paid_social: "Paid Social",
+        w.organic_social: "Organic Social",
+        w.paid_search: "Paid Search",
+        w.paid_other: "Paid Other",
+    }
+    if w.display is not None:
+        mapping[w.display] = "Display"
+    if w.cross_network is not None:
+        mapping[w.cross_network] = "Cross-network"
+    return mapping
 
 
 @dataclass
 class MonthMetrics:
     unique_pageviews: int
     users: int
+    new_users: int
     sessions: int
     sessions_per_user: float
     views_per_session: float
@@ -103,6 +87,7 @@ def _fetch_month(property_id: str, start: str, end: str) -> MonthMetrics:
         metrics=[
             Metric(name="screenPageViews"),
             Metric(name="activeUsers"),
+            Metric(name="newUsers"),
             Metric(name="sessions"),
             Metric(name="sessionsPerUser"),
             Metric(name="screenPageViewsPerSession"),
@@ -133,28 +118,38 @@ def _fetch_month(property_id: str, start: str, end: str) -> MonthMetrics:
     return MonthMetrics(
         unique_pageviews=int(mv[0].value),
         users=int(mv[1].value),
-        sessions=int(mv[2].value),
-        sessions_per_user=float(mv[3].value),
-        views_per_session=float(mv[4].value),
-        scrolled_users=int(mv[5].value),
-        avg_session_seconds=float(mv[6].value),
-        bounce_rate=float(mv[7].value),
+        new_users=int(mv[2].value),
+        sessions=int(mv[3].value),
+        sessions_per_user=float(mv[4].value),
+        views_per_session=float(mv[5].value),
+        scrolled_users=int(mv[6].value),
+        avg_session_seconds=float(mv[7].value),
+        bounce_rate=float(mv[8].value),
         channel_sessions=channel_sessions,
     )
 
 
 def _month_to_updates(metrics: MonthMetrics) -> dict[int, str]:
+    w = active_layout().website
     updates: dict[int, str] = {
-        ROW_UNIQUE_PAGEVIEWS: _fmt_int(metrics.unique_pageviews),
-        ROW_USERS: _fmt_int(metrics.users),
-        ROW_SESSIONS: _fmt_int(metrics.sessions),
-        ROW_SESSIONS_PER_USER: _fmt_ratio(metrics.sessions_per_user),
-        ROW_VIEWS_PER_SESSION: _fmt_ratio(metrics.views_per_session),
-        ROW_SCROLLED_USERS: _fmt_int(metrics.scrolled_users),
-        ROW_AVG_SESSION_DURATION: _fmt_duration(metrics.avg_session_seconds),
-        ROW_BOUNCE_RATE: _fmt_bounce(metrics.bounce_rate),
+        w.unique_pageviews: _fmt_int(metrics.unique_pageviews),
+        w.users: _fmt_int(metrics.users),
+        w.sessions: _fmt_int(metrics.sessions),
+        w.sessions_per_user: _fmt_ratio(metrics.sessions_per_user),
+        w.views_per_session: _fmt_ratio(metrics.views_per_session),
+        w.avg_session_duration: _fmt_duration(metrics.avg_session_seconds),
+        w.bounce_rate: _fmt_bounce(metrics.bounce_rate),
     }
-    for row, ga_channel in CHANNEL_MAP.items():
+    if w.scrolled_users is not None:
+        updates[w.scrolled_users] = _fmt_int(metrics.scrolled_users)
+    if w.all_users is not None:
+        updates[w.all_users] = _fmt_int(metrics.users)
+    if w.new_users is not None:
+        updates[w.new_users] = _fmt_int(metrics.new_users)
+    if w.new_users_pct is not None and metrics.users:
+        pct = 100.0 * metrics.new_users / metrics.users
+        updates[w.new_users_pct] = f"{pct:.2f}%"
+    for row, ga_channel in _channel_map().items():
         updates[row] = _fmt_int(metrics.channel_sessions.get(ga_channel, 0))
     return updates
 
@@ -174,9 +169,7 @@ def run_month(year: int, month: int, *, dry_run: bool = False) -> int:
         f"  pageviews={metrics.unique_pageviews:,} users={metrics.users:,} "
         f"sessions={metrics.sessions:,}"
     )
-    for row in range(ROW_UNIQUE_PAGEVIEWS, ROW_PAID_ORGANIC_OTHER + 1):
-        if row == 91:
-            continue
+    for row in sorted(updates):
         print(f"  {col}{row}: {updates[row]}")
 
     if dry_run:
@@ -184,7 +177,7 @@ def run_month(year: int, month: int, *, dry_run: bool = False) -> int:
         return 0
 
     write_columns({col: updates})
-    print(f"Updated 5J Website rows 83–101, column {col}.")
+    print(f"Updated 5J Website ({len(updates)} cells), column {col}.")
     return 0
 
 
