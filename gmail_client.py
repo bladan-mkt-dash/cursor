@@ -291,3 +291,38 @@ def format_datetime(dt: datetime | None) -> str:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone().strftime("%Y-%m-%d %H:%M")
 
+
+def _gmail_label_query(label: str) -> str:
+    """Build a Gmail search query for unread messages under ``label``."""
+    clean = (label or "").strip()
+    if not clean:
+        raise ValueError("label is required")
+    if "/" in clean or " " in clean:
+        safe = clean.replace('"', "")
+        return f'label:"{safe}" is:unread'
+    return f"label:{clean} is:unread"
+
+
+def fetch_unread_by_label(
+    service,
+    *,
+    label: str,
+    max_messages: int = 25,
+) -> list[GmailMessage]:
+    """Unread messages in a user label (e.g. Marketing/Action)."""
+    query = _gmail_label_query(label)
+    ids = list_message_ids(service, query=query, max_messages=max_messages)
+    return [fetch_message(service, mid, folder="marketing") for mid in ids]
+
+
+def fetch_unread_by_query(
+    service,
+    *,
+    query: str,
+    max_messages: int = 25,
+) -> list[GmailMessage]:
+    """Unread messages matching a custom Gmail search query."""
+    full = f"({query.strip()}) is:unread".strip()
+    ids = list_message_ids(service, query=full, max_messages=max_messages)
+    return [fetch_message(service, mid, folder="marketing") for mid in ids]
+

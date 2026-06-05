@@ -2,8 +2,10 @@
 
 # -*- coding: utf-8 -*-
 
-
 from __future__ import annotations
+
+# Bump when hear-about normalization or fetch helpers change (war_room_data reloads).
+GHL_CLIENT_REVISION = "2026-06-04-hear-about-labels-v2"
 
 import os
 from collections import Counter
@@ -2336,7 +2338,13 @@ def count_calendar_bookings_by_date_added(
 
 def _normalize_hear_about_label(raw: str) -> str:
     text = (raw or "").strip()
-    return text if text else "(Not set)"
+    if not text:
+        return "(Not set)"
+    if text.casefold().startswith("word of mouth"):
+        return "WOM"
+    if text.casefold().startswith("3rd party"):
+        return "3rd party"
+    return text
 
 
 def _hear_about_rows_from_counter(counter: Counter[str]) -> list[dict[str, Any]]:

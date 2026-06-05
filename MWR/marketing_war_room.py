@@ -29,6 +29,7 @@ Needs response scope (marketing-only, not a full inbox):
 from __future__ import annotations
 
 import html
+import importlib
 import sys
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -43,21 +44,32 @@ import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
 
+# Streamlit keeps war_room_data in sys.modules; reload after code changes.
+import war_room_data as _war_room_data
+
+_WAR_ROOM_DATA_REVISION = "2026-06-04-command-strip-layout-v2"
+if getattr(_war_room_data, "WAR_ROOM_DATA_REVISION", None) != _WAR_ROOM_DATA_REVISION:
+    _war_room_data = importlib.reload(_war_room_data)
+
 from war_room_data import (
+    AlertsMetrics,
     CommandStripMetrics,
     ContentSeoMetrics,
     ConversionDriversMetrics,
     CrmFunnelMetrics,
     HearAboutCountRow,
+    NeedsResponseMetrics,
     OrganicSocialMetrics,
     PaidMediaMetrics,
     TeamOpsMetrics,
     TrendSeries,
     WebsiteTrafficMetrics,
+    load_alerts,
     load_command_strip,
     load_content_seo,
     load_conversion_drivers,
     load_crm_funnel,
+    load_needs_response,
     load_organic_social,
     load_paid_media,
     load_team_ops,
@@ -68,7 +80,7 @@ from ghl_client import HEAR_ABOUT_US_FIELD_NAME  # noqa: E402 — after war_room
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 # Bump when loader logic changes — invalidates @st.cache_data without a server restart.
-WAR_ROOM_LOADER_VERSION = "2026-06-04-conversion-drivers-v2"
+WAR_ROOM_LOADER_VERSION = "2026-06-04-command-strip-layout-v2"
 
 SPARKLINE_HEIGHT_PX = 44
 
@@ -213,11 +225,34 @@ def _inject_styles() -> None:
         div[data-testid="stPlotlyChart"] iframe {{
             max-height: {SPARKLINE_HEIGHT_PX}px !important;
         }}
-        .war-room-trend-label {{
-            color: {COLORS["muted"]};
-            font-size: 0.72rem;
-            margin-top: 0.1rem;
-            margin-bottom: 0;
+        /* Command-strip KPI: one bordered card holds metric + sparkline */
+        div[class*="st-key-war-room-kpi-"][data-testid="stVerticalBlockBorderWrapper"] {{
+            border: 1px solid rgba(93, 166, 138, 0.12) !important;
+            border-radius: 10px !important;
+            background: {COLORS["panel_bg"]} !important;
+            box-shadow: 0 1px 2px rgba(38, 69, 64, 0.06) !important;
+            padding: 0.35rem 0.5rem 0.3rem 0.5rem !important;
+            min-width: 0;
+        }}
+        div[class*="st-key-war-room-kpi-"] [data-testid="stHorizontalBlock"] {{
+            gap: 0.35rem !important;
+            align-items: center !important;
+        }}
+        div[class*="st-key-war-room-kpi-"] [data-testid="stMetric"] {{
+            background: transparent !important;
+            border: none !important;
+            box-shadow: none !important;
+            padding: 0 !important;
+            margin: 0 !important;
+        }}
+        div[class*="st-key-war-room-kpi-"] div[data-testid="stPlotlyChart"] {{
+            margin: 0 !important;
+            padding: 0 !important;
+        }}
+        div[class*="st-key-war-room-kpi-"] .war-room-sparkline-placeholder {{
+            margin: 0;
+            border: none;
+            background: transparent;
         }}
         {panel_rules}
         </style>
@@ -312,19 +347,9 @@ def _load_team_ops() -> TeamOpsMetrics:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _load_needs_response() -> dict:
-    """Stage 9: marketing-only inbound — Gmail API + Google Chat API.
-
-    Configure via .env when wiring:
-      WAR_ROOM_GMAIL_LABEL=Marketing/Action
-      WAR_ROOM_CHAT_SPACES=Marketing Team,Agency Updates   (comma-separated names)
-    """
-    return {
-        "gmail_count": None,
-        "chat_count": None,
-        "oldest_wait": None,
-        "items": [],  # list[{"source", "from", "preview", "age"}]
-    }
+def _load_needs_response(_loader_version: str = WAR_ROOM_LOADER_VERSION) -> NeedsResponseMetrics:
+    """Marketing-only inbound — Gmail label queue + Google Chat @mentions."""
+    return load_needs_response()
 
 
 def _fmt(value: str | None, *, prefix: str = "", suffix: str = "") -> str:
@@ -365,6 +390,27 @@ def _fmt_vs_prior_mtd(pct: float | None) -> str | None:
     return f"{pct:+.0f}% vs prior MTD"
 
 
+def _sparkline_trend_color(trend: TrendSeries) -> str:
+    """Green when the series rises over the window, red when it falls."""
+    if len(trend.points) < 2:
+        return COLORS["muted"]
+    points = trend.points[-7:]
+    y = [p.value for p in points]
+    start = y[0]
+    end = y[-2] if trend.dim_today and len(y) >= 2 else y[-1]
+    if end > start:
+        return COLORS["accent"]
+    if end < start:
+        return COLORS["danger"]
+    return COLORS["muted"]
+
+
+def _hex_to_rgba(hex_color: str, alpha: float) -> str:
+    hex_color = hex_color.lstrip("#")
+    r, g, b = (int(hex_color[i : i + 2], 16) for i in (0, 2, 4))
+    return f"rgba({r},{g},{b},{alpha})"
+
+
 def _sparkline_figure(trend: TrendSeries) -> go.Figure | None:
     if not trend.wired or len(trend.points) < 2:
         return None
@@ -372,6 +418,7 @@ def _sparkline_figure(trend: TrendSeries) -> go.Figure | None:
     points = trend.points[-7:]
     x = [p.date for p in points]
     y = [p.value for p in points]
+    line_color = _sparkline_trend_color(trend)
     fig = go.Figure()
 
     if trend.dim_today and len(points) >= 2:
@@ -380,7 +427,7 @@ def _sparkline_figure(trend: TrendSeries) -> go.Figure | None:
                 x=x[:-1],
                 y=y[:-1],
                 mode="lines",
-                line=dict(color=COLORS["accent"], width=2),
+                line=dict(color=line_color, width=2),
                 hoverinfo="skip",
             )
         )
@@ -389,8 +436,8 @@ def _sparkline_figure(trend: TrendSeries) -> go.Figure | None:
                 x=x[-2:],
                 y=y[-2:],
                 mode="lines+markers",
-                line=dict(color="rgba(93,166,138,0.45)", width=2, dash="dot"),
-                marker=dict(size=4, color="rgba(93,166,138,0.45)"),
+                line=dict(color=_hex_to_rgba(line_color, 0.45), width=2, dash="dot"),
+                marker=dict(size=4, color=_hex_to_rgba(line_color, 0.45)),
                 hoverinfo="skip",
             )
         )
@@ -400,7 +447,7 @@ def _sparkline_figure(trend: TrendSeries) -> go.Figure | None:
                 x=x,
                 y=y,
                 mode="lines",
-                line=dict(color=COLORS["accent"], width=2),
+                line=dict(color=line_color, width=2),
                 hoverinfo="skip",
             )
         )
@@ -416,6 +463,13 @@ def _sparkline_figure(trend: TrendSeries) -> go.Figure | None:
         dragmode=False,
     )
     return fig
+
+
+def _kpi_container_key(label: str) -> str:
+    slug = "".join(ch if ch.isalnum() else "-" for ch in label.lower()).strip("-")
+    while "--" in slug:
+        slug = slug.replace("--", "-")
+    return f"war-room-kpi-{slug or 'metric'}"
 
 
 def _render_sparkline(trend: TrendSeries) -> None:
@@ -439,18 +493,38 @@ def _render_trend_metric(
     value: str,
     trend: TrendSeries | None,
     *,
-    trend_caption: str,
+    delta: str | None = None,
 ) -> None:
-    delta = _fmt_vs_prior_avg(trend.vs_prior_avg_pct) if trend else None
-    st.metric(label, value, delta=delta, delta_color="normal")
-    if trend:
-        st.markdown(f'<p class="war-room-trend-label">{trend_caption}</p>', unsafe_allow_html=True)
-        _render_sparkline(trend)
-    else:
-        st.markdown(
-            '<div class="war-room-sparkline-placeholder">7d trend · wiring pending</div>',
-            unsafe_allow_html=True,
+    """Single KPI card: headline metric and sparkline share one bordered box."""
+    with st.container(border=True, key=_kpi_container_key(label)):
+        col_metric, col_spark = st.columns(
+            [1.2, 0.9],
+            gap="small",
+            vertical_alignment="center",
         )
+        with col_metric:
+            if delta is None and trend:
+                delta = _fmt_vs_prior_avg(trend.vs_prior_avg_pct)
+            st.metric(label, value, delta=delta, delta_color="normal")
+        with col_spark:
+            if trend:
+                _render_sparkline(trend)
+            else:
+                st.markdown(
+                    '<div class="war-room-sparkline-placeholder">7d trend · wiring pending</div>',
+                    unsafe_allow_html=True,
+                )
+
+
+def _format_hear_about_source_label(source: str) -> str:
+    text = (source or "").strip()
+    if not text:
+        return "(Not set)"
+    if "word of mouth" in text.casefold():
+        return "WOM"
+    if text.casefold().startswith("3rd party"):
+        return "3rd party"
+    return text
 
 
 def _horizontal_bar_figure(
@@ -464,7 +538,7 @@ def _horizontal_bar_figure(
     fig = go.Figure(
         go.Bar(
             x=[r.count for r in ordered],
-            y=[r.source for r in ordered],
+            y=[_format_hear_about_source_label(r.source) for r in ordered],
             orientation="h",
             marker=dict(color=COLORS["accent"]),
             text=[f"{r.count:,}" for r in ordered],
@@ -513,6 +587,13 @@ def _clear_caches() -> None:
     _load_content_seo.clear()
     _load_team_ops.clear()
     _load_needs_response.clear()
+    _load_alerts.clear()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_alerts(_loader_version: str = WAR_ROOM_LOADER_VERSION) -> AlertsMetrics:
+    """Google Tasks — overdue, due today, and due soon."""
+    return load_alerts()
 
 
 # ---------------------------------------------------------------------------
@@ -549,55 +630,43 @@ def _render_command_strip(data: CommandStripMetrics) -> None:
         "war-room-command-strip",
     ):
         st.caption(
-            "All headline counts are 7-day totals (same window as sparklines). "
-            "Today is dimmed on Meta- and GA4-backed series (intraday may be incomplete)."
+            "7-day KPIs compare vs the prior 7 days. Ad spend (MTD) compares vs the same "
+            "calendar days last month. Today is dimmed on paid/GA4 series (intraday may be incomplete)."
         )
 
-        trend_spend, trend_leads, trend_sessions = st.columns(3, gap="small")
-        with trend_spend:
+        row_spend, row_mtd = st.columns(2, gap="small")
+        with row_spend:
             _render_trend_metric(
                 "Ad spend (7d)",
                 _fmt_currency(data.spend_7d),
                 data.spend_trend,
-                trend_caption="Daily spend · Google Ads + Meta · today dimmed",
             )
-        with trend_leads:
+        with row_mtd:
             _render_trend_metric(
-                "Leads (7d)",
-                _fmt_count(data.leads_7d),
-                data.leads_trend,
-                trend_caption="Daily leads · Google Ads + Meta · today dimmed",
+                "Ad spend (MTD)",
+                _fmt_currency(data.ad_spend_mtd),
+                data.ad_spend_mtd_trend,
+                delta=_fmt_vs_prior_mtd(data.ad_spend_mtd_vs_prior_pct),
             )
-        with trend_sessions:
+
+        row_sessions, row_contacts, row_leads = st.columns(3, gap="small")
+        with row_sessions:
             _render_trend_metric(
                 "GA4 sessions (7d)",
                 _fmt_count(data.sessions_7d),
                 data.sessions_trend,
-                trend_caption="Daily sessions · GA4 · today dimmed",
             )
-
-        st.caption(f"GHL funnel · {period} · deltas vs prior 7d (MTD vs same days last month)")
-        snap_a, snap_b, snap_c = st.columns(3, gap="small")
-        with snap_a:
-            st.metric(
-                "GHL signups (7d)",
-                _fmt_count(data.signups_7d),
-                delta=_fmt_vs_prior_avg(data.signups_7d_vs_prior_pct),
-                delta_color="normal",
+        with row_contacts:
+            _render_trend_metric(
+                "New contacts (7d)",
+                _fmt_count(data.new_contacts_7d),
+                data.new_contacts_trend,
             )
-        with snap_b:
-            st.metric(
-                "Bookings (7d)",
-                _fmt_count(data.bookings_7d),
-                delta=_fmt_vs_prior_avg(data.bookings_7d_vs_prior_pct),
-                delta_color="normal",
-            )
-        with snap_c:
-            st.metric(
-                "Ad spend (MTD)",
-                _fmt_currency(data.ad_spend_mtd),
-                delta=_fmt_vs_prior_mtd(data.ad_spend_mtd_vs_prior_pct),
-                delta_color="normal",
+        with row_leads:
+            _render_trend_metric(
+                "Leads (7d)",
+                _fmt_count(data.leads_7d),
+                data.leads_trend,
             )
 
         if data.notes:
@@ -608,7 +677,10 @@ def _render_command_strip(data: CommandStripMetrics) -> None:
                 st.warning(err)
 
 
-def _render_conversion_drivers(data: ConversionDriversMetrics) -> None:
+def _render_conversion_drivers(
+    data: ConversionDriversMetrics,
+    command: CommandStripMetrics,
+) -> None:
     period = (
         f"{data.period_since} – {data.period_until}"
         if data.period_since and data.period_until
@@ -621,19 +693,32 @@ def _render_conversion_drivers(data: ConversionDriversMetrics) -> None:
     ):
         st.caption(
             "Bookings = calendar events by date added · "
-            "Committed = Sign Up Date in range with Committed? = Yes"
+            "Signups = Sign Up Date in range with Committed? = Yes · "
+            "deltas vs prior 7d"
         )
         col_bookings, col_committed = st.columns(2, gap="medium")
         with col_bookings:
+            st.metric(
+                "Bookings (7d)",
+                _fmt_count(command.bookings_7d),
+                delta=_fmt_vs_prior_avg(command.bookings_7d_vs_prior_pct),
+                delta_color="normal",
+            )
             _render_hear_about_bar_chart(
                 data.bookings_by_source,
-                title="Bookings by How did you hear?",
+                title="DC Bookings by Source",
                 total=data.total_bookings,
             )
         with col_committed:
+            st.metric(
+                "Signups (7d)",
+                _fmt_count(command.signups_7d),
+                delta=_fmt_vs_prior_avg(command.signups_7d_vs_prior_pct),
+                delta_color="normal",
+            )
             _render_hear_about_bar_chart(
                 data.committed_by_source,
-                title="Committed by How did you hear?",
+                title="Signups by Source",
                 total=data.total_committed,
             )
         if data.notes:
@@ -822,7 +907,7 @@ def _render_team_ops(data: TeamOpsMetrics) -> None:
                 st.warning(err)
 
 
-def _render_needs_response(data: dict) -> None:
+def _render_needs_response(data: NeedsResponseMetrics) -> None:
     with _panel(
         "Needs response",
         "Marketing-only · Gmail label queue + Google Chat spaces (not general inbox)",
@@ -830,33 +915,53 @@ def _render_needs_response(data: dict) -> None:
     ):
         _metric_row(
             [
-                ("Gmail (marketing)", _fmt(data["gmail_count"])),
-                ("Google Chat", _fmt(data["chat_count"])),
-                ("Oldest waiting", _fmt(data["oldest_wait"])),
+                ("Gmail (marketing)", _fmt_count(data.gmail_count)),
+                ("Google Chat", _fmt_count(data.chat_count)),
+                ("Oldest waiting", _fmt(data.oldest_wait)),
             ]
         )
-        items: list = data.get("items") or []
-        if items:
-            for item in items[:5]:
+        if data.items:
+            for item in data.items[:5]:
                 st.markdown(
-                    f"**{item.get('source', '—')}** · {item.get('from', '—')} · "
-                    f"_{item.get('age', '—')}_  \n{item.get('preview', '')}"
+                    f"**{item.source}** · {item.sender} · _{item.age}_  \n{item.preview}"
                 )
         else:
             st.caption("No pending marketing requests in queue.")
-        _placeholder_note(
-            "Stage 9 — Gmail API (scoped label) + Chat API (named spaces / @mentions)."
-        )
+        if data.notes:
+            for note in data.notes:
+                st.caption(note)
+        if data.errors:
+            for err in data.errors:
+                st.warning(err)
 
 
-def _render_alerts() -> None:
+def _render_alerts(data: AlertsMetrics) -> None:
     with _panel(
         "Alerts",
-        "Thresholds, anomalies, stale feeds",
+        "Google Tasks · overdue and upcoming due dates",
         "war-room-alerts",
     ):
-        st.info("No alerts configured yet.")
-        _placeholder_note("Stage 10 — add rules (e.g. CPA spike, booking drop, overdue tasks).")
+        _metric_row(
+            [
+                ("Overdue", _fmt_count(data.overdue_count)),
+                ("Due today", _fmt_count(data.due_today_count)),
+                ("Due soon", _fmt_count(data.due_soon_count)),
+            ]
+        )
+        if data.items:
+            for item in data.items[:8]:
+                st.markdown(
+                    f"**{item.severity}** · {item.title} · _{item.due_label}_  \n"
+                    f"{item.list_name}"
+                )
+        elif not data.errors:
+            st.caption("No overdue or upcoming tasks with due dates.")
+        if data.notes:
+            for note in data.notes:
+                st.caption(note)
+        if data.errors:
+            for err in data.errors:
+                st.warning(err)
 
 
 # ---------------------------------------------------------------------------
@@ -890,7 +995,7 @@ def main() -> None:
 
     with st.spinner("Loading Discovery Call & Conversion Drivers…"):
         conversion = _load_conversion_drivers()
-    _render_conversion_drivers(conversion)
+    _render_conversion_drivers(conversion, command)
 
     col_left, col_mid, col_right = st.columns(3, gap="medium")
     with st.spinner("Loading panels…"):
@@ -917,10 +1022,13 @@ def main() -> None:
         _render_team_ops(team)
 
     col_needs, col_alerts = st.columns([3, 2], gap="medium")
+    with st.spinner("Loading needs response & alerts…"):
+        needs = _load_needs_response()
+        alerts = _load_alerts()
     with col_needs:
-        _render_needs_response(_load_needs_response())
+        _render_needs_response(needs)
     with col_alerts:
-        _render_alerts()
+        _render_alerts(alerts)
 
     if refresh_minutes > 0:
         st.caption(f"Auto-refresh every {refresh_minutes} min — not active yet.")

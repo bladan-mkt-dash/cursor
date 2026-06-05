@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+# Bump when exports or loaders change — marketing_war_room.py reloads this module
+# when the revision differs (Streamlit caches imports across reruns).
+WAR_ROOM_DATA_REVISION = "2026-06-04-command-strip-layout-v2"
+
 import calendar
 import importlib
+import os
 import sys
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -17,7 +22,11 @@ if str(_PROJECT_ROOT) not in sys.path:
 # were added to ghl_client.py after the server started.
 import ghl_client as _ghl_client
 
-if not hasattr(_ghl_client, "fetch_bookings_by_hear_about_us"):
+_GHL_CLIENT_REVISION = "2026-06-04-hear-about-labels-v2"
+if (
+    not hasattr(_ghl_client, "fetch_bookings_by_hear_about_us")
+    or getattr(_ghl_client, "GHL_CLIENT_REVISION", None) != _GHL_CLIENT_REVISION
+):
     _ghl_client = importlib.reload(_ghl_client)
 
 from ghl_client import (  # noqa: E402
@@ -70,6 +79,7 @@ class CommandStripMetrics:
     signups_7d: int | None = None
     sessions_7d: int | None = None
     bookings_7d: int | None = None
+    new_contacts_7d: int | None = None
     ad_spend_mtd: float | None = None
     signups_7d_vs_prior_pct: float | None = None
     bookings_7d_vs_prior_pct: float | None = None
@@ -77,6 +87,8 @@ class CommandStripMetrics:
     spend_trend: TrendSeries | None = None
     leads_trend: TrendSeries | None = None
     sessions_trend: TrendSeries | None = None
+    new_contacts_trend: TrendSeries | None = None
+    ad_spend_mtd_trend: TrendSeries | None = None
     errors: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -171,6 +183,46 @@ class TeamOpsMetrics:
     notes: list[str] = field(default_factory=list)
 
 
+DEFAULT_WAR_ROOM_GMAIL_LABEL = "Marketing/Action"
+
+
+@dataclass
+class NeedsResponseItem:
+    source: str
+    sender: str
+    preview: str
+    age: str
+    when: datetime | None = None
+
+
+@dataclass
+class NeedsResponseMetrics:
+    gmail_count: int | None = None
+    chat_count: int | None = None
+    oldest_wait: str | None = None
+    items: list[NeedsResponseItem] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class TaskAlertItem:
+    severity: str
+    title: str
+    list_name: str
+    due_label: str
+
+
+@dataclass
+class AlertsMetrics:
+    overdue_count: int | None = None
+    due_today_count: int | None = None
+    due_soon_count: int | None = None
+    items: list[TaskAlertItem] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+
 def compute_vs_prior_avg(
     today_value: float | None,
     points: list[TrendPoint],
@@ -238,6 +290,24 @@ def _prior_seven_day_dates(as_of: date) -> list[str]:
 
 def _sum_for_dates(values_by_date: dict[str, float], dates: list[str]) -> float:
     return sum(float(values_by_date.get(day, 0.0)) for day in dates)
+
+
+def _calendar_dates_inclusive(start: date, end: date) -> list[str]:
+    days: list[str] = []
+    cursor = start
+    while cursor <= end:
+        days.append(cursor.isoformat())
+        cursor += timedelta(days=1)
+    return days
+
+
+def _cumulative_by_date(dates: list[str], daily: dict[str, float]) -> dict[str, float]:
+    running = 0.0
+    out: dict[str, float] = {}
+    for day in dates:
+        running += float(daily.get(day, 0.0))
+        out[day] = running
+    return out
 
 
 def _pct_vs_prior_period(current: float | None, prior: float | None) -> float | None:
@@ -643,6 +713,7 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
       - Ad spend / leads: Google Ads + Meta (account level)
       - Signups: GHL Sign Up Date custom field
       - Bookings: GHL calendar events by dateAdded
+      - New contacts: GHL contacts by ``dateAdded``
       - Sessions: GA4 property total
     """
     today = as_of or date.today()
@@ -662,16 +733,17 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
     google_prior_mtd_spend: float | None = None
     meta_prior_mtd_spend: float | None = None
     google_daily = None
+    google_month_daily = None
     meta_daily: list[dict] = []
+    meta_month_daily: list[dict] = []
     ga4_sessions_by_date: dict[str, int] = {}
 
     try:
         from google_ads_ghl_paid_cohort import fetch_google_ads_daily
 
         google_daily = fetch_google_ads_daily(prior_since, today_iso)
-        google_mtd_spend = _google_mtd_spend(
-            fetch_google_ads_daily(month_start_iso, today_iso)
-        )
+        google_month_daily = fetch_google_ads_daily(month_start_iso, today_iso)
+        google_mtd_spend = _google_mtd_spend(google_month_daily)
         google_prior_mtd_spend = _google_mtd_spend(
             fetch_google_ads_daily(prior_mtd_since, prior_mtd_until)
         )
@@ -684,6 +756,7 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
         meta = fetch_account_daily_insights(since=prior_since, until=today_iso)
         meta_daily = meta["daily"]
         meta_mtd = fetch_account_daily_insights(since=month_start_iso, until=today_iso)
+        meta_month_daily = meta_mtd["daily"]
         meta_mtd_spend = meta_mtd["totals"]["spend"]
         meta_prior_mtd = fetch_account_daily_insights(
             since=prior_mtd_since,
@@ -757,6 +830,26 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
     except Exception as exc:
         metrics.errors.append(f"GHL: {exc}")
 
+    new_contacts_by_date: dict[str, float] = {day: 0.0 for day in compare_dates}
+    try:
+        from ghl_client import contact_created_utc_date_str, fetch_contacts_date_added_complete
+
+        new_contacts, new_contacts_truncated = fetch_contacts_date_added_complete(
+            prior_since,
+            trend_until,
+        )
+        for contact in new_contacts:
+            created = contact_created_utc_date_str(contact)
+            if created in new_contacts_by_date:
+                new_contacts_by_date[created] += 1.0
+        metrics.new_contacts_7d = int(_sum_for_dates(new_contacts_by_date, trend_dates))
+        if new_contacts_truncated:
+            metrics.notes.append(
+                "GHL new contacts count may be incomplete (pagination cap)."
+            )
+    except Exception as exc:
+        metrics.errors.append(f"GHL new contacts: {exc}")
+
     try:
         from google_data import get_ga4_sessions_by_date
 
@@ -824,19 +917,70 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
             float(metrics.sessions_7d), float(prior_sessions_7d)
         )
 
+    prior_new_contacts_7d = int(_sum_for_dates(new_contacts_by_date, prior_dates))
+    metrics.new_contacts_trend = _build_trend_series(
+        "New contacts",
+        trend_dates,
+        new_contacts_by_date,
+        today_value=None,
+        dim_today=False,
+    )
+    if metrics.new_contacts_trend:
+        metrics.new_contacts_trend.vs_prior_avg_pct = _pct_vs_prior_period(
+            float(metrics.new_contacts_7d) if metrics.new_contacts_7d is not None else None,
+            float(prior_new_contacts_7d),
+        )
+
+    month_dates = _calendar_dates_inclusive(month_start, today)
+    google_month_spend = _google_daily_dict(
+        google_month_daily, value_col="cost", dates=month_dates
+    )
+    meta_month_spend = _meta_daily_dict(
+        meta_month_daily, value_key="spend", dates=month_dates
+    )
+    mtd_daily_spend = _sum_daily_dicts(month_dates, google_month_spend, meta_month_spend)
+    mtd_cumulative = _cumulative_by_date(month_dates, mtd_daily_spend)
+    metrics.ad_spend_mtd_trend = _build_trend_series(
+        "Ad spend MTD",
+        month_dates,
+        mtd_cumulative,
+        today_value=metrics.ad_spend_mtd,
+        dim_today=True,
+    )
+    if metrics.ad_spend_mtd_trend:
+        metrics.ad_spend_mtd_trend.vs_prior_avg_pct = metrics.ad_spend_mtd_vs_prior_pct
+
     if not metrics.spend_trend.wired:
         metrics.spend_trend = _placeholder_trend("Ad spend", dim_today=True)
     if not metrics.leads_trend.wired:
         metrics.leads_trend = _placeholder_trend("Leads", dim_today=True)
     if not metrics.sessions_trend.wired:
         metrics.sessions_trend = _placeholder_trend("GA4 sessions", dim_today=True)
+    if not metrics.new_contacts_trend.wired:
+        metrics.new_contacts_trend = _placeholder_trend("New contacts", dim_today=False)
+    if not metrics.ad_spend_mtd_trend.wired:
+        metrics.ad_spend_mtd_trend = _placeholder_trend("Ad spend MTD", dim_today=True)
 
     return metrics
 
 
+def _format_hear_about_source_label(source: str) -> str:
+    text = (source or "").strip()
+    if not text:
+        return "(Not set)"
+    if "word of mouth" in text.casefold():
+        return "WOM"
+    if text.casefold().startswith("3rd party"):
+        return "3rd party"
+    return text
+
+
 def _rows_from_ghl_payload(rows: list[dict]) -> list[HearAboutCountRow]:
     return [
-        HearAboutCountRow(source=str(row.get("source") or "(Not set)"), count=int(row.get("count") or 0))
+        HearAboutCountRow(
+            source=_format_hear_about_source_label(str(row.get("source") or "")),
+            count=int(row.get("count") or 0),
+        )
         for row in rows
     ]
 
@@ -883,9 +1027,192 @@ def load_conversion_drivers(*, as_of: date | None = None) -> ConversionDriversMe
                 f"{excluded} contact(s) with sign-up in range excluded (Committed? ≠ Yes)."
             )
         metrics.notes.append(
-            "Committed = Sign Up Date in range and Committed? = Yes."
+            "Signups by source = Sign Up Date in range and Committed? = Yes."
         )
     except Exception as exc:
         metrics.errors.append(f"GHL committed: {exc}")
+
+    return metrics
+
+
+def _format_wait_age(when: datetime | None, *, now: datetime | None = None) -> str:
+    if when is None:
+        return "—"
+    current = now or datetime.now(timezone.utc)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    delta = current - when.astimezone(timezone.utc)
+    if delta.days >= 1:
+        return f"{delta.days}d"
+    hours = delta.seconds // 3600
+    if hours >= 1:
+        return f"{hours}h"
+    minutes = max(1, delta.seconds // 60)
+    return f"{minutes}m"
+
+
+def _parse_chat_space_names(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def load_needs_response() -> NeedsResponseMetrics:
+    """
+    Marketing-only inbound queue — Gmail label + Google Chat @mentions.
+
+    Environment:
+      WAR_ROOM_GMAIL_LABEL — unread messages in this label (default Marketing/Action)
+      WAR_ROOM_GMAIL_QUERY — optional full Gmail query (overrides label)
+      WAR_ROOM_CHAT_SPACES — comma-separated display-name substrings; empty = named spaces
+    """
+    metrics = NeedsResponseMetrics()
+    now = datetime.now(timezone.utc)
+    queue: list[NeedsResponseItem] = []
+
+    gmail_label = (os.getenv("WAR_ROOM_GMAIL_LABEL") or DEFAULT_WAR_ROOM_GMAIL_LABEL).strip()
+    gmail_query = (os.getenv("WAR_ROOM_GMAIL_QUERY") or "").strip()
+    chat_spaces = _parse_chat_space_names(os.getenv("WAR_ROOM_CHAT_SPACES"))
+
+    try:
+        from gmail_client import (
+            fetch_unread_by_label,
+            fetch_unread_by_query,
+            gmail_service,
+        )
+
+        service = gmail_service()
+        if gmail_query:
+            gmail_messages = fetch_unread_by_query(service, query=gmail_query)
+            metrics.notes.append(f"Gmail queue: custom query ({gmail_query}).")
+        else:
+            gmail_messages = fetch_unread_by_label(service, label=gmail_label)
+            metrics.notes.append(f"Gmail queue: unread in label “{gmail_label}”.")
+
+        metrics.gmail_count = len(gmail_messages)
+        for msg in gmail_messages:
+            preview = msg.subject
+            if msg.snippet:
+                preview = f"{msg.subject} — {msg.snippet[:120]}"
+            queue.append(
+                NeedsResponseItem(
+                    source="Gmail",
+                    sender=msg.from_addr or "—",
+                    preview=preview,
+                    age=_format_wait_age(msg.date, now=now),
+                    when=msg.date,
+                )
+            )
+    except Exception as exc:
+        metrics.errors.append(f"Gmail: {exc}")
+
+    try:
+        from google_chat_client import fetch_unread_mentions, chat_service
+
+        chat = chat_service()
+        chat_rows = fetch_unread_mentions(chat, space_display_names=chat_spaces or None)
+        metrics.chat_count = len(chat_rows)
+        if chat_spaces:
+            metrics.notes.append(
+                f"Chat: unread @mentions in spaces matching {', '.join(chat_spaces)}."
+            )
+        else:
+            metrics.notes.append("Chat: unread @mentions in named spaces (set WAR_ROOM_CHAT_SPACES to narrow).")
+
+        for row in chat_rows:
+            queue.append(
+                NeedsResponseItem(
+                    source=f"Chat · {row.space_display_name}",
+                    sender=row.sender_name,
+                    preview=row.preview,
+                    age=_format_wait_age(row.create_time, now=now),
+                    when=row.create_time,
+                )
+            )
+    except Exception as exc:
+        metrics.errors.append(f"Google Chat: {exc}")
+
+    queue.sort(
+        key=lambda item: item.when or datetime.min.replace(tzinfo=timezone.utc)
+    )
+    metrics.items = queue
+
+    oldest = next((item for item in queue if item.when), None)
+    metrics.oldest_wait = oldest.age if oldest else None
+
+    return metrics
+
+
+def _format_task_due_label(due: date, *, severity: str, today: date) -> str:
+    if severity == "Overdue":
+        days = max(1, (today - due).days)
+        return f"{days}d overdue"
+    return f"{due.strftime('%b')} {due.day}"
+
+
+def _parse_tasks_list_filters(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def load_alerts(*, as_of: date | None = None) -> AlertsMetrics:
+    """
+    Google Tasks alerts — overdue, due today, and due soon (tasks with due dates only).
+
+    Environment:
+      WAR_ROOM_TASKS_LISTS — optional comma-separated task list titles or IDs to include
+      WAR_ROOM_TASKS_DUE_SOON_DAYS — days ahead for “due soon” (default 3)
+    """
+    today = as_of or date.today()
+    metrics = AlertsMetrics()
+    list_filters = _parse_tasks_list_filters(os.getenv("WAR_ROOM_TASKS_LISTS"))
+    try:
+        due_soon_days = int(os.getenv("WAR_ROOM_TASKS_DUE_SOON_DAYS") or "3")
+    except ValueError:
+        due_soon_days = 3
+
+    try:
+        from google_tasks_client import TaskAlertSeverity, fetch_task_alerts, tasks_service
+
+        service = tasks_service()
+        rows = fetch_task_alerts(
+            service,
+            list_filters=list_filters or None,
+            due_soon_days=due_soon_days,
+            today=today,
+        )
+        metrics.overdue_count = sum(
+            1 for row in rows if row.severity == TaskAlertSeverity.OVERDUE
+        )
+        metrics.due_today_count = sum(
+            1 for row in rows if row.severity == TaskAlertSeverity.DUE_TODAY
+        )
+        metrics.due_soon_count = sum(
+            1 for row in rows if row.severity == TaskAlertSeverity.DUE_SOON
+        )
+        metrics.items = [
+            TaskAlertItem(
+                severity=row.severity.value,
+                title=row.title,
+                list_name=row.list_name,
+                due_label=_format_task_due_label(
+                    row.due_date,
+                    severity=row.severity.value,
+                    today=today,
+                ),
+            )
+            for row in rows
+        ]
+        if list_filters:
+            metrics.notes.append(
+                f"Tasks: lists matching {', '.join(list_filters)} · due within {due_soon_days}d."
+            )
+        else:
+            metrics.notes.append(
+                f"Tasks: all lists · overdue, due today, or due within {due_soon_days}d (due date required)."
+            )
+    except Exception as exc:
+        metrics.errors.append(f"Google Tasks: {exc}")
 
     return metrics
