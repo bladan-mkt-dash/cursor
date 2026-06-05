@@ -4,7 +4,7 @@ from __future__ import annotations
 
 # Bump when exports or loaders change — marketing_war_room.py reloads this module
 # when the revision differs (Streamlit caches imports across reruns).
-WAR_ROOM_DATA_REVISION = "2026-06-04-command-strip-layout-v2"
+WAR_ROOM_DATA_REVISION = "2026-06-05-chat-scope-fix-v1"
 
 import calendar
 import importlib
@@ -22,7 +22,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 # were added to ghl_client.py after the server started.
 import ghl_client as _ghl_client
 
-_GHL_CLIENT_REVISION = "2026-06-04-hear-about-labels-v2"
+_GHL_CLIENT_REVISION = "2026-06-05-ghl-retry-v1"
 if (
     not hasattr(_ghl_client, "fetch_bookings_by_hear_about_us")
     or getattr(_ghl_client, "GHL_CLIENT_REVISION", None) != _GHL_CLIENT_REVISION
@@ -62,6 +62,8 @@ class HearAboutCountRow:
 class ConversionDriversMetrics:
     period_since: str = ""
     period_until: str = ""
+    traffic_contributors: list[HearAboutCountRow] = field(default_factory=list)
+    total_sessions_7d: int | None = None
     bookings_by_source: list[HearAboutCountRow] = field(default_factory=list)
     committed_by_source: list[HearAboutCountRow] = field(default_factory=list)
     total_bookings: int | None = None
@@ -81,14 +83,17 @@ class CommandStripMetrics:
     bookings_7d: int | None = None
     new_contacts_7d: int | None = None
     ad_spend_mtd: float | None = None
+    ad_spend_ytd: float | None = None
     signups_7d_vs_prior_pct: float | None = None
     bookings_7d_vs_prior_pct: float | None = None
     ad_spend_mtd_vs_prior_pct: float | None = None
+    ad_spend_ytd_vs_prior_pct: float | None = None
     spend_trend: TrendSeries | None = None
     leads_trend: TrendSeries | None = None
     sessions_trend: TrendSeries | None = None
     new_contacts_trend: TrendSeries | None = None
     ad_spend_mtd_trend: TrendSeries | None = None
+    ad_spend_ytd_trend: TrendSeries | None = None
     errors: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -324,6 +329,14 @@ def _prior_month_mtd_range(as_of: date) -> tuple[str, str]:
         prior_start = date(as_of.year, as_of.month - 1, 1)
     last_day = calendar.monthrange(prior_start.year, prior_start.month)[1]
     prior_end = prior_start.replace(day=min(as_of.day, last_day))
+    return prior_start.isoformat(), prior_end.isoformat()
+
+
+def _prior_year_ytd_range(as_of: date) -> tuple[str, str]:
+    """Jan 1 through the same calendar day in the prior year (for YTD comparisons)."""
+    prior_start = date(as_of.year - 1, 1, 1)
+    last_day = calendar.monthrange(prior_start.year, as_of.month)[1]
+    prior_end = date(as_of.year - 1, as_of.month, min(as_of.day, last_day))
     return prior_start.isoformat(), prior_end.isoformat()
 
 
@@ -718,11 +731,14 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
     """
     today = as_of or date.today()
     month_start = today.replace(day=1)
+    year_start = today.replace(month=1, day=1)
     month_start_iso = month_start.isoformat()
+    year_start_iso = year_start.isoformat()
     today_iso = today.isoformat()
     trend_since, trend_until = _last_n_days_range(as_of=today, days=7)
     prior_since, prior_until = _last_n_days_range(as_of=today - timedelta(days=7), days=7)
     prior_mtd_since, prior_mtd_until = _prior_month_mtd_range(today)
+    prior_ytd_since, prior_ytd_until = _prior_year_ytd_range(today)
     trend_dates = _seven_day_dates(today)
     prior_dates = _prior_seven_day_dates(today)
     compare_dates = prior_dates + trend_dates
@@ -730,12 +746,18 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
     metrics = CommandStripMetrics(period_since=trend_since, period_until=trend_until)
     google_mtd_spend: float | None = None
     meta_mtd_spend: float | None = None
+    google_ytd_spend: float | None = None
+    meta_ytd_spend: float | None = None
     google_prior_mtd_spend: float | None = None
     meta_prior_mtd_spend: float | None = None
+    google_prior_ytd_spend: float | None = None
+    meta_prior_ytd_spend: float | None = None
     google_daily = None
     google_month_daily = None
+    google_ytd_daily = None
     meta_daily: list[dict] = []
     meta_month_daily: list[dict] = []
+    meta_ytd_daily: list[dict] = []
     ga4_sessions_by_date: dict[str, int] = {}
 
     try:
@@ -743,9 +765,14 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
 
         google_daily = fetch_google_ads_daily(prior_since, today_iso)
         google_month_daily = fetch_google_ads_daily(month_start_iso, today_iso)
+        google_ytd_daily = fetch_google_ads_daily(year_start_iso, today_iso)
         google_mtd_spend = _google_mtd_spend(google_month_daily)
+        google_ytd_spend = _google_mtd_spend(google_ytd_daily)
         google_prior_mtd_spend = _google_mtd_spend(
             fetch_google_ads_daily(prior_mtd_since, prior_mtd_until)
+        )
+        google_prior_ytd_spend = _google_mtd_spend(
+            fetch_google_ads_daily(prior_ytd_since, prior_ytd_until)
         )
     except Exception as exc:
         metrics.errors.append(f"Google Ads: {exc}")
@@ -758,41 +785,63 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
         meta_mtd = fetch_account_daily_insights(since=month_start_iso, until=today_iso)
         meta_month_daily = meta_mtd["daily"]
         meta_mtd_spend = meta_mtd["totals"]["spend"]
+        meta_ytd = fetch_account_daily_insights(since=year_start_iso, until=today_iso)
+        meta_ytd_daily = meta_ytd["daily"]
+        meta_ytd_spend = meta_ytd["totals"]["spend"]
         meta_prior_mtd = fetch_account_daily_insights(
             since=prior_mtd_since,
             until=prior_mtd_until,
         )
         meta_prior_mtd_spend = meta_prior_mtd["totals"]["spend"]
+        meta_prior_ytd = fetch_account_daily_insights(
+            since=prior_ytd_since,
+            until=prior_ytd_until,
+        )
+        meta_prior_ytd_spend = meta_prior_ytd["totals"]["spend"]
         metrics.notes.append("Meta daily totals may lag until the day completes.")
     except Exception as exc:
         metrics.errors.append(f"Meta: {exc}")
 
     metrics.ad_spend_mtd = _sum_optional(google_mtd_spend, meta_mtd_spend)
+    metrics.ad_spend_ytd = _sum_optional(google_ytd_spend, meta_ytd_spend)
     metrics.ad_spend_mtd_vs_prior_pct = _pct_vs_prior_period(
         metrics.ad_spend_mtd,
         _sum_optional(google_prior_mtd_spend, meta_prior_mtd_spend),
     )
+    metrics.ad_spend_ytd_vs_prior_pct = _pct_vs_prior_period(
+        metrics.ad_spend_ytd,
+        _sum_optional(google_prior_ytd_spend, meta_prior_ytd_spend),
+    )
 
+    sign_up_field_id: str | None = None
     try:
-        from ghl_client import (
-            count_calendar_bookings_by_date_added,
-            resolve_sign_up_date_custom_field_id,
-            search_contacts_custom_field_date_range,
-        )
+        from ghl_client import resolve_sign_up_date_custom_field_id
 
         sign_up_field_id = resolve_sign_up_date_custom_field_id()
         if not sign_up_field_id:
             raise ValueError(
                 "Could not resolve Sign Up Date field. Set GHL_SIGN_UP_DATE_FIELD_ID in .env."
             )
-        contacts, truncated, total_signups = search_contacts_custom_field_date_range(
-            sign_up_field_id,
-            trend_since,
-            trend_until,
-        )
-        metrics.signups_7d = total_signups or len(contacts)
-        if truncated:
-            metrics.notes.append("GHL signups count may be incomplete (pagination cap).")
+    except Exception as exc:
+        metrics.errors.append(f"GHL signups: {exc}")
+
+    if sign_up_field_id:
+        try:
+            from ghl_client import search_contacts_custom_field_date_range
+
+            contacts, truncated, total_signups = search_contacts_custom_field_date_range(
+                sign_up_field_id,
+                trend_since,
+                trend_until,
+            )
+            metrics.signups_7d = total_signups or len(contacts)
+            if truncated:
+                metrics.notes.append("GHL signups count may be incomplete (pagination cap).")
+        except Exception as exc:
+            metrics.errors.append(f"GHL signups: {exc}")
+
+    try:
+        from ghl_client import count_calendar_bookings_by_date_added
 
         bookings, calendar_errors = count_calendar_bookings_by_date_added(
             trend_since,
@@ -803,32 +852,52 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
             metrics.notes.append(
                 f"GHL bookings: {calendar_errors} calendar(s) failed to load."
             )
+    except Exception as exc:
+        metrics.errors.append(f"GHL bookings: {exc}")
 
-        prior_contacts, prior_truncated, prior_signups = search_contacts_custom_field_date_range(
-            sign_up_field_id,
-            prior_since,
-            prior_until,
-        )
+    prior_signups: int | None = None
+    prior_bookings: int | None = None
+    if sign_up_field_id:
+        try:
+            from ghl_client import search_contacts_custom_field_date_range
+
+            prior_contacts, prior_truncated, prior_signups = (
+                search_contacts_custom_field_date_range(
+                    sign_up_field_id,
+                    prior_since,
+                    prior_until,
+                )
+            )
+            prior_signups = prior_signups or len(prior_contacts)
+            if prior_truncated:
+                metrics.notes.append(
+                    "Prior-period GHL signups may be incomplete (pagination cap)."
+                )
+        except Exception as exc:
+            metrics.errors.append(f"GHL prior signups: {exc}")
+
+    try:
+        from ghl_client import count_calendar_bookings_by_date_added
+
         prior_bookings, prior_calendar_errors = count_calendar_bookings_by_date_added(
             prior_since,
             prior_until,
         )
-        metrics.signups_7d_vs_prior_pct = _pct_vs_prior_period(
-            float(metrics.signups_7d) if metrics.signups_7d is not None else None,
-            float(prior_signups or len(prior_contacts)),
-        )
-        metrics.bookings_7d_vs_prior_pct = _pct_vs_prior_period(
-            float(metrics.bookings_7d) if metrics.bookings_7d is not None else None,
-            float(prior_bookings) if prior_bookings is not None else None,
-        )
-        if prior_truncated:
-            metrics.notes.append("Prior-period GHL signups may be incomplete (pagination cap).")
         if prior_calendar_errors:
             metrics.notes.append(
                 f"Prior-period GHL bookings: {prior_calendar_errors} calendar(s) failed."
             )
     except Exception as exc:
-        metrics.errors.append(f"GHL: {exc}")
+        metrics.errors.append(f"GHL prior bookings: {exc}")
+
+    metrics.signups_7d_vs_prior_pct = _pct_vs_prior_period(
+        float(metrics.signups_7d) if metrics.signups_7d is not None else None,
+        float(prior_signups) if prior_signups is not None else None,
+    )
+    metrics.bookings_7d_vs_prior_pct = _pct_vs_prior_period(
+        float(metrics.bookings_7d) if metrics.bookings_7d is not None else None,
+        float(prior_bookings) if prior_bookings is not None else None,
+    )
 
     new_contacts_by_date: dict[str, float] = {day: 0.0 for day in compare_dates}
     try:
@@ -950,6 +1019,25 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
     if metrics.ad_spend_mtd_trend:
         metrics.ad_spend_mtd_trend.vs_prior_avg_pct = metrics.ad_spend_mtd_vs_prior_pct
 
+    year_dates = _calendar_dates_inclusive(year_start, today)
+    google_year_spend = _google_daily_dict(
+        google_ytd_daily, value_col="cost", dates=year_dates
+    )
+    meta_year_spend = _meta_daily_dict(
+        meta_ytd_daily, value_key="spend", dates=year_dates
+    )
+    ytd_daily_spend = _sum_daily_dicts(year_dates, google_year_spend, meta_year_spend)
+    ytd_cumulative = _cumulative_by_date(year_dates, ytd_daily_spend)
+    metrics.ad_spend_ytd_trend = _build_trend_series(
+        "Ad spend YTD",
+        year_dates,
+        ytd_cumulative,
+        today_value=metrics.ad_spend_ytd,
+        dim_today=True,
+    )
+    if metrics.ad_spend_ytd_trend:
+        metrics.ad_spend_ytd_trend.vs_prior_avg_pct = metrics.ad_spend_ytd_vs_prior_pct
+
     if not metrics.spend_trend.wired:
         metrics.spend_trend = _placeholder_trend("Ad spend", dim_today=True)
     if not metrics.leads_trend.wired:
@@ -960,6 +1048,8 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
         metrics.new_contacts_trend = _placeholder_trend("New contacts", dim_today=False)
     if not metrics.ad_spend_mtd_trend.wired:
         metrics.ad_spend_mtd_trend = _placeholder_trend("Ad spend MTD", dim_today=True)
+    if not metrics.ad_spend_ytd_trend or not metrics.ad_spend_ytd_trend.wired:
+        metrics.ad_spend_ytd_trend = _placeholder_trend("Ad spend YTD", dim_today=True)
 
     return metrics
 
@@ -987,12 +1077,35 @@ def _rows_from_ghl_payload(rows: list[dict]) -> list[HearAboutCountRow]:
 
 def load_conversion_drivers(*, as_of: date | None = None) -> ConversionDriversMetrics:
     """
-    Discovery Call & Conversion Drivers — GHL bookings and committed members
-    grouped by **How did you hear about us?** (last 7 days).
+    Discovery Call & Conversion Drivers — GA4 traffic contributors, GHL bookings,
+    and committed members grouped by **How did you hear about us?** (last 7 days).
     """
     today = as_of or date.today()
     since, until = _last_n_days_range(as_of=today, days=7)
     metrics = ConversionDriversMetrics(period_since=since, period_until=until)
+
+    try:
+        from google_data import get_sessions_by_session_default_channel_group
+
+        channels = get_sessions_by_session_default_channel_group(since, until)
+        if channels.empty:
+            metrics.notes.append("GA4 returned no channel rows for traffic contributors.")
+        else:
+            metrics.total_sessions_7d = int(channels["Sessions"].sum())
+            top5 = channels.head(5)
+            rows: list[HearAboutCountRow] = [
+                HearAboutCountRow(
+                    source=str(row["Session_default_channel_group"]),
+                    count=int(row["Sessions"]),
+                )
+                for _, row in top5.iterrows()
+            ]
+            other_sessions = int(channels.iloc[5:]["Sessions"].sum()) if len(channels) > 5 else 0
+            if other_sessions > 0:
+                rows.append(HearAboutCountRow(source="Other", count=other_sessions))
+            metrics.traffic_contributors = rows
+    except Exception as exc:
+        metrics.errors.append(f"GA4 traffic: {exc}")
 
     try:
         bookings = fetch_bookings_by_hear_about_us(since, until)
@@ -1107,6 +1220,16 @@ def load_needs_response() -> NeedsResponseMetrics:
         metrics.errors.append(f"Gmail: {exc}")
 
     try:
+        import importlib
+
+        import google_chat_client as _google_chat_client
+        import verify_google_chat_connection as _chat_auth
+
+        _CHAT_AUTH_REVISION = "2026-06-05-scope-fix-v1"
+        if getattr(_chat_auth, "CHAT_AUTH_REVISION", None) != _CHAT_AUTH_REVISION:
+            _chat_auth = importlib.reload(_chat_auth)
+            _google_chat_client = importlib.reload(_google_chat_client)
+
         from google_chat_client import fetch_unread_mentions, chat_service
 
         chat = chat_service()

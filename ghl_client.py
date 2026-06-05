@@ -5,9 +5,10 @@
 from __future__ import annotations
 
 # Bump when hear-about normalization or fetch helpers change (war_room_data reloads).
-GHL_CLIENT_REVISION = "2026-06-04-hear-about-labels-v2"
+GHL_CLIENT_REVISION = "2026-06-05-ghl-retry-v1"
 
 import os
+import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -182,40 +183,76 @@ def fetch_recent_contacts(
     return fetch_last_created_contacts(limit=limit, location_id=location_id)
 
 
-def _ghl_post_json(path: str, payload: dict[str, Any], timeout: int = 60) -> dict[str, Any]:
+def _ghl_error_detail(response: requests.Response) -> str:
+    detail = response.text
+    try:
+        err = response.json()
+        if isinstance(err, dict):
+            detail = err.get("message") or err.get("error") or str(err)
+    except ValueError:
+        pass
+    return detail
+
+
+def _ghl_retryable(status_code: int, detail: str) -> bool:
+    if status_code in (429, 500, 502, 503):
+        return True
+    if status_code == 400:
+        lowered = detail.casefold()
+        return "try again" in lowered or "failed to fetch" in lowered
+    return False
+
+
+def _ghl_post_json(
+    path: str,
+    payload: dict[str, Any],
+    timeout: int = 60,
+    *,
+    max_retries: int = 3,
+) -> dict[str, Any]:
     url = f"{BASE_URL}{path}"
-    response = requests.post(url, json=payload, headers=_request_headers(), timeout=timeout)
-    if not response.ok:
-        detail = response.text
-        try:
-            err = response.json()
-            if isinstance(err, dict):
-                detail = err.get("message") or err.get("error") or str(err)
-        except ValueError:
-            pass
-        raise RuntimeError(f"GHL API error {response.status_code}: {detail}")
-    data = response.json()
-    return data if isinstance(data, dict) else {}
+    last_detail = ""
+    for attempt in range(max_retries):
+        response = requests.post(
+            url, json=payload, headers=_request_headers(), timeout=timeout
+        )
+        if response.ok:
+            data = response.json()
+            return data if isinstance(data, dict) else {}
+        last_detail = _ghl_error_detail(response)
+        if attempt < max_retries - 1 and _ghl_retryable(
+            response.status_code, last_detail
+        ):
+            time.sleep(0.4 * (2**attempt))
+            continue
+        raise RuntimeError(f"GHL API error {response.status_code}: {last_detail}")
+    raise RuntimeError(f"GHL API error: {last_detail}")
 
 
 def _ghl_get_json(
-    path: str, params: dict[str, Any] | None = None, timeout: int = 60
+    path: str,
+    params: dict[str, Any] | None = None,
+    timeout: int = 60,
+    *,
+    max_retries: int = 3,
 ) -> dict[str, Any]:
     url = f"{BASE_URL}{path}"
-    response = requests.get(
-        url, params=params or {}, headers=_request_headers(), timeout=timeout
-    )
-    if not response.ok:
-        detail = response.text
-        try:
-            err = response.json()
-            if isinstance(err, dict):
-                detail = err.get("message") or err.get("error") or str(err)
-        except ValueError:
-            pass
-        raise RuntimeError(f"GHL API error {response.status_code}: {detail}")
-    data = response.json()
-    return data if isinstance(data, dict) else {}
+    last_detail = ""
+    for attempt in range(max_retries):
+        response = requests.get(
+            url, params=params or {}, headers=_request_headers(), timeout=timeout
+        )
+        if response.ok:
+            data = response.json()
+            return data if isinstance(data, dict) else {}
+        last_detail = _ghl_error_detail(response)
+        if attempt < max_retries - 1 and _ghl_retryable(
+            response.status_code, last_detail
+        ):
+            time.sleep(0.4 * (2**attempt))
+            continue
+        raise RuntimeError(f"GHL API error {response.status_code}: {last_detail}")
+    raise RuntimeError(f"GHL API error: {last_detail}")
 
 
 DC_APPOINTMENT_FORM_NAME_DEFAULT = "DC Appointment Form"
@@ -244,6 +281,9 @@ _FORM_FIELD_LABEL_SKIP_FINGERPRINTS = frozenset(
 )
 
 
+_custom_fields_cache: dict[str, list[dict[str, Any]]] = {}
+
+
 def fetch_location_custom_fields(location_id: str | None = None) -> list[dict[str, Any]]:
     """
     List custom fields for the location.
@@ -258,24 +298,17 @@ def fetch_location_custom_fields(location_id: str | None = None) -> list[dict[st
     if not location_id:
         raise ValueError("Set GHL_LOCATION_ID in .env")
 
-    url = f"{BASE_URL}/locations/{location_id}/customFields"
-    response = requests.get(url, headers=_request_headers(), timeout=60)
-    if not response.ok:
-        detail = response.text
-        try:
-            err = response.json()
-            if isinstance(err, dict):
-                detail = err.get("message") or err.get("error") or str(err)
-        except ValueError:
-            pass
-        raise RuntimeError(f"GHL API error {response.status_code}: {detail}")
+    cached = _custom_fields_cache.get(location_id)
+    if cached is not None:
+        return cached
 
-    data = response.json()
+    data = _ghl_get_json(f"/locations/{location_id}/customFields", timeout=60)
     fields = data.get("customFields")
     if fields is None and isinstance(data.get("data"), list):
         fields = data["data"]
     if not isinstance(fields, list):
         fields = []
+    _custom_fields_cache[location_id] = fields
     return fields
 
 
@@ -896,6 +929,9 @@ def search_contacts_date_added_range(
 # GHL returns HTTP 400 around page ~101 for large ``dateAdded`` windows.
 _GHL_DATE_ADDED_MAX_PAGES = 100
 _GHL_DATE_ADDED_MIN_SPLIT_MS = 60_000
+
+# ``/contacts/search``: page * pageLimit must not exceed 10_000 (400 beyond page 100).
+_GHL_CONTACT_SEARCH_MAX_PAGES = 100
 
 
 def _search_contacts_date_added_ms_range(
@@ -1827,40 +1863,24 @@ def fetch_committed_yes_contacts(
     }
 
 
-def search_contacts_custom_field_date_range(
+def _search_contacts_custom_field_date_window(
     field_id: str,
     since: str,
     until: str,
     *,
-    location_id: str | None = None,
+    location_id: str,
     page_limit: int = 100,
-    max_pages: int = 500,
+    max_pages: int = _GHL_CONTACT_SEARCH_MAX_PAGES,
 ) -> tuple[list[dict[str, Any]], bool, int]:
     """
-    Contacts whose DATE custom field is in ``[since, until]`` inclusive (YYYY-MM-DD).
+    One ``/contacts/search`` window for a DATE custom field (inclusive YYYY-MM-DD).
 
-    Uses POST ``/contacts/search`` with operator ``range`` and
-    ``value: {"gte": since, "lte": until}``. Pagination uses the ``page`` field
-    (1-based).
-
-    Returns:
-        (contacts, truncated_pages, total_reported)
-        ``total_reported`` is the API ``total`` count from the first page, or 0.
+    GHL rejects ``page * pageLimit > 10_000``; keep ``max_pages`` at 100 when
+    ``page_limit`` is 100.
     """
-    if location_id and location_id.strip():
-        location_id = location_id.strip()
-    else:
-        location_id = _location_id()
-    if not location_id:
-        raise ValueError("Set GHL_LOCATION_ID in .env")
-
-    fid = (field_id or "").strip()
-    if not fid:
-        raise ValueError("field_id is required")
-
     filters = [
         {
-            "field": f"customFields.{fid}",
+            "field": f"customFields.{field_id}",
             "operator": "range",
             "value": {"gte": since, "lte": until},
         }
@@ -1897,6 +1917,66 @@ def search_contacts_custom_field_date_range(
         truncated = True
 
     return out, truncated, total_reported
+
+
+def search_contacts_custom_field_date_range(
+    field_id: str,
+    since: str,
+    until: str,
+    *,
+    location_id: str | None = None,
+    page_limit: int = 100,
+    max_pages: int = _GHL_CONTACT_SEARCH_MAX_PAGES,
+) -> tuple[list[dict[str, Any]], bool, int]:
+    """
+    Contacts whose DATE custom field is in ``[since, until]`` inclusive (YYYY-MM-DD).
+
+    Uses POST ``/contacts/search`` with operator ``range`` and
+    ``value: {"gte": since, "lte": until}``. Pagination uses the ``page`` field
+    (1-based).
+
+    Splits multi-day windows into daily chunks so wide ranges do not hit GHL's
+    ``page * pageLimit <= 10_000`` cap (HTTP 400 on deep pages).
+
+    Returns:
+        (contacts, truncated_pages, total_reported)
+        ``total_reported`` sums API ``total`` counts across daily chunks.
+    """
+    if location_id and location_id.strip():
+        location_id = location_id.strip()
+    else:
+        location_id = _location_id()
+    if not location_id:
+        raise ValueError("Set GHL_LOCATION_ID in .env")
+
+    fid = (field_id or "").strip()
+    if not fid:
+        raise ValueError("field_id is required")
+
+    combined: dict[str, dict[str, Any]] = {}
+    truncated = False
+    total_reported = 0
+    for chunk_index, (chunk_since, chunk_until) in enumerate(
+        _calendar_day_chunks(since, until)
+    ):
+        if chunk_index > 0:
+            time.sleep(0.15)
+        batch, part_truncated, part_total = _search_contacts_custom_field_date_window(
+            fid,
+            chunk_since,
+            chunk_until,
+            location_id=location_id,
+            page_limit=page_limit,
+            max_pages=max_pages,
+        )
+        truncated = truncated or part_truncated
+        total_reported += part_total
+        for contact in batch:
+            cid = str(contact.get("id") or "")
+            if cid:
+                combined[cid] = contact
+
+    return list(combined.values()), truncated, total_reported
 
 
 def fetch_signup_date_range_committed_yes_contacts(
@@ -2139,6 +2219,20 @@ class CalendarFunnelCounts:
     calendar_api_errors: int
 
 
+def _fetch_location_calendars(
+    location_id: str,
+) -> tuple[list[dict[str, Any]], int]:
+    """Return ``(calendars, api_errors)`` for a location."""
+    try:
+        data = _ghl_get_json("/calendars/", params={"locationId": location_id}, timeout=60)
+    except RuntimeError:
+        return [], 1
+    calendars = data.get("calendars")
+    if not isinstance(calendars, list):
+        calendars = []
+    return calendars, 0
+
+
 def count_calendar_funnel_events(
     since: str,
     until: str,
@@ -2173,14 +2267,7 @@ def count_calendar_funnel_events(
     end_ms = str(int(window_end.timestamp() * 1000))
 
     headers = _request_headers()
-    response = requests.get(
-        f"{BASE_URL}/calendars/",
-        params={"locationId": loc},
-        headers=headers,
-        timeout=60,
-    )
-    response.raise_for_status()
-    calendars = response.json().get("calendars") or []
+    calendars, api_errors = _fetch_location_calendars(loc)
 
     allowed_days = {
         (since_date + timedelta(days=offset)).isoformat()
@@ -2190,7 +2277,6 @@ def count_calendar_funnel_events(
     seen_ids: set[str] = set()
     bookings = 0
     meetings = 0
-    api_errors = 0
 
     for calendar in calendars:
         calendar_id = calendar.get("id")
@@ -2267,14 +2353,7 @@ def _calendar_bookings_in_date_added_range(
     end_ms = str(int(window_end.timestamp() * 1000))
 
     headers = _request_headers()
-    response = requests.get(
-        f"{BASE_URL}/calendars/",
-        params={"locationId": loc},
-        headers=headers,
-        timeout=60,
-    )
-    response.raise_for_status()
-    calendars = response.json().get("calendars") or []
+    calendars, api_errors = _fetch_location_calendars(loc)
 
     allowed_days = {
         (since_date + timedelta(days=offset)).isoformat()
@@ -2283,7 +2362,6 @@ def _calendar_bookings_in_date_added_range(
 
     seen_ids: set[str] = set()
     bookings: list[dict[str, Any]] = []
-    api_errors = 0
 
     for calendar in calendars:
         calendar_id = calendar.get("id")

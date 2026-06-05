@@ -61,10 +61,22 @@ def get_credentials(*, allow_interactive: bool = False) -> Credentials:
         return creds
 
     if not allow_interactive:
-        raise RuntimeError(
-            f"Gmail is not authorized. Run:\n  python auth_google_gmail.py\n"
-            f"Token path: {GMAIL_TOKEN_PATH}"
+        sheets_token = CONFIG_DIR / "token.json"
+        hint = (
+            f"Gmail token not found at:\n  {GMAIL_TOKEN_PATH}\n\n"
+            "Gmail uses a separate OAuth file from Google Sheets "
+            f"({sheets_token}).\n"
+            "Authorize Gmail once from the project root:\n"
+            "  python auth_google_gmail.py\n"
+            "Then verify:\n"
+            "  python verify_gmail_connection.py"
         )
+        if sheets_token.exists() and not GMAIL_TOKEN_PATH.exists():
+            hint += (
+                "\n\nNote: token.json (Sheets/Drive) is present but "
+                "gmail_token.json is not — run auth_google_gmail.py to create it."
+            )
+        raise RuntimeError(hint)
 
     if not CREDENTIALS_PATH.exists():
         raise FileNotFoundError(

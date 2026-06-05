@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from googleapiclient.discovery import build
 
@@ -136,6 +136,9 @@ def fetch_unread_mentions(
         if me_user_id is None:
             me_user_id = _me_user_id_from_read_state(service, space_id)
 
+        last_read = (
+            datetime.now(timezone.utc) - timedelta(days=7)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
         try:
             read_state = (
                 service.users()
@@ -143,7 +146,11 @@ def fetch_unread_mentions(
                 .getSpaceReadState(name=f"users/me/spaces/{space_id}/spaceReadState")
                 .execute()
             )
-            last_read = read_state.get("lastReadTime") or "1970-01-01T00:00:00Z"
+            last_read = read_state.get("lastReadTime") or last_read
+        except Exception:
+            pass
+
+        try:
             resp = (
                 service.spaces()
                 .messages()

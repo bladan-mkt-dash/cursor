@@ -47,7 +47,7 @@ from dotenv import load_dotenv
 # Streamlit keeps war_room_data in sys.modules; reload after code changes.
 import war_room_data as _war_room_data
 
-_WAR_ROOM_DATA_REVISION = "2026-06-04-command-strip-layout-v2"
+_WAR_ROOM_DATA_REVISION = "2026-06-05-chat-scope-fix-v1"
 if getattr(_war_room_data, "WAR_ROOM_DATA_REVISION", None) != _WAR_ROOM_DATA_REVISION:
     _war_room_data = importlib.reload(_war_room_data)
 
@@ -80,7 +80,7 @@ from ghl_client import HEAR_ABOUT_US_FIELD_NAME  # noqa: E402 — after war_room
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 # Bump when loader logic changes — invalidates @st.cache_data without a server restart.
-WAR_ROOM_LOADER_VERSION = "2026-06-04-command-strip-layout-v2"
+WAR_ROOM_LOADER_VERSION = "2026-06-05-chat-scope-fix-v1"
 
 SPARKLINE_HEIGHT_PX = 44
 
@@ -93,6 +93,15 @@ COLORS = {
     "panel_bg": "#FFFFFF",
     "page_bg": "#F4F8FB",
 }
+
+TRAFFIC_PIE_COLORS = (
+    "#5DA68A",
+    "#264540",
+    "#6B7C93",
+    "#4A90A4",
+    "#F58518",
+    "#E45756",
+)
 
 # ---------------------------------------------------------------------------
 # Styling
@@ -254,6 +263,62 @@ def _inject_styles() -> None:
             border: none;
             background: transparent;
         }}
+        /* Conversion drivers: metric + source bar chart in one bordered card */
+        div[class*="st-key-war-room-conversion-"][data-testid="stVerticalBlockBorderWrapper"] {{
+            border: 1px solid rgba(93, 166, 138, 0.12) !important;
+            border-radius: 10px !important;
+            background: {COLORS["panel_bg"]} !important;
+            box-shadow: 0 1px 2px rgba(38, 69, 64, 0.06) !important;
+            padding: 0.35rem 0.5rem 0.45rem 0.5rem !important;
+            min-width: 0;
+            overflow: visible !important;
+        }}
+        .war-room-conversion-headline {{
+            margin: 0 0 0.15rem 0;
+            font-size: 0.95rem;
+            line-height: 1.35;
+            color: {COLORS["accent_dark"]};
+        }}
+        .war-room-conversion-label {{
+            font-weight: 600;
+        }}
+        .war-room-conversion-value {{
+            font-weight: 700;
+            font-size: 1.05rem;
+            color: {COLORS["accent"]};
+        }}
+        .war-room-conversion-delta {{
+            display: inline-block;
+            margin: 0 0 0.25rem 0;
+            padding: 0.12rem 0.42rem;
+            border-radius: 0.35rem;
+            font-size: 0.68rem;
+            font-weight: 600;
+            line-height: 1.2;
+        }}
+        .war-room-conversion-delta--up {{
+            background: rgba(93, 166, 138, 0.2);
+            color: #2d6b52;
+        }}
+        .war-room-conversion-delta--down {{
+            background: rgba(228, 87, 86, 0.18);
+            color: {COLORS["danger"]};
+        }}
+        .war-room-conversion-delta--flat {{
+            background: rgba(107, 124, 147, 0.14);
+            color: {COLORS["muted"]};
+        }}
+        div[class*="st-key-war-room-conversion-"] div[data-testid="stPlotlyChart"] {{
+            margin: 0 !important;
+            padding: 0 !important;
+        }}
+        div[class*="st-key-war-room-conversion-"] div[data-testid="stPlotlyChart"] {{
+            min-height: 140px;
+        }}
+        div[class*="st-key-war-room-conversion-"] div[data-testid="stPlotlyChart"] iframe {{
+            max-height: none !important;
+            min-height: 140px !important;
+        }}
         {panel_rules}
         </style>
         """,
@@ -390,6 +455,12 @@ def _fmt_vs_prior_mtd(pct: float | None) -> str | None:
     return f"{pct:+.0f}% vs prior MTD"
 
 
+def _fmt_vs_prior_ytd(pct: float | None) -> str | None:
+    if pct is None:
+        return None
+    return f"{pct:+.0f}% vs prior YTD"
+
+
 def _sparkline_trend_color(trend: TrendSeries) -> str:
     """Green when the series rises over the window, red when it falls."""
     if len(trend.points) < 2:
@@ -465,11 +536,19 @@ def _sparkline_figure(trend: TrendSeries) -> go.Figure | None:
     return fig
 
 
-def _kpi_container_key(label: str) -> str:
+def _slugify_label(label: str) -> str:
     slug = "".join(ch if ch.isalnum() else "-" for ch in label.lower()).strip("-")
     while "--" in slug:
         slug = slug.replace("--", "-")
-    return f"war-room-kpi-{slug or 'metric'}"
+    return slug or "metric"
+
+
+def _kpi_container_key(label: str) -> str:
+    return f"war-room-kpi-{_slugify_label(label)}"
+
+
+def _conversion_kpi_container_key(label: str) -> str:
+    return f"war-room-conversion-{_slugify_label(label)}"
 
 
 def _render_sparkline(trend: TrendSeries) -> None:
@@ -542,16 +621,17 @@ def _horizontal_bar_figure(
             orientation="h",
             marker=dict(color=COLORS["accent"]),
             text=[f"{r.count:,}" for r in ordered],
-            textposition="outside",
-            cliponaxis=False,
+            textposition="inside",
+            insidetextanchor="end",
+            textfont=dict(color="#FFFFFF", size=11),
             hoverinfo="skip",
         )
     )
-    bar_height = 26
+    bar_height = 28
     fig.update_layout(
         title=dict(text=title, font=dict(size=13, color=COLORS["accent_dark"])),
-        height=max(140, min(380, bar_height * len(ordered) + 48)),
-        margin=dict(l=4, r=52, t=36, b=4),
+        height=max(160, min(380, bar_height * len(ordered) + 56)),
+        margin=dict(l=4, r=16, t=36, b=8),
         showlegend=False,
         xaxis=dict(title="", fixedrange=True, showgrid=True, gridcolor="rgba(107,124,147,0.15)"),
         yaxis=dict(title="", automargin=True, fixedrange=True),
@@ -562,19 +642,152 @@ def _horizontal_bar_figure(
     return fig
 
 
+def _conversion_delta_badge(delta_pct: float | None) -> str:
+    if delta_pct is None:
+        return ""
+    if delta_pct > 0:
+        tone = "up"
+        arrow = "↑ "
+    elif delta_pct < 0:
+        tone = "down"
+        arrow = "↓ "
+    else:
+        tone = "flat"
+        arrow = ""
+    text = f"{arrow}{delta_pct:+.0f}% vs prior 7d"
+    return (
+        f'<span class="war-room-conversion-delta war-room-conversion-delta--{tone}">'
+        f"{html.escape(text)}</span>"
+    )
+
+
+def _render_conversion_driver_headline(
+    label: str,
+    value: str,
+    *,
+    delta_pct: float | None,
+) -> None:
+    st.markdown(
+        (
+            f'<p class="war-room-conversion-headline">'
+            f'<span class="war-room-conversion-label">{html.escape(label)}:</span> '
+            f'<span class="war-room-conversion-value">{html.escape(value)}</span>'
+            f"</p>{_conversion_delta_badge(delta_pct)}"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
 def _render_hear_about_bar_chart(
     rows: list[HearAboutCountRow],
     *,
     title: str,
     total: int | None,
+    show_total: bool = True,
 ) -> None:
     fig = _horizontal_bar_figure(rows, title=title)
     if fig is None:
         st.caption("No records in this window.")
         return
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-    if total is not None:
+    chart_height = int(fig.layout.height or 160)
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        height=chart_height,
+        config={"displayModeBar": False},
+    )
+    if show_total and total is not None:
         st.caption(f"Total: {total:,}")
+
+
+def _traffic_contributors_pie_figure(rows: list[HearAboutCountRow]) -> go.Figure | None:
+    if not rows:
+        return None
+    labels = [f"{row.source} ({row.count:,})" for row in rows]
+    values = [row.count for row in rows]
+    fig = go.Figure(
+        go.Pie(
+            labels=labels,
+            values=values,
+            hole=0.4,
+            sort=False,
+            direction="clockwise",
+            domain=dict(x=[0.0, 0.56], y=[0.02, 0.98]),
+            textinfo="percent",
+            textposition="inside",
+            insidetextorientation="horizontal",
+            textfont=dict(size=12, color="#FFFFFF"),
+            marker=dict(
+                colors=TRAFFIC_PIE_COLORS[: len(rows)],
+                line=dict(color="#FFFFFF", width=1.5),
+            ),
+            hovertemplate=(
+                "<b>%{label}</b><br>%{value:,} sessions<br>%{percent}<extra></extra>"
+            ),
+        )
+    )
+    fig.update_layout(
+        height=300,
+        margin=dict(l=4, r=4, t=4, b=4),
+        showlegend=True,
+        legend=dict(
+            orientation="v",
+            yanchor="middle",
+            y=0.5,
+            xanchor="left",
+            x=0.6,
+            font=dict(size=11, color=COLORS["accent_dark"]),
+            itemclick=False,
+            itemdoubleclick=False,
+        ),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    return fig
+
+
+def _render_traffic_contributors_card(
+    rows: list[HearAboutCountRow],
+    *,
+    total_sessions: int | None,
+) -> None:
+    """Traffic contributors card — GA4 top channel groups as a pie chart."""
+    with st.container(border=True, key=_conversion_kpi_container_key("Traffic contributors (7d)")):
+        _render_conversion_driver_headline(
+            "Traffic contributors (7d)",
+            _fmt_count(total_sessions),
+            delta_pct=None,
+        )
+        fig = _traffic_contributors_pie_figure(rows)
+        if fig is None:
+            st.caption("No GA4 channel data in this window.")
+            return
+        st.plotly_chart(
+            fig,
+            use_container_width=True,
+            height=300,
+            config={"displayModeBar": False},
+        )
+
+
+def _render_conversion_driver_card(
+    label: str,
+    value: str,
+    *,
+    delta_pct: float | None,
+    rows: list[HearAboutCountRow],
+    chart_title: str,
+    total: int | None,
+) -> None:
+    """Single conversion-driver card: compact headline and source bar chart in one box."""
+    with st.container(border=True, key=_conversion_kpi_container_key(label)):
+        _render_conversion_driver_headline(label, value, delta_pct=delta_pct)
+        _render_hear_about_bar_chart(
+            rows,
+            title=chart_title,
+            total=total,
+            show_total=False,
+        )
 
 
 def _clear_caches() -> None:
@@ -626,15 +839,16 @@ def _render_command_strip(data: CommandStripMetrics) -> None:
     )
     with _panel(
         "Command strip",
-        f"Cross-channel snapshot · {period} + MTD · Google Ads + Meta + GHL + GA4",
+        f"Cross-channel snapshot · {period} + MTD + YTD · Google Ads + Meta + GHL + GA4",
         "war-room-command-strip",
     ):
         st.caption(
             "7-day KPIs compare vs the prior 7 days. Ad spend (MTD) compares vs the same "
-            "calendar days last month. Today is dimmed on paid/GA4 series (intraday may be incomplete)."
+            "calendar days last month; Ad spend (YTD) vs the same span last year. Today is "
+            "dimmed on paid/GA4 series (intraday may be incomplete)."
         )
 
-        row_spend, row_mtd = st.columns(2, gap="small")
+        row_spend, row_mtd, row_ytd = st.columns(3, gap="small")
         with row_spend:
             _render_trend_metric(
                 "Ad spend (7d)",
@@ -647,6 +861,13 @@ def _render_command_strip(data: CommandStripMetrics) -> None:
                 _fmt_currency(data.ad_spend_mtd),
                 data.ad_spend_mtd_trend,
                 delta=_fmt_vs_prior_mtd(data.ad_spend_mtd_vs_prior_pct),
+            )
+        with row_ytd:
+            _render_trend_metric(
+                "Ad spend (YTD)",
+                _fmt_currency(data.ad_spend_ytd),
+                data.ad_spend_ytd_trend,
+                delta=_fmt_vs_prior_ytd(data.ad_spend_ytd_vs_prior_pct),
             )
 
         row_sessions, row_contacts, row_leads = st.columns(3, gap="small")
@@ -688,38 +909,48 @@ def _render_conversion_drivers(
     )
     with _panel(
         "Discovery Call & Conversion Drivers",
-        f"GoHighLevel · {HEAR_ABOUT_US_FIELD_NAME} · {period}",
+        f"GA4 + GoHighLevel · {HEAR_ABOUT_US_FIELD_NAME} · {period}",
         "war-room-conversion-drivers",
     ):
         st.caption(
+            "Traffic = GA4 default channel group (top 5 + Other) · "
             "Bookings = calendar events by date added · "
             "Signups = Sign Up Date in range with Committed? = Yes · "
             "deltas vs prior 7d"
         )
-        col_bookings, col_committed = st.columns(2, gap="medium")
-        with col_bookings:
-            st.metric(
-                "Bookings (7d)",
-                _fmt_count(command.bookings_7d),
-                delta=_fmt_vs_prior_avg(command.bookings_7d_vs_prior_pct),
-                delta_color="normal",
+        col_traffic, col_bookings, col_committed = st.columns([4, 3, 3], gap="medium")
+        bookings_count = (
+            data.total_bookings
+            if data.total_bookings is not None
+            else command.bookings_7d
+        )
+        signups_count = (
+            data.total_committed
+            if data.total_committed is not None
+            else command.signups_7d
+        )
+        with col_traffic:
+            _render_traffic_contributors_card(
+                data.traffic_contributors,
+                total_sessions=data.total_sessions_7d,
             )
-            _render_hear_about_bar_chart(
-                data.bookings_by_source,
-                title="DC Bookings by Source",
-                total=data.total_bookings,
+        with col_bookings:
+            _render_conversion_driver_card(
+                "Bookings (7d)",
+                _fmt_count(bookings_count),
+                delta_pct=command.bookings_7d_vs_prior_pct,
+                rows=data.bookings_by_source,
+                chart_title="DC Bookings by Source",
+                total=bookings_count,
             )
         with col_committed:
-            st.metric(
+            _render_conversion_driver_card(
                 "Signups (7d)",
-                _fmt_count(command.signups_7d),
-                delta=_fmt_vs_prior_avg(command.signups_7d_vs_prior_pct),
-                delta_color="normal",
-            )
-            _render_hear_about_bar_chart(
-                data.committed_by_source,
-                title="Signups by Source",
-                total=data.total_committed,
+                _fmt_count(signups_count),
+                delta_pct=command.signups_7d_vs_prior_pct,
+                rows=data.committed_by_source,
+                chart_title="Signups by Source",
+                total=signups_count,
             )
         if data.notes:
             for note in data.notes:

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+# Bump when token-loading logic changes (war_room_data reloads this module).
+CHAT_AUTH_REVISION = "2026-06-05-scope-fix-v1"
+
 import json
 import os
 import sys
@@ -21,13 +24,19 @@ CREDENTIALS_PATH = CONFIG_DIR / "credentials.json"
 CHAT_TOKEN_PATH = CONFIG_DIR / "chat_token.json"
 WORKSPACE_MCP_CREDS_DIR = Path.home() / ".google_workspace_mcp" / "credentials"
 
-# Match workspace-mcp read-only Chat scopes (see Google Workspace MCP docs).
-CHAT_READONLY_SCOPES = [
+# Scopes requested when running auth_google_chat.py (must be on OAuth consent screen).
+CHAT_AUTH_SCOPES = [
     "https://www.googleapis.com/auth/chat.spaces.readonly",
-    "https://www.googleapis.com/auth/chat.memberships.readonly",
     "https://www.googleapis.com/auth/chat.messages.readonly",
     "https://www.googleapis.com/auth/chat.users.readstate.readonly",
 ]
+
+_CHAT_REQUIRED_SCOPES = frozenset(
+    {
+        "https://www.googleapis.com/auth/chat.spaces.readonly",
+        "https://www.googleapis.com/auth/chat.messages.readonly",
+    }
+)
 
 
 def _load_mcp_oauth_from_json() -> tuple[str, str] | None:
@@ -43,49 +52,74 @@ def _load_mcp_oauth_from_json() -> tuple[str, str] | None:
     return None
 
 
+def _token_has_chat_access(creds: Credentials) -> bool:
+    scopes = set(creds.scopes or [])
+    return _CHAT_REQUIRED_SCOPES.issubset(scopes)
+
+
+def _load_credentials_from_file(
+    path: Path,
+    *,
+    persist_refresh: bool = False,
+) -> Credentials | None:
+    """
+    Load OAuth credentials using the scopes stored in the token file.
+
+    Passing a different scope list to ``from_authorized_user_file`` causes
+    ``invalid_scope`` errors on refresh when the file was issued with fewer
+    scopes (e.g. workspace-mcp tokens).
+    """
+    try:
+        info = json.loads(path.read_text(encoding="utf-8"))
+        creds = Credentials.from_authorized_user_info(info)
+    except (ValueError, OSError, json.JSONDecodeError):
+        return None
+    if not _token_has_chat_access(creds):
+        return None
+    if creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            if persist_refresh:
+                path.write_text(creds.to_json(), encoding="utf-8")
+        except Exception:
+            return None
+    return creds if creds.valid else None
+
+
 def _workspace_mcp_token() -> Credentials | None:
     if not WORKSPACE_MCP_CREDS_DIR.is_dir():
         return None
     for path in sorted(WORKSPACE_MCP_CREDS_DIR.glob("*.json")):
-        try:
-            creds = Credentials.from_authorized_user_file(str(path), CHAT_READONLY_SCOPES)
-        except (ValueError, OSError):
+        if path.name == "oauth_states.json":
             continue
-        if creds and creds.valid:
-            return creds
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+        creds = _load_credentials_from_file(path)
+        if creds:
             return creds
     return None
 
 
 def _chat_token(allow_interactive: bool) -> Credentials:
-    creds: Credentials | None = None
     if CHAT_TOKEN_PATH.exists():
-        creds = Credentials.from_authorized_user_file(str(CHAT_TOKEN_PATH), CHAT_READONLY_SCOPES)
-
-    if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-
-    if creds and creds.valid:
-        return creds
+        creds = _load_credentials_from_file(CHAT_TOKEN_PATH, persist_refresh=True)
+        if creds:
+            return creds
 
     if not allow_interactive:
         raise RuntimeError(
             "No valid Chat token found.\n"
             f"  - workspace-mcp creds: {WORKSPACE_MCP_CREDS_DIR} (empty or missing Chat scopes)\n"
             f"  - script token: {CHAT_TOKEN_PATH}\n"
-            "Fix: In Cursor, restart the google-workspace MCP server and complete OAuth in the browser,\n"
-            "  or run:  python auth_google_chat.py"
+            "Fix: run  python auth_google_chat.py\n"
+            "  (or restart google-workspace MCP and complete OAuth in the browser)"
         )
 
     if not CREDENTIALS_PATH.exists():
         raise FileNotFoundError(f"Missing OAuth client: {CREDENTIALS_PATH}")
 
     flow = InstalledAppFlow.from_client_secrets_file(
-        str(CREDENTIALS_PATH), CHAT_READONLY_SCOPES
+        str(CREDENTIALS_PATH), CHAT_AUTH_SCOPES
     )
-    creds = flow.run_local_server(port=0)
+    creds = flow.run_local_server(port=0, open_browser=True)
     CHAT_TOKEN_PATH.write_text(creds.to_json(), encoding="utf-8")
     return creds
 
