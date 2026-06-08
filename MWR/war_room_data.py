@@ -4,7 +4,7 @@ from __future__ import annotations
 
 # Bump when exports or loaders change — marketing_war_room.py reloads this module
 # when the revision differs (Streamlit caches imports across reruns).
-WAR_ROOM_DATA_REVISION = "2026-06-08-conv-pct-meetings-v7"
+WAR_ROOM_DATA_REVISION = "2026-06-08-meetings-delta-spend-layout-v9"
 
 import calendar
 import importlib
@@ -22,9 +22,10 @@ if str(_PROJECT_ROOT) not in sys.path:
 # were added to ghl_client.py after the server started.
 import ghl_client as _ghl_client
 
-_GHL_CLIENT_REVISION = "2026-06-05-ghl-retry-v1"
+_GHL_CLIENT_REVISION = "2026-06-08-meetings-hear-about-v1"
 if (
     not hasattr(_ghl_client, "fetch_bookings_by_hear_about_us")
+    or not hasattr(_ghl_client, "fetch_meetings_by_hear_about_us")
     or getattr(_ghl_client, "GHL_CLIENT_REVISION", None) != _GHL_CLIENT_REVISION
 ):
     _ghl_client = importlib.reload(_ghl_client)
@@ -32,6 +33,7 @@ if (
 from ghl_client import (  # noqa: E402
     fetch_bookings_by_hear_about_us,
     fetch_committed_yes_by_hear_about_us,
+    fetch_meetings_by_hear_about_us,
 )
 
 
@@ -50,6 +52,7 @@ class TrendSeries:
     dim_today: bool = False
     vs_prior_avg_pct: float | None = None
     wired: bool = False
+    invert_spark_color: bool = False
 
 
 @dataclass
@@ -65,8 +68,10 @@ class ConversionDriversMetrics:
     traffic_contributors: list[HearAboutCountRow] = field(default_factory=list)
     total_sessions_7d: int | None = None
     bookings_by_source: list[HearAboutCountRow] = field(default_factory=list)
+    meetings_by_source: list[HearAboutCountRow] = field(default_factory=list)
     committed_by_source: list[HearAboutCountRow] = field(default_factory=list)
     total_bookings: int | None = None
+    total_meetings: int | None = None
     total_committed: int | None = None
     errors: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -86,6 +91,7 @@ class CommandStripMetrics:
     ad_spend_ytd: float | None = None
     signups_7d_vs_prior_pct: float | None = None
     bookings_7d_vs_prior_pct: float | None = None
+    meetings_7d_vs_prior_pct: float | None = None
     ad_spend_mtd_vs_prior_pct: float | None = None
     ad_spend_ytd_vs_prior_pct: float | None = None
     spend_trend: TrendSeries | None = None
@@ -905,23 +911,23 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
         except Exception as exc:
             metrics.errors.append(f"GHL signups: {exc}")
 
+    current_meetings: int | None = None
     try:
-        from ghl_client import count_calendar_bookings_by_date_added
+        from ghl_client import count_calendar_funnel_events
 
-        bookings, calendar_errors = count_calendar_bookings_by_date_added(
-            trend_since,
-            trend_until,
-        )
-        metrics.bookings_7d = bookings
-        if calendar_errors:
+        funnel = count_calendar_funnel_events(trend_since, trend_until)
+        metrics.bookings_7d = funnel.bookings
+        current_meetings = funnel.meetings
+        if funnel.calendar_api_errors:
             metrics.notes.append(
-                f"GHL bookings: {calendar_errors} calendar(s) failed to load."
+                f"GHL calendar: {funnel.calendar_api_errors} calendar(s) failed to load."
             )
     except Exception as exc:
-        metrics.errors.append(f"GHL bookings: {exc}")
+        metrics.errors.append(f"GHL bookings/meetings: {exc}")
 
     prior_signups: int | None = None
     prior_bookings: int | None = None
+    prior_meetings: int | None = None
     if sign_up_field_id:
         try:
             from ghl_client import search_contacts_custom_field_date_range
@@ -942,18 +948,17 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
             metrics.errors.append(f"GHL prior signups: {exc}")
 
     try:
-        from ghl_client import count_calendar_bookings_by_date_added
+        from ghl_client import count_calendar_funnel_events
 
-        prior_bookings, prior_calendar_errors = count_calendar_bookings_by_date_added(
-            prior_since,
-            prior_until,
-        )
-        if prior_calendar_errors:
+        prior_funnel = count_calendar_funnel_events(prior_since, prior_until)
+        prior_bookings = prior_funnel.bookings
+        prior_meetings = prior_funnel.meetings
+        if prior_funnel.calendar_api_errors:
             metrics.notes.append(
-                f"Prior-period GHL bookings: {prior_calendar_errors} calendar(s) failed."
+                f"Prior-period GHL calendar: {prior_funnel.calendar_api_errors} calendar(s) failed."
             )
     except Exception as exc:
-        metrics.errors.append(f"GHL prior bookings: {exc}")
+        metrics.errors.append(f"GHL prior bookings/meetings: {exc}")
 
     metrics.signups_7d_vs_prior_pct = _pct_vs_prior_period(
         float(metrics.signups_7d) if metrics.signups_7d is not None else None,
@@ -962,6 +967,10 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
     metrics.bookings_7d_vs_prior_pct = _pct_vs_prior_period(
         float(metrics.bookings_7d) if metrics.bookings_7d is not None else None,
         float(prior_bookings) if prior_bookings is not None else None,
+    )
+    metrics.meetings_7d_vs_prior_pct = _pct_vs_prior_period(
+        float(current_meetings) if current_meetings is not None else None,
+        float(prior_meetings) if prior_meetings is not None else None,
     )
 
     new_contacts_by_date: dict[str, float] = {day: 0.0 for day in compare_dates}
@@ -1042,6 +1051,7 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
         metrics.spend_trend.vs_prior_avg_pct = _pct_vs_prior_period(
             metrics.spend_7d, prior_spend_7d
         )
+        metrics.spend_trend.invert_spark_color = True
     if metrics.leads_trend:
         metrics.leads_trend.vs_prior_avg_pct = _pct_vs_prior_period(
             metrics.leads_7d, prior_leads_7d
@@ -1083,6 +1093,7 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
     )
     if metrics.ad_spend_mtd_trend:
         metrics.ad_spend_mtd_trend.vs_prior_avg_pct = metrics.ad_spend_mtd_vs_prior_pct
+        metrics.ad_spend_mtd_trend.invert_spark_color = True
 
     year_dates = _calendar_dates_inclusive(year_start, today)
     google_year_spend = _google_daily_dict(
@@ -1102,6 +1113,7 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
     )
     if metrics.ad_spend_ytd_trend:
         metrics.ad_spend_ytd_trend.vs_prior_avg_pct = metrics.ad_spend_ytd_vs_prior_pct
+        metrics.ad_spend_ytd_trend.invert_spark_color = True
 
     if not metrics.spend_trend.wired:
         metrics.spend_trend = _placeholder_trend("Ad spend", dim_today=True)
@@ -1149,7 +1161,8 @@ def _rows_from_ghl_payload(rows: list[dict]) -> list[HearAboutCountRow]:
 def load_conversion_drivers(*, as_of: date | None = None) -> ConversionDriversMetrics:
     """
     Discovery Call & Conversion Drivers — GA4 traffic contributors, GHL bookings,
-    and committed members grouped by **How did you hear about us?** (last 7 days).
+    meetings, and committed members grouped by **How did you hear about us?**
+    (last 7 days).
     """
     today = as_of or date.today()
     since, until = _last_n_days_range(as_of=today, days=7)
@@ -1196,6 +1209,25 @@ def load_conversion_drivers(*, as_of: date | None = None) -> ConversionDriversMe
             )
     except Exception as exc:
         metrics.errors.append(f"GHL bookings: {exc}")
+
+    try:
+        meetings = fetch_meetings_by_hear_about_us(since, until)
+        metrics.meetings_by_source = _rows_from_ghl_payload(meetings.get("rows") or [])
+        metrics.total_meetings = int(meetings.get("total_meetings") or 0)
+        if meetings.get("calendar_api_errors"):
+            metrics.notes.append(
+                f"Meetings: {meetings['calendar_api_errors']} calendar(s) failed to load."
+            )
+        if meetings.get("missing_contact_link"):
+            metrics.notes.append(
+                f"{meetings['missing_contact_link']} meeting(s) had no linked contact."
+            )
+        if meetings.get("contact_lookup_failures"):
+            metrics.notes.append(
+                f"{meetings['contact_lookup_failures']} contact(s) could not be loaded from GHL."
+            )
+    except Exception as exc:
+        metrics.errors.append(f"GHL meetings: {exc}")
 
     try:
         committed = fetch_committed_yes_by_hear_about_us(since, until)

@@ -47,7 +47,7 @@ from dotenv import load_dotenv
 # Streamlit keeps war_room_data in sys.modules; reload after code changes.
 import war_room_data as _war_room_data
 
-_WAR_ROOM_DATA_REVISION = "2026-06-08-conv-pct-meetings-v7"
+_WAR_ROOM_DATA_REVISION = "2026-06-08-meetings-delta-spend-layout-v9"
 if getattr(_war_room_data, "WAR_ROOM_DATA_REVISION", None) != _WAR_ROOM_DATA_REVISION:
     _war_room_data = importlib.reload(_war_room_data)
 
@@ -82,7 +82,7 @@ from ghl_client import HEAR_ABOUT_US_FIELD_NAME  # noqa: E402 — after war_room
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 # Bump when loader logic changes — invalidates @st.cache_data without a server restart.
-WAR_ROOM_LOADER_VERSION = "2026-06-08-conv-pct-meetings-v7"
+WAR_ROOM_LOADER_VERSION = "2026-06-08-meetings-delta-spend-layout-v9"
 
 SPARKLINE_HEIGHT_PX = 44
 
@@ -222,24 +222,24 @@ def _inject_styles() -> None:
             text-align: right;
         }}
         .war-room-panel-header {{
-            margin: 0.75rem 0 0.35rem 0;
+            margin: 0.75rem 0 0.2rem 0;
         }}
         .war-room-panel-title {{
             color: {COLORS["accent_dark"]};
             font-size: 1.15rem;
             font-weight: 700;
-            line-height: 1.3;
-            margin: 0 0 0.2rem 0;
+            line-height: 1.15;
+            margin: 0;
         }}
         .war-room-panel-caption {{
             color: {COLORS["muted"]};
             font-size: 0.82rem;
-            line-height: 1.35;
-            margin: 0;
+            line-height: 1.2;
+            margin: 0.1rem 0 0 0;
         }}
         .war-room-panel-caption--dates {{
-            margin-top: 0.12rem;
-            font-size: 0.78rem;
+            margin-top: 0.06rem;
+            font-size: 0.66rem;
         }}
         .war-room-placeholder {{
             color: {COLORS["muted"]};
@@ -714,9 +714,9 @@ def _sparkline_trend_color(trend: TrendSeries) -> str:
     start = y[0]
     end = y[-2] if trend.dim_today and len(y) >= 2 else y[-1]
     if end > start:
-        return COLORS["accent"]
+        return COLORS["danger"] if trend.invert_spark_color else COLORS["accent"]
     if end < start:
-        return COLORS["danger"]
+        return COLORS["accent"] if trend.invert_spark_color else COLORS["danger"]
     return COLORS["muted"]
 
 
@@ -1112,13 +1112,7 @@ def _render_command_strip(data: CommandStripMetrics) -> None:
             "dimmed on paid/GA4 series (intraday may be incomplete)."
         )
 
-        row_spend, row_mtd, row_ytd = st.columns(3, gap="small")
-        with row_spend:
-            _render_trend_metric(
-                "Ad spend (7d)",
-                _fmt_currency(data.spend_7d),
-                data.spend_trend,
-            )
+        row_mtd, row_ytd = st.columns(2, gap="small")
         with row_mtd:
             _render_trend_metric(
                 "Ad spend (MTD)",
@@ -1134,7 +1128,13 @@ def _render_command_strip(data: CommandStripMetrics) -> None:
                 delta=_fmt_vs_prior_ytd(data.ad_spend_ytd_vs_prior_pct),
             )
 
-        row_sessions, row_contacts, row_leads = st.columns(3, gap="small")
+        row_spend, row_sessions, row_contacts, row_leads = st.columns(4, gap="small")
+        with row_spend:
+            _render_trend_metric(
+                "Ad spend (7d)",
+                _fmt_currency(data.spend_7d),
+                data.spend_trend,
+            )
         with row_sessions:
             _render_trend_metric(
                 "GA4 sessions (7d)",
@@ -1178,26 +1178,29 @@ def _render_conversion_drivers(
         st.caption(
             "Traffic = GA4 default channel group (top 5 + Other) · "
             "Bookings = calendar events by date added · "
+            "Meetings = calendar events by start time · "
             "Signups = Sign Up Date in range with Committed? = Yes · "
-            "deltas vs prior 7d"
+            "deltas vs prior 7d (bookings, meetings & signups)"
         )
-        col_traffic, col_bookings, col_committed = st.columns([4, 3, 3], gap="medium")
+        row_top = st.columns(2, gap="medium")
+        row_bottom = st.columns(2, gap="medium")
         bookings_count = (
             data.total_bookings
             if data.total_bookings is not None
             else command.bookings_7d
         )
+        meetings_count = data.total_meetings
         signups_count = (
             data.total_committed
             if data.total_committed is not None
             else command.signups_7d
         )
-        with col_traffic:
+        with row_top[0]:
             _render_traffic_contributors_card(
                 data.traffic_contributors,
                 total_sessions=data.total_sessions_7d,
             )
-        with col_bookings:
+        with row_top[1]:
             _render_conversion_driver_card(
                 "Bookings (7d)",
                 _fmt_count(bookings_count),
@@ -1206,7 +1209,16 @@ def _render_conversion_drivers(
                 chart_title="DC Bookings by Source",
                 total=bookings_count,
             )
-        with col_committed:
+        with row_bottom[0]:
+            _render_conversion_driver_card(
+                "Meetings (7d)",
+                _fmt_count(meetings_count),
+                delta_pct=command.meetings_7d_vs_prior_pct,
+                rows=data.meetings_by_source,
+                chart_title="DC Meetings by Source",
+                total=meetings_count,
+            )
+        with row_bottom[1]:
             _render_conversion_driver_card(
                 "Signups (7d)",
                 _fmt_count(signups_count),

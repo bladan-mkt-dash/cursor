@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 # Bump when hear-about normalization or fetch helpers change (war_room_data reloads).
-GHL_CLIENT_REVISION = "2026-06-05-ghl-retry-v1"
+GHL_CLIENT_REVISION = "2026-06-08-meetings-hear-about-v1"
 
 import os
 import time
@@ -2317,22 +2317,18 @@ def count_calendar_funnel_events(
     )
 
 
-def _calendar_bookings_in_date_added_range(
+def _calendar_events_in_range(
     since: str,
     until: str,
     *,
+    day_from_event,
     location_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """
-    Non-deleted calendar events whose ``dateAdded`` falls on days in
-    ``[since, until]`` inclusive (YYYY-MM-DD).
+    Non-deleted calendar events whose ``day_from_event(event)`` falls in range.
 
     Scans events with ``startTime`` from seven days before ``since`` through
-    180 days after ``until`` so future-dated appointments booked in-range are
-    included.
-
-    Returns:
-        (booking_events, calendar_api_errors)
+    180 days after ``until``.
     """
     if location_id and location_id.strip():
         loc = location_id.strip()
@@ -2361,7 +2357,7 @@ def _calendar_bookings_in_date_added_range(
     }
 
     seen_ids: set[str] = set()
-    bookings: list[dict[str, Any]] = []
+    matched: list[dict[str, Any]] = []
 
     for calendar in calendars:
         calendar_id = calendar.get("id")
@@ -2388,11 +2384,41 @@ def _calendar_bookings_in_date_added_range(
             seen_ids.add(str(event_id))
             if event.get("deleted"):
                 continue
-            added_day = _event_date_added_ymd(event)
-            if added_day in allowed_days:
-                bookings.append(event)
+            event_day = day_from_event(event)
+            if event_day in allowed_days:
+                matched.append(event)
 
-    return bookings, api_errors
+    return matched, api_errors
+
+
+def _calendar_bookings_in_date_added_range(
+    since: str,
+    until: str,
+    *,
+    location_id: str | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Non-deleted calendar events whose ``dateAdded`` falls in range."""
+    return _calendar_events_in_range(
+        since,
+        until,
+        day_from_event=_event_date_added_ymd,
+        location_id=location_id,
+    )
+
+
+def _calendar_meetings_in_start_time_range(
+    since: str,
+    until: str,
+    *,
+    location_id: str | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Non-deleted calendar events whose ``startTime`` falls in range."""
+    return _calendar_events_in_range(
+        since,
+        until,
+        day_from_event=_event_start_time_ymd,
+        location_id=location_id,
+    )
 
 
 def count_calendar_bookings_by_date_added(
@@ -2507,6 +2533,58 @@ def fetch_bookings_by_hear_about_us(
         "field_name": field_name,
         "rows": _hear_about_rows_from_counter(by_source),
         "total_bookings": len(bookings),
+        "calendar_api_errors": api_errors,
+        "missing_contact_link": missing_contact_link,
+        "contact_lookup_failures": contact_lookup_failures,
+        "unique_contacts": len(contact_cache),
+    }
+
+
+def fetch_meetings_by_hear_about_us(
+    since: str,
+    until: str,
+    *,
+    location_id: str | None = None,
+    field_name: str = HEAR_ABOUT_US_FIELD_NAME,
+) -> dict[str, Any]:
+    """
+    Calendar meetings (``startTime`` in range) grouped by the linked contact's
+    **How did you hear about us?** custom field value.
+    """
+    hear_id = resolve_hear_about_us_custom_field_id(location_id, field_name=field_name)
+    meetings, api_errors = _calendar_meetings_in_start_time_range(
+        since, until, location_id=location_id
+    )
+
+    by_source: Counter[str] = Counter()
+    contact_cache: dict[str, dict[str, Any] | None] = {}
+    missing_contact_link = 0
+    contact_lookup_failures = 0
+
+    for event in meetings:
+        contact_id = event.get("contactId")
+        if not contact_id:
+            missing_contact_link += 1
+            by_source["(No contact linked)"] += 1
+            continue
+        cid = str(contact_id)
+        if cid not in contact_cache:
+            contact_cache[cid] = fetch_contact_by_id(cid, location_id=location_id)
+        contact = contact_cache[cid]
+        if not contact:
+            contact_lookup_failures += 1
+            by_source["(Contact not found)"] += 1
+            continue
+        label = _normalize_hear_about_label(contact_custom_field_value(contact, hear_id))
+        by_source[label] += 1
+
+    return {
+        "since": since,
+        "until": until,
+        "field_id": hear_id,
+        "field_name": field_name,
+        "rows": _hear_about_rows_from_counter(by_source),
+        "total_meetings": len(meetings),
         "calendar_api_errors": api_errors,
         "missing_contact_link": missing_contact_link,
         "contact_lookup_failures": contact_lookup_failures,
