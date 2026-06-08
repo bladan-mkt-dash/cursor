@@ -4,7 +4,7 @@ from __future__ import annotations
 
 # Bump when exports or loaders change — marketing_war_room.py reloads this module
 # when the revision differs (Streamlit caches imports across reruns).
-WAR_ROOM_DATA_REVISION = "2026-06-05-chat-scope-fix-v1"
+WAR_ROOM_DATA_REVISION = "2026-06-08-conv-pct-meetings-v7"
 
 import calendar
 import importlib
@@ -165,23 +165,67 @@ class ContentSeoMetrics:
 WAR_ROOM_MONDAY_BOARD_NAMES: tuple[str, ...] = (
     "Sam New To-Do List",
     "Je New To-Do List",
-    "Communication Plan",
+    "Voltaire To-Do List",
+    "Lead Paramedic",
+    "We Have SEO",
+)
+
+# Je's board is organized into month groups; her queue view uses the current month only.
+WAR_ROOM_MONDAY_CURRENT_MONTH_GROUP_BOARDS: frozenset[str] = frozenset(
+    {"Je New To-Do List"}
+)
+
+
+@dataclass
+class StatusCountRow:
+    status: str
+    count: int
+
+
+TEAM_OPS_STATUS_ORDER: tuple[str, ...] = (
+    "Requested",
+    "Working On It",
+    "In Review",
+    "For approval",
+    "Initiated",
+    "Ready for Publishing",
+    "Approved",
+    "Done/Published",
+    "Done",
+)
+
+TEAM_OPS_STATUS_DISPLAY: dict[str, str] = {
+    "working on it": "In Progress",
+}
+
+TEAM_OPS_CLOSED_STATUSES: frozenset[str] = frozenset(
+    {
+        "done",
+        "complete",
+        "completed",
+        "finished",
+        "closed",
+        "won't do",
+        "wont do",
+        "cancelled",
+        "canceled",
+        "done/published",
+    }
 )
 
 
 @dataclass
 class BoardTaskSummary:
     board_name: str
-    open_tasks: int = 0
-    due_this_week: int = 0
-    overdue: int = 0
+    requested: int = 0
+    scope_label: str = ""
+    by_status: list[StatusCountRow] = field(default_factory=list)
 
 
 @dataclass
 class TeamOpsMetrics:
-    open_tasks: int | None = None
-    due_this_week: int | None = None
-    overdue: int | None = None
+    period_since: str = ""
+    period_until: str = ""
     boards: list[BoardTaskSummary] = field(default_factory=list)
     missing_boards: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
@@ -459,7 +503,7 @@ def load_crm_funnel(*, as_of: date | None = None) -> CrmFunnelMetrics:
     - Signups: **Sign Up Date** custom field in range
     - Bookings: calendar appointments by **dateAdded**
     - Meetings: calendar appointments by **startTime**
-    - Conv. rate: signups ÷ bookings (%)
+    - Conv. rate: signups ÷ meetings (%)
     """
     today = as_of or date.today()
     since, until = _last_n_days_range(as_of=today, days=7)
@@ -499,7 +543,7 @@ def load_crm_funnel(*, as_of: date | None = None) -> CrmFunnelMetrics:
 
     metrics.conversion_rate = _conversion_rate_pct(
         float(metrics.signups_7d) if metrics.signups_7d is not None else None,
-        float(metrics.bookings_7d) if metrics.bookings_7d is not None else None,
+        float(metrics.meetings_7d) if metrics.meetings_7d is not None else None,
     )
     return metrics
 
@@ -629,36 +673,63 @@ def load_content_seo(*, as_of: date | None = None) -> ContentSeoMetrics:
     return metrics
 
 
-def _is_open_task_status(status: str) -> bool:
-    from monday_client import DONE_STATUS_LABELS
-
-    return (status or "").strip().casefold() not in DONE_STATUS_LABELS
+def _is_open_team_ops_status(status: str) -> bool:
+    return (status or "").strip().casefold() not in TEAM_OPS_CLOSED_STATUSES
 
 
-def _due_this_week(due_iso: str, *, today: date) -> bool:
-    if not due_iso:
-        return False
-    try:
-        due = date.fromisoformat(due_iso[:10])
-    except ValueError:
-        return False
-    week_start = today - timedelta(days=today.weekday())
-    week_end = week_start + timedelta(days=6)
-    return week_start <= due <= week_end
+def _open_team_ops_tasks(df):
+    if df.empty or "status" not in df.columns:
+        return df
+    return df[df["status"].map(_is_open_team_ops_status)]
 
 
-def _summarize_board_tasks(df, *, today: date) -> tuple[int, int, int]:
+def _current_month_group_title(*, as_of: date) -> str:
+    return f"{as_of.strftime('%B')} {as_of.year}"
+
+
+def _filter_board_scope(df, board_name: str, *, as_of: date) -> tuple[object, str]:
+    """Return board rows, optionally scoped to the current month group."""
     if df.empty:
-        return 0, 0, 0
-    open_df = df[df["status"].map(_is_open_task_status)]
-    open_count = len(open_df)
-    due_week = int(open_df["due_date"].map(lambda d: _due_this_week(d, today=today)).sum())
-    overdue = int(open_df["overdue"].sum()) if "overdue" in open_df.columns else 0
-    return open_count, due_week, overdue
+        return df, ""
+    if board_name not in WAR_ROOM_MONDAY_CURRENT_MONTH_GROUP_BOARDS:
+        return df, ""
+    if "group_title" not in df.columns:
+        return df, ""
+
+    group_title = _current_month_group_title(as_of=as_of)
+    scoped = df[df["group_title"] == group_title]
+    return scoped, group_title
+
+
+def format_team_status_label(status: str) -> str:
+    label = (status or "").strip() or "No status"
+    return TEAM_OPS_STATUS_DISPLAY.get(label.casefold(), label)
+
+
+def status_count_for(rows: list[StatusCountRow], status: str) -> int:
+    target = (status or "").strip().casefold()
+    for row in rows:
+        if row.status.strip().casefold() == target:
+            return row.count
+    return 0
+
+
+def _status_sort_key(status: str) -> tuple[int, str]:
+    label = (status or "").strip()
+    order = {name.casefold(): idx for idx, name in enumerate(TEAM_OPS_STATUS_ORDER)}
+    return (order.get(label.casefold(), 100), label.casefold())
+
+
+def _count_tasks_by_status(df) -> list[StatusCountRow]:
+    if df.empty or "status" not in df.columns:
+        return []
+    counts = df["status"].value_counts()
+    rows = [StatusCountRow(status=str(label), count=int(count)) for label, count in counts.items()]
+    return sorted(rows, key=lambda row: _status_sort_key(row.status))
 
 
 def load_team_ops(*, as_of: date | None = None) -> TeamOpsMetrics:
-    """Team & projects panel — scoped Monday.com boards for Sam, Je, and Communication Plan."""
+    """Team & projects — open Monday.com tasks by current workflow Status per board."""
     today = as_of or date.today()
     metrics = TeamOpsMetrics()
 
@@ -681,35 +752,29 @@ def load_team_ops(*, as_of: date | None = None) -> TeamOpsMetrics:
         if any(truncated.values()):
             metrics.notes.append("Some boards hit pagination cap; counts may be incomplete.")
 
-        total_open = 0
-        total_due = 0
-        total_overdue = 0
-        summaries: list[BoardTaskSummary] = []
+        open_df = _open_team_ops_tasks(df)
 
+        summaries: list[BoardTaskSummary] = []
         for board_name in WAR_ROOM_MONDAY_BOARD_NAMES:
             board_id = board_map.get(board_name)
             if not board_id:
                 continue
-            board_df = df[df["board_id"] == board_id] if not df.empty else df
-            open_count, due_week, overdue = _summarize_board_tasks(board_df, today=today)
+            board_df = open_df[open_df["board_id"] == board_id] if not open_df.empty else open_df
+            board_df, scope_label = _filter_board_scope(board_df, board_name, as_of=today)
+            by_status = _count_tasks_by_status(board_df)
             summaries.append(
                 BoardTaskSummary(
                     board_name=board_name,
-                    open_tasks=open_count,
-                    due_this_week=due_week,
-                    overdue=overdue,
+                    requested=status_count_for(by_status, "Requested"),
+                    scope_label=scope_label,
+                    by_status=by_status,
                 )
             )
-            total_open += open_count
-            total_due += due_week
-            total_overdue += overdue
 
         metrics.boards = summaries
-        metrics.open_tasks = total_open
-        metrics.due_this_week = total_due
-        metrics.overdue = total_overdue
         metrics.notes.append(
-            "Open = not done · Due this week = Mon–Sun calendar week · Overdue = past due, not done."
+            "Open tasks by current workflow Status (excludes Done/Published) · "
+            "Je scoped to current month group · Status column, not Priority."
         )
     except Exception as exc:
         metrics.errors.append(f"Monday.com: {exc}")
@@ -1058,10 +1123,16 @@ def _format_hear_about_source_label(source: str) -> str:
     text = (source or "").strip()
     if not text:
         return "(Not set)"
-    if "word of mouth" in text.casefold():
+    fold = text.casefold()
+    if "word of mouth" in fold:
         return "WOM"
-    if text.casefold().startswith("3rd party"):
+    if fold.startswith("3rd party"):
         return "3rd party"
+    compact = fold.replace(" ", "")
+    if "chatgpt" in compact and "ai" in fold:
+        return "LLMs"
+    if "tiktok" in fold and ("linkedin" in fold or "linedin" in fold or "other social" in fold):
+        return "Other Social"
     return text
 
 

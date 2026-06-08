@@ -212,13 +212,37 @@ def _pick_column_id_by_title(columns: list[dict[str, Any]], *needles: str) -> st
     return None
 
 
+def _pick_workflow_status_column_id(columns: list[dict[str, Any]]) -> str | None:
+    """
+    Prefer the workflow ``Status`` column over other status-type columns.
+
+    Sam/Je boards also use status-type columns for Priority and Category; those
+    must not be treated as workflow status.
+    """
+    for col in columns:
+        title = (col.get("title") or "").strip().casefold()
+        col_type = (col.get("type") or "").casefold()
+        if title == "status" and col_type == "status":
+            cid = col.get("id")
+            if cid:
+                return str(cid)
+    for col in columns:
+        title = (col.get("title") or "").strip().casefold()
+        col_type = (col.get("type") or "").casefold()
+        if col_type == "status" and title not in {"priority", "category", "label"}:
+            cid = col.get("id")
+            if cid:
+                return str(cid)
+    return _pick_column_id(columns, "status")
+
+
 def build_column_map(columns: list[dict[str, Any]]) -> dict[str, str | None]:
     """
     Map logical roles (status, assignee, due_date) to column ids on a board.
 
-    Uses column type first, then common title patterns for due dates.
+    Workflow status prefers a ``Status`` title; due dates use title patterns.
     """
-    status_id = _pick_column_id(columns, "status")
+    status_id = _pick_workflow_status_column_id(columns)
     assignee_id = _pick_column_id(columns, "people") or _pick_column_id(columns, "person")
     due_id = (
         _pick_column_id_by_title(columns, "due date", "deadline", "due")
@@ -330,11 +354,15 @@ def item_to_row(
         and not _is_done_status(status)
     )
 
+    group = item.get("group") if isinstance(item.get("group"), dict) else {}
+    group_title = (group.get("title") or "").strip()
+
     return {
         "item_id": str(item.get("id") or ""),
         "name": (item.get("name") or "").strip(),
         "board_id": str(board_id),
         "board_name": board_name,
+        "group_title": group_title,
         "assignee": assignee or "Unassigned",
         "status": status or "No status",
         "due_date": due_dt.isoformat() if due_dt else "",
@@ -369,6 +397,7 @@ def fetch_board_items_page(
               name
               state
               updated_at
+              group { title }
               column_values {
                 id
                 type
@@ -399,6 +428,7 @@ def fetch_board_items_page(
             name
             state
             updated_at
+            group { title }
             column_values {
               id
               type
@@ -519,6 +549,7 @@ def fetch_items_from_boards(
                 "name",
                 "board_id",
                 "board_name",
+                "group_title",
                 "assignee",
                 "status",
                 "due_date",
