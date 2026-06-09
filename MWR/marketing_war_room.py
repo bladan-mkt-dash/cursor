@@ -29,12 +29,12 @@ Needs response scope (marketing-only, not a full inbox):
 from __future__ import annotations
 
 import html
-import importlib
+import pickle
 import sys
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator, TypeVar
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
@@ -44,13 +44,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
 
-# Streamlit keeps war_room_data in sys.modules; reload after code changes.
-import war_room_data as _war_room_data
-
-_WAR_ROOM_DATA_REVISION = "2026-06-08-meetings-delta-spend-layout-v9"
-if getattr(_war_room_data, "WAR_ROOM_DATA_REVISION", None) != _WAR_ROOM_DATA_REVISION:
-    _war_room_data = importlib.reload(_war_room_data)
-
+# Bump WAR_ROOM_LOADER_VERSION when war_room_data loaders change (cache bust).
 from war_room_data import (
     AlertsMetrics,
     CommandStripMetrics,
@@ -82,7 +76,7 @@ from ghl_client import HEAR_ABOUT_US_FIELD_NAME  # noqa: E402 — after war_room
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 # Bump when loader logic changes — invalidates @st.cache_data without a server restart.
-WAR_ROOM_LOADER_VERSION = "2026-06-08-meetings-delta-spend-layout-v9"
+WAR_ROOM_LOADER_VERSION = "2026-06-09-team-ops-status-labels-v15"
 
 SPARKLINE_HEIGHT_PX = 44
 
@@ -222,24 +216,63 @@ def _inject_styles() -> None:
             text-align: right;
         }}
         .war-room-panel-header {{
-            margin: 0.75rem 0 0.2rem 0;
+            margin: 0.75rem 0 0.12rem 0;
+            padding: 0;
+        }}
+        .war-room-panel-heading {{
+            display: flex;
+            flex-direction: column;
+            gap: 0;
+            margin: 0;
+            padding: 0;
         }}
         .war-room-panel-title {{
             color: {COLORS["accent_dark"]};
             font-size: 1.15rem;
             font-weight: 700;
-            line-height: 1.15;
+            line-height: 1.05;
             margin: 0;
+            padding: 0;
         }}
         .war-room-panel-caption {{
             color: {COLORS["muted"]};
-            font-size: 0.82rem;
-            line-height: 1.2;
-            margin: 0.1rem 0 0 0;
+            font-size: calc(0.82rem + 2pt);
+            line-height: 1.1;
+            margin: 0;
+            padding: 0;
+        }}
+        .war-room-panel-caption--source {{
+            margin-top: 0.12rem;
         }}
         .war-room-panel-caption--dates {{
-            margin-top: 0.06rem;
-            font-size: 0.66rem;
+            margin-top: 0.14rem;
+            font-size: calc(0.62rem + 2pt);
+            line-height: 1.15;
+            letter-spacing: 0.01em;
+        }}
+        /* Streamlit injects large margins on markdown headings/paragraphs — collapse them */
+        [data-testid="stMarkdownContainer"]:has(.war-room-panel-header),
+        [data-testid="stMarkdown"]:has(.war-room-panel-header),
+        [data-testid="stElementContainer"]:has(.war-room-panel-header) {{
+            margin: 0 !important;
+            padding: 0 !important;
+        }}
+        [data-testid="stMarkdownContainer"]:has(.war-room-panel-header) [data-testid="stMarkdownContainer"],
+        [data-testid="stMarkdownContainer"]:has(.war-room-panel-header) p,
+        [data-testid="stMarkdownContainer"]:has(.war-room-panel-header) h1,
+        [data-testid="stMarkdownContainer"]:has(.war-room-panel-header) h2,
+        [data-testid="stMarkdownContainer"]:has(.war-room-panel-header) h3,
+        [data-testid="stMarkdownContainer"]:has(.war-room-panel-header) h4,
+        .war-room-panel-header .war-room-panel-title,
+        .war-room-panel-header .war-room-panel-caption {{
+            margin: 0 !important;
+            padding: 0 !important;
+        }}
+        .war-room-panel-header .war-room-panel-caption--source {{
+            margin-top: 0.12rem !important;
+        }}
+        .war-room-panel-header .war-room-panel-caption--dates {{
+            margin-top: 0.14rem !important;
         }}
         .war-room-placeholder {{
             color: {COLORS["muted"]};
@@ -570,19 +603,32 @@ def _panel_period_caption(source: str, period_since: str, period_until: str) -> 
 
 def _panel_header(title: str, caption: str) -> None:
     lines = [line.strip() for line in caption.split("\n") if line.strip()]
-    caption_html = []
-    for index, line in enumerate(lines):
-        extra_class = " war-room-panel-caption--dates" if index == 1 else ""
-        caption_html.append(
-            f'<p class="war-room-panel-caption{extra_class}">{html.escape(line)}</p>'
+    has_date_line = len(lines) >= 2
+    if has_date_line:
+        source_line = lines[0]
+        date_line = lines[1]
+        body_html = (
+            f'<div class="war-room-panel-heading">'
+            f'<div class="war-room-panel-title">{html.escape(title)}</div>'
+            f'<div class="war-room-panel-caption war-room-panel-caption--source">'
+            f"{html.escape(source_line)}</div>"
+            f"</div>"
+            f'<div class="war-room-panel-caption war-room-panel-caption--dates">'
+            f"{html.escape(date_line)}</div>"
+        )
+    else:
+        caption_html = "".join(
+            f'<div class="war-room-panel-caption">{html.escape(line)}</div>'
+            for line in lines
+        )
+        body_html = (
+            f'<div class="war-room-panel-heading">'
+            f'<div class="war-room-panel-title">{html.escape(title)}</div>'
+            f"{caption_html}"
+            f"</div>"
         )
     st.markdown(
-        f"""
-        <div class="war-room-panel-header">
-            <h3 class="war-room-panel-title">{html.escape(title)}</h3>
-            {"".join(caption_html)}
-        </div>
-        """,
+        f'<div class="war-room-panel-header">{body_html}</div>',
         unsafe_allow_html=True,
     )
 
@@ -604,55 +650,55 @@ def _load_conversion_drivers(
     _loader_version: str = WAR_ROOM_LOADER_VERSION,
 ) -> ConversionDriversMetrics:
     """Discovery Call & Conversion Drivers — GHL hear-about breakdowns (7 days)."""
-    return load_conversion_drivers()
+    return _cache_safe_metrics(load_conversion_drivers())
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _load_command_strip(_loader_version: str = WAR_ROOM_LOADER_VERSION) -> CommandStripMetrics:
     """Stage 2: aggregate top-line KPIs from all connected sources."""
-    return load_command_strip()
+    return _cache_safe_metrics(load_command_strip())
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _load_paid_media() -> PaidMediaMetrics:
     """Stage 3: Google Ads + Meta account roll-up, last 7 days."""
-    return load_paid_media()
+    return _cache_safe_metrics(load_paid_media())
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _load_crm_funnel() -> CrmFunnelMetrics:
     """Stage 4: GHL signups, bookings, meetings, last 7 days."""
-    return load_crm_funnel()
+    return _cache_safe_metrics(load_crm_funnel())
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _load_website_traffic() -> WebsiteTrafficMetrics:
     """Stage 5: GA4 sessions, users, top channel, embed page views (7 days)."""
-    return load_website_traffic()
+    return _cache_safe_metrics(load_website_traffic())
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _load_organic_social() -> OrganicSocialMetrics:
     """Stage 6: Instagram organic reach, engagement, followers (7 days)."""
-    return load_organic_social()
+    return _cache_safe_metrics(load_organic_social())
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _load_content_seo() -> ContentSeoMetrics:
     """Stage 7: GA4 organic search, blog pageviews, top landing page (7 days)."""
-    return load_content_seo()
+    return _cache_safe_metrics(load_content_seo())
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _load_team_ops() -> TeamOpsMetrics:
     """Stage 8: Monday.com — Sam, Je, Voltaire, Lead Paramedic, We Have SEO."""
-    return load_team_ops()
+    return _cache_safe_metrics(load_team_ops())
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _load_needs_response(_loader_version: str = WAR_ROOM_LOADER_VERSION) -> NeedsResponseMetrics:
     """Marketing-only inbound — Gmail label queue + Google Chat @mentions."""
-    return load_needs_response()
+    return _cache_safe_metrics(load_needs_response())
 
 
 def _fmt(value: str | None, *, prefix: str = "", suffix: str = "") -> str:
@@ -705,19 +751,59 @@ def _fmt_vs_prior_ytd(pct: float | None) -> str | None:
     return f"{pct:+.0f}% vs prior YTD"
 
 
-def _sparkline_trend_color(trend: TrendSeries) -> str:
-    """Green when the series rises over the window, red when it falls."""
+def _is_spend_sparkline(label: str, trend: TrendSeries | None) -> bool:
+    if "ad spend" in label.casefold():
+        return True
+    if trend is not None and trend.invert_spark_color:
+        return True
+    if trend is not None and "ad spend" in (trend.label or "").casefold():
+        return True
+    return False
+
+
+def _sparkline_visible_values(trend: TrendSeries) -> list[float]:
+    values = [point.value for point in trend.points[-7:]]
+    if trend.dim_today and len(values) >= 2:
+        return values[:-1]
+    return values
+
+
+def _sparkline_direction(trend: TrendSeries) -> int:
+    """Visual slope of the solid sparkline: last visible point vs first."""
+    values = _sparkline_visible_values(trend)
+    if len(values) < 2:
+        return 0
+    if values[-1] > values[0]:
+        return 1
+    if values[-1] < values[0]:
+        return -1
+    return 0
+
+
+def _sparkline_trend_color(
+    trend: TrendSeries,
+    *,
+    invert: bool,
+    delta_pct: float | None = None,
+) -> str:
+    """Spend: higher vs prior = red, lower = green. Others: the opposite."""
     if len(trend.points) < 2:
         return COLORS["muted"]
-    points = trend.points[-7:]
-    y = [p.value for p in points]
-    start = y[0]
-    end = y[-2] if trend.dim_today and len(y) >= 2 else y[-1]
-    if end > start:
-        return COLORS["danger"] if trend.invert_spark_color else COLORS["accent"]
-    if end < start:
-        return COLORS["accent"] if trend.invert_spark_color else COLORS["danger"]
-    return COLORS["muted"]
+
+    pct = delta_pct if delta_pct is not None else trend.vs_prior_avg_pct
+    if pct is not None:
+        if pct > 0:
+            return COLORS["danger"] if invert else COLORS["accent"]
+        if pct < 0:
+            return COLORS["accent"] if invert else COLORS["danger"]
+        return COLORS["muted"]
+
+    direction = _sparkline_direction(trend)
+    if direction == 0:
+        return COLORS["muted"]
+    if invert:
+        return COLORS["accent"] if direction < 0 else COLORS["danger"]
+    return COLORS["accent"] if direction > 0 else COLORS["danger"]
 
 
 def _hex_to_rgba(hex_color: str, alpha: float) -> str:
@@ -726,14 +812,19 @@ def _hex_to_rgba(hex_color: str, alpha: float) -> str:
     return f"rgba({r},{g},{b},{alpha})"
 
 
-def _sparkline_figure(trend: TrendSeries) -> go.Figure | None:
+def _sparkline_figure(
+    trend: TrendSeries,
+    *,
+    invert: bool,
+    delta_pct: float | None = None,
+) -> go.Figure | None:
     if not trend.wired or len(trend.points) < 2:
         return None
 
     points = trend.points[-7:]
     x = [p.date for p in points]
     y = [p.value for p in points]
-    line_color = _sparkline_trend_color(trend)
+    line_color = _sparkline_trend_color(trend, invert=invert, delta_pct=delta_pct)
     fig = go.Figure()
 
     if trend.dim_today and len(points) >= 2:
@@ -795,8 +886,14 @@ def _conversion_kpi_container_key(label: str) -> str:
     return f"war-room-conversion-{_slugify_label(label)}"
 
 
-def _render_sparkline(trend: TrendSeries) -> None:
-    fig = _sparkline_figure(trend)
+def _render_sparkline(
+    trend: TrendSeries,
+    *,
+    invert: bool,
+    metric_label: str,
+    delta_pct: float | None = None,
+) -> None:
+    fig = _sparkline_figure(trend, invert=invert, delta_pct=delta_pct)
     if fig is None:
         st.markdown(
             '<div class="war-room-sparkline-placeholder">7d trend · wiring pending</div>',
@@ -808,6 +905,7 @@ def _render_sparkline(trend: TrendSeries) -> None:
         use_container_width=True,
         height=SPARKLINE_HEIGHT_PX,
         config={"displayModeBar": False},
+        key=f"{_kpi_container_key(metric_label)}-spark",
     )
 
 
@@ -817,8 +915,12 @@ def _render_trend_metric(
     trend: TrendSeries | None,
     *,
     delta: str | None = None,
+    delta_pct: float | None = None,
+    invert_sparkline: bool | None = None,
 ) -> None:
     """Single KPI card: headline metric and sparkline share one bordered box."""
+    if invert_sparkline is None:
+        invert_sparkline = _is_spend_sparkline(label, trend)
     with st.container(border=True, key=_kpi_container_key(label)):
         col_metric, col_spark = st.columns(
             [1.2, 0.9],
@@ -826,12 +928,21 @@ def _render_trend_metric(
             vertical_alignment="center",
         )
         with col_metric:
-            if delta is None and trend:
+            if trend and delta_pct is None:
+                delta_pct = trend.vs_prior_avg_pct
+            if delta is None and delta_pct is not None:
+                delta = _fmt_vs_prior_avg(delta_pct)
+            elif delta is None and trend:
                 delta = _fmt_vs_prior_avg(trend.vs_prior_avg_pct)
             st.metric(label, value, delta=delta, delta_color="normal")
         with col_spark:
             if trend:
-                _render_sparkline(trend)
+                _render_sparkline(
+                    trend,
+                    invert=invert_sparkline,
+                    metric_label=label,
+                    delta_pct=delta_pct,
+                )
             else:
                 st.markdown(
                     '<div class="war-room-sparkline-placeholder">7d trend · wiring pending</div>',
@@ -870,7 +981,14 @@ def _horizontal_bar_figure(
             y=[_format_hear_about_source_label(r.source) for r in ordered],
             orientation="h",
             marker=dict(color=COLORS["accent"]),
-            hoverinfo="skip",
+            hovertemplate=(
+                "<b>%{y}</b><br>Count: %{x:,}<extra></extra>"
+            ),
+            hoverlabel=dict(
+                bgcolor="#FFFFFF",
+                bordercolor=COLORS["accent"],
+                font=dict(size=12, color=COLORS["accent_dark"]),
+            ),
         )
     )
     bar_height = 28
@@ -1067,10 +1185,114 @@ def _clear_caches() -> None:
     _load_alerts.clear()
 
 
+MetricsT = TypeVar("MetricsT")
+
+
+def _cache_safe_metrics(metrics: MetricsT) -> MetricsT:
+    """Deep-copy via pickle so Streamlit cache and session snapshots can serialize."""
+    return pickle.loads(pickle.dumps(metrics))
+
+
+def _store_data_snapshot(snapshots: dict[str, object], key: str, data: object) -> None:
+    snapshots[key] = pickle.dumps(data)
+
+
+def _load_data_snapshot(snapshots: dict[str, object], key: str) -> object | None:
+    raw = snapshots.get(key)
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        return pickle.loads(raw)
+    return raw
+
+
+_DATA_SOURCE_SPECS: tuple[tuple[str, str, str], ...] = (
+    ("command_strip", "Command strip", "Google Ads, Meta, GHL, GA4"),
+    ("conversion_drivers", "Conversion drivers", "GA4, GHL (hear-about lookups)"),
+    ("paid_media", "Paid media", "Google Ads, Meta"),
+    ("crm_funnel", "CRM & funnel", "GoHighLevel"),
+    ("website_traffic", "Website & traffic", "GA4"),
+    ("organic_social", "Organic social", "Meta / Instagram"),
+    ("content_seo", "Content & SEO", "GA4"),
+    ("alerts", "Alerts", "Google Tasks"),
+    ("team_ops", "Team & projects", "Monday.com"),
+)
+
+_DATA_SOURCE_KEYS: tuple[str, ...] = tuple(key for key, _, _ in _DATA_SOURCE_SPECS)
+
+
+def _init_data_source_prefs() -> None:
+    if "war_room_data_enabled" not in st.session_state:
+        st.session_state.war_room_data_enabled = {key: True for key in _DATA_SOURCE_KEYS}
+    if "war_room_data_snapshots" not in st.session_state:
+        st.session_state.war_room_data_snapshots = {}
+
+
+def _data_source_enabled(key: str) -> bool:
+    return bool(st.session_state.war_room_data_enabled.get(key, True))
+
+
+def _set_all_data_sources(enabled: bool) -> None:
+    for key in _DATA_SOURCE_KEYS:
+        st.session_state.war_room_data_enabled[key] = enabled
+        st.session_state.pop(f"war_room_src_{key}", None)
+
+
+def _render_data_source_controls() -> None:
+    _init_data_source_prefs()
+    enabled_map: dict[str, bool] = st.session_state.war_room_data_enabled
+    skipped_count = sum(1 for key in _DATA_SOURCE_KEYS if not enabled_map.get(key, True))
+
+    with st.expander("Load data sources", expanded=skipped_count > 0):
+        st.caption(
+            "Uncheck sources to skip API calls on refresh. Skipped panels keep "
+            "the last loaded snapshot so layout work stays fast."
+        )
+        preset_col_a, preset_col_b = st.columns(2)
+        with preset_col_a:
+            if st.button("Layout dev (skip all)", use_container_width=True):
+                _set_all_data_sources(False)
+                st.rerun()
+        with preset_col_b:
+            if st.button("Enable all", use_container_width=True):
+                _set_all_data_sources(True)
+                st.rerun()
+
+        for key, label, apis in _DATA_SOURCE_SPECS:
+            enabled_map[key] = st.checkbox(
+                label,
+                value=enabled_map.get(key, True),
+                help=f"APIs: {apis}",
+                key=f"war_room_src_{key}",
+            )
+        st.session_state.war_room_data_enabled = enabled_map
+
+
+def _resolve_data_source(
+    key: str,
+    loader: Callable[[], MetricsT],
+    empty_factory: Callable[[], MetricsT],
+) -> MetricsT:
+    """Load live data, or reuse a snapshot when the source is skipped."""
+    _init_data_source_prefs()
+    snapshots: dict[str, object] = st.session_state.war_room_data_snapshots
+
+    if _data_source_enabled(key):
+        data = loader()
+        _store_data_snapshot(snapshots, key, data)
+        return data
+
+    snapshot = _load_data_snapshot(snapshots, key)
+    if snapshot is not None:
+        return snapshot  # type: ignore[return-value]
+
+    return empty_factory()
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _load_alerts(_loader_version: str = WAR_ROOM_LOADER_VERSION) -> AlertsMetrics:
     """Google Tasks — overdue, due today, and due soon."""
-    return load_alerts()
+    return _cache_safe_metrics(load_alerts())
 
 
 # ---------------------------------------------------------------------------
@@ -1096,14 +1318,14 @@ def _render_header(last_refresh: datetime) -> None:
 
 
 def _render_command_strip(data: CommandStripMetrics) -> None:
-    period = (
-        f"{data.period_since} – {data.period_until}"
-        if data.period_since and data.period_until
-        else "last 7 days"
-    )
+    source = "Cross-channel snapshot + MTD + YTD · Google Ads + Meta + GHL + GA4"
+    if data.period_since and data.period_until:
+        caption = f"{source}\n{data.period_since} – {data.period_until}"
+    else:
+        caption = f"{source} (last 7 days)"
     with _panel(
         "Command strip",
-        f"Cross-channel snapshot · {period} + MTD + YTD · Google Ads + Meta + GHL + GA4",
+        caption,
         "war-room-command-strip",
     ):
         st.caption(
@@ -1119,6 +1341,8 @@ def _render_command_strip(data: CommandStripMetrics) -> None:
                 _fmt_currency(data.ad_spend_mtd),
                 data.ad_spend_mtd_trend,
                 delta=_fmt_vs_prior_mtd(data.ad_spend_mtd_vs_prior_pct),
+                delta_pct=data.ad_spend_mtd_vs_prior_pct,
+                invert_sparkline=True,
             )
         with row_ytd:
             _render_trend_metric(
@@ -1126,6 +1350,8 @@ def _render_command_strip(data: CommandStripMetrics) -> None:
                 _fmt_currency(data.ad_spend_ytd),
                 data.ad_spend_ytd_trend,
                 delta=_fmt_vs_prior_ytd(data.ad_spend_ytd_vs_prior_pct),
+                delta_pct=data.ad_spend_ytd_vs_prior_pct,
+                invert_sparkline=True,
             )
 
         row_spend, row_sessions, row_contacts, row_leads = st.columns(4, gap="small")
@@ -1134,24 +1360,28 @@ def _render_command_strip(data: CommandStripMetrics) -> None:
                 "Ad spend (7d)",
                 _fmt_currency(data.spend_7d),
                 data.spend_trend,
+                invert_sparkline=True,
             )
         with row_sessions:
             _render_trend_metric(
                 "GA4 sessions (7d)",
                 _fmt_count(data.sessions_7d),
                 data.sessions_trend,
+                invert_sparkline=False,
             )
         with row_contacts:
             _render_trend_metric(
                 "New contacts (7d)",
                 _fmt_count(data.new_contacts_7d),
                 data.new_contacts_trend,
+                invert_sparkline=False,
             )
         with row_leads:
             _render_trend_metric(
                 "Leads (7d)",
                 _fmt_count(data.leads_7d),
                 data.leads_trend,
+                invert_sparkline=False,
             )
 
         if data.notes:
@@ -1189,7 +1419,11 @@ def _render_conversion_drivers(
             if data.total_bookings is not None
             else command.bookings_7d
         )
-        meetings_count = data.total_meetings
+        meetings_count = (
+            data.total_meetings
+            if data.total_meetings is not None
+            else command.meetings_7d
+        )
         signups_count = (
             data.total_committed
             if data.total_committed is not None
@@ -1562,11 +1796,15 @@ def main() -> None:
 
     with st.sidebar:
         st.header("War Room controls")
+        _render_data_source_controls()
         refresh_minutes = st.selectbox("Auto-refresh interval", [0, 5, 15, 30], index=0, format_func=lambda m: "Off" if m == 0 else f"{m} min")
         if st.button("Refresh now", type="primary", use_container_width=True):
             _clear_caches()
             st.rerun()
-        st.caption("Caches clear on manual refresh. Wire auto-refresh in a later stage.")
+        st.caption(
+            "Refresh now fetches live data for enabled sources. Skipped sources "
+            "keep the last snapshot until you turn them back on."
+        )
 
     last_refresh = datetime.now(timezone.utc)
     _render_header(last_refresh)
@@ -1574,15 +1812,25 @@ def main() -> None:
     col_main, col_side = st.columns([2, 1], gap="medium")
 
     with st.spinner("Loading War Room…"):
-        command = _load_command_strip()
-        conversion = _load_conversion_drivers()
-        paid = _load_paid_media()
-        crm = _load_crm_funnel()
-        traffic = _load_website_traffic()
-        organic = _load_organic_social()
-        content = _load_content_seo()
-        alerts = _load_alerts()
-        team = _load_team_ops()
+        command = _resolve_data_source(
+            "command_strip", _load_command_strip, CommandStripMetrics
+        )
+        conversion = _resolve_data_source(
+            "conversion_drivers", _load_conversion_drivers, ConversionDriversMetrics
+        )
+        paid = _resolve_data_source("paid_media", _load_paid_media, PaidMediaMetrics)
+        crm = _resolve_data_source("crm_funnel", _load_crm_funnel, CrmFunnelMetrics)
+        traffic = _resolve_data_source(
+            "website_traffic", _load_website_traffic, WebsiteTrafficMetrics
+        )
+        organic = _resolve_data_source(
+            "organic_social", _load_organic_social, OrganicSocialMetrics
+        )
+        content = _resolve_data_source(
+            "content_seo", _load_content_seo, ContentSeoMetrics
+        )
+        alerts = _resolve_data_source("alerts", _load_alerts, AlertsMetrics)
+        team = _resolve_data_source("team_ops", _load_team_ops, TeamOpsMetrics)
 
     with col_main:
         with st.container(key="war-room-scroll-main"):

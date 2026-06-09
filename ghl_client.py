@@ -5,11 +5,12 @@
 from __future__ import annotations
 
 # Bump when hear-about normalization or fetch helpers change (war_room_data reloads).
-GHL_CLIENT_REVISION = "2026-06-08-meetings-hear-about-v1"
+GHL_CLIENT_REVISION = "2026-06-09-calendar-hear-about-batch-v2"
 
 import os
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -2233,28 +2234,16 @@ def _fetch_location_calendars(
     return calendars, 0
 
 
-def count_calendar_funnel_events(
-    since: str,
-    until: str,
-    *,
-    location_id: str | None = None,
-) -> CalendarFunnelCounts:
-    """
-    Count calendar funnel events in ``[since, until]`` inclusive (YYYY-MM-DD).
+def _calendar_allowed_days(since: str, until: str) -> set[str]:
+    since_date = date.fromisoformat(since)
+    until_date = date.fromisoformat(until)
+    return {
+        (since_date + timedelta(days=offset)).isoformat()
+        for offset in range((until_date - since_date).days + 1)
+    }
 
-    - **Bookings** — non-deleted events whose ``dateAdded`` falls in range.
-    - **Meetings** — non-deleted events whose ``startTime`` falls in range.
 
-    Uses one calendar scan with a wide ``startTime`` fetch window so future-dated
-    bookings are included.
-    """
-    if location_id and location_id.strip():
-        loc = location_id.strip()
-    else:
-        loc = _location_id()
-    if not loc:
-        raise ValueError("Set GHL_LOCATION_ID in .env")
-
+def _calendar_fetch_window_ms(since: str, until: str) -> tuple[str, str]:
     since_date = date.fromisoformat(since)
     until_date = date.fromisoformat(until)
     window_start = datetime.combine(
@@ -2263,20 +2252,44 @@ def count_calendar_funnel_events(
     window_end = datetime.combine(
         until_date + timedelta(days=180), datetime.max.time(), tzinfo=timezone.utc
     )
-    start_ms = str(int(window_start.timestamp() * 1000))
-    end_ms = str(int(window_end.timestamp() * 1000))
+    return str(int(window_start.timestamp() * 1000)), str(int(window_end.timestamp() * 1000))
 
+
+_calendar_events_cache: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]], int]] = {}
+_CALENDAR_EVENTS_CACHE_TTL_SEC = 300
+
+
+def _fetch_calendar_events_deduped(
+    since: str,
+    until: str,
+    *,
+    location_id: str | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """
+    Non-deleted calendar events in the scan window, deduped by event id.
+
+    Cached in-process for five minutes so command strip, CRM funnel, and
+    conversion drivers share one calendar pass per date range.
+    """
+    if location_id and location_id.strip():
+        loc = location_id.strip()
+    else:
+        loc = _location_id()
+    if not loc:
+        raise ValueError("Set GHL_LOCATION_ID in .env")
+
+    cache_key = (since, until, loc)
+    now = time.time()
+    cached = _calendar_events_cache.get(cache_key)
+    if cached and now - cached[0] < _CALENDAR_EVENTS_CACHE_TTL_SEC:
+        return cached[1], cached[2]
+
+    start_ms, end_ms = _calendar_fetch_window_ms(since, until)
     headers = _request_headers()
     calendars, api_errors = _fetch_location_calendars(loc)
 
-    allowed_days = {
-        (since_date + timedelta(days=offset)).isoformat()
-        for offset in range((until_date - since_date).days + 1)
-    }
-
     seen_ids: set[str] = set()
-    bookings = 0
-    meetings = 0
+    events: list[dict[str, Any]] = []
 
     for calendar in calendars:
         calendar_id = calendar.get("id")
@@ -2303,12 +2316,46 @@ def count_calendar_funnel_events(
             seen_ids.add(str(event_id))
             if event.get("deleted"):
                 continue
-            added_day = _event_date_added_ymd(event)
-            if added_day in allowed_days:
-                bookings += 1
-            meeting_day = _event_start_time_ymd(event)
-            if meeting_day in allowed_days:
-                meetings += 1
+            events.append(event)
+
+    _calendar_events_cache[cache_key] = (now, events, api_errors)
+    return events, api_errors
+
+
+def count_calendar_funnel_events(
+    since: str,
+    until: str,
+    *,
+    location_id: str | None = None,
+) -> CalendarFunnelCounts:
+    """
+    Count calendar funnel events in ``[since, until]`` inclusive (YYYY-MM-DD).
+
+    - **Bookings** — non-deleted events whose ``dateAdded`` falls in range.
+    - **Meetings** — non-deleted events whose ``startTime`` falls in range.
+
+    Uses one calendar scan with a wide ``startTime`` fetch window so future-dated
+    bookings are included.
+    """
+    if location_id and location_id.strip():
+        loc = location_id.strip()
+    else:
+        loc = _location_id()
+    if not loc:
+        raise ValueError("Set GHL_LOCATION_ID in .env")
+
+    allowed_days = _calendar_allowed_days(since, until)
+    events, api_errors = _fetch_calendar_events_deduped(
+        since, until, location_id=loc
+    )
+
+    bookings = 0
+    meetings = 0
+    for event in events:
+        if _event_date_added_ymd(event) in allowed_days:
+            bookings += 1
+        if _event_start_time_ymd(event) in allowed_days:
+            meetings += 1
 
     return CalendarFunnelCounts(
         bookings=bookings,
@@ -2337,57 +2384,15 @@ def _calendar_events_in_range(
     if not loc:
         raise ValueError("Set GHL_LOCATION_ID in .env")
 
-    since_date = date.fromisoformat(since)
-    until_date = date.fromisoformat(until)
-    window_start = datetime.combine(
-        since_date - timedelta(days=7), datetime.min.time(), tzinfo=timezone.utc
+    allowed_days = _calendar_allowed_days(since, until)
+    events, api_errors = _fetch_calendar_events_deduped(
+        since, until, location_id=loc
     )
-    window_end = datetime.combine(
-        until_date + timedelta(days=180), datetime.max.time(), tzinfo=timezone.utc
-    )
-    start_ms = str(int(window_start.timestamp() * 1000))
-    end_ms = str(int(window_end.timestamp() * 1000))
-
-    headers = _request_headers()
-    calendars, api_errors = _fetch_location_calendars(loc)
-
-    allowed_days = {
-        (since_date + timedelta(days=offset)).isoformat()
-        for offset in range((until_date - since_date).days + 1)
-    }
-
-    seen_ids: set[str] = set()
-    matched: list[dict[str, Any]] = []
-
-    for calendar in calendars:
-        calendar_id = calendar.get("id")
-        if not calendar_id:
-            continue
-        events_response = requests.get(
-            f"{BASE_URL}/calendars/events",
-            params={
-                "locationId": loc,
-                "calendarId": calendar_id,
-                "startTime": start_ms,
-                "endTime": end_ms,
-            },
-            headers=headers,
-            timeout=90,
-        )
-        if not events_response.ok:
-            api_errors += 1
-            continue
-        for event in events_response.json().get("events") or []:
-            event_id = event.get("id")
-            if not event_id or str(event_id) in seen_ids:
-                continue
-            seen_ids.add(str(event_id))
-            if event.get("deleted"):
-                continue
-            event_day = day_from_event(event)
-            if event_day in allowed_days:
-                matched.append(event)
-
+    matched = [
+        event
+        for event in events
+        if day_from_event(event) in allowed_days
+    ]
     return matched, api_errors
 
 
@@ -2488,6 +2493,123 @@ def fetch_contact_by_id(
     return None
 
 
+def fetch_contacts_by_ids(
+    contact_ids: set[str] | list[str],
+    *,
+    location_id: str | None = None,
+    max_workers: int = 8,
+) -> dict[str, dict[str, Any] | None]:
+    """Load many contacts in parallel (deduped by id)."""
+    unique_ids = sorted({str(cid).strip() for cid in contact_ids if str(cid).strip()})
+    if not unique_ids:
+        return {}
+
+    cache: dict[str, dict[str, Any] | None] = {}
+    workers = max(1, min(max_workers, len(unique_ids)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(fetch_contact_by_id, cid, location_id=location_id): cid
+            for cid in unique_ids
+        }
+        for future in as_completed(futures):
+            cid = futures[future]
+            try:
+                cache[cid] = future.result()
+            except Exception:
+                cache[cid] = None
+    return cache
+
+
+def _aggregate_events_by_hear_about(
+    events: list[dict[str, Any]],
+    *,
+    hear_id: str,
+    contact_cache: dict[str, dict[str, Any] | None],
+) -> dict[str, Any]:
+    by_source: Counter[str] = Counter()
+    missing_contact_link = 0
+    contact_lookup_failures = 0
+
+    for event in events:
+        contact_id = event.get("contactId")
+        if not contact_id:
+            missing_contact_link += 1
+            by_source["(No contact linked)"] += 1
+            continue
+        cid = str(contact_id)
+        contact = contact_cache.get(cid)
+        if contact is None and cid not in contact_cache:
+            contact = fetch_contact_by_id(cid)
+            contact_cache[cid] = contact
+        if not contact:
+            contact_lookup_failures += 1
+            by_source["(Contact not found)"] += 1
+            continue
+        label = _normalize_hear_about_label(contact_custom_field_value(contact, hear_id))
+        by_source[label] += 1
+
+    return {
+        "rows": _hear_about_rows_from_counter(by_source),
+        "total": len(events),
+        "missing_contact_link": missing_contact_link,
+        "contact_lookup_failures": contact_lookup_failures,
+    }
+
+
+def fetch_bookings_and_meetings_by_hear_about_us(
+    since: str,
+    until: str,
+    *,
+    location_id: str | None = None,
+    field_name: str = HEAR_ABOUT_US_FIELD_NAME,
+) -> dict[str, Any]:
+    """
+    Bookings (``dateAdded``) and meetings (``startTime``) in range, grouped by
+    hear-about source — one calendar scan and one batched contact load.
+    """
+    hear_id = resolve_hear_about_us_custom_field_id(location_id, field_name=field_name)
+    allowed_days = _calendar_allowed_days(since, until)
+    events, api_errors = _fetch_calendar_events_deduped(
+        since, until, location_id=location_id
+    )
+
+    booking_events = [
+        event for event in events if _event_date_added_ymd(event) in allowed_days
+    ]
+    meeting_events = [
+        event for event in events if _event_start_time_ymd(event) in allowed_days
+    ]
+
+    contact_ids = {
+        str(event["contactId"])
+        for event in booking_events + meeting_events
+        if event.get("contactId")
+    }
+    contact_cache = fetch_contacts_by_ids(contact_ids, location_id=location_id)
+
+    bookings = _aggregate_events_by_hear_about(
+        booking_events,
+        hear_id=hear_id,
+        contact_cache=contact_cache,
+    )
+    meetings = _aggregate_events_by_hear_about(
+        meeting_events,
+        hear_id=hear_id,
+        contact_cache=contact_cache,
+    )
+
+    return {
+        "since": since,
+        "until": until,
+        "field_id": hear_id,
+        "field_name": field_name,
+        "calendar_api_errors": api_errors,
+        "unique_contacts": len(contact_cache),
+        "bookings": bookings,
+        "meetings": meetings,
+    }
+
+
 def fetch_bookings_by_hear_about_us(
     since: str,
     until: str,
@@ -2503,39 +2625,24 @@ def fetch_bookings_by_hear_about_us(
     bookings, api_errors = _calendar_bookings_in_date_added_range(
         since, until, location_id=location_id
     )
-
-    by_source: Counter[str] = Counter()
-    contact_cache: dict[str, dict[str, Any] | None] = {}
-    missing_contact_link = 0
-    contact_lookup_failures = 0
-
-    for event in bookings:
-        contact_id = event.get("contactId")
-        if not contact_id:
-            missing_contact_link += 1
-            by_source["(No contact linked)"] += 1
-            continue
-        cid = str(contact_id)
-        if cid not in contact_cache:
-            contact_cache[cid] = fetch_contact_by_id(cid, location_id=location_id)
-        contact = contact_cache[cid]
-        if not contact:
-            contact_lookup_failures += 1
-            by_source["(Contact not found)"] += 1
-            continue
-        label = _normalize_hear_about_label(contact_custom_field_value(contact, hear_id))
-        by_source[label] += 1
+    contact_ids = {str(event["contactId"]) for event in bookings if event.get("contactId")}
+    contact_cache = fetch_contacts_by_ids(contact_ids, location_id=location_id)
+    grouped = _aggregate_events_by_hear_about(
+        bookings,
+        hear_id=hear_id,
+        contact_cache=contact_cache,
+    )
 
     return {
         "since": since,
         "until": until,
         "field_id": hear_id,
         "field_name": field_name,
-        "rows": _hear_about_rows_from_counter(by_source),
-        "total_bookings": len(bookings),
+        "rows": grouped["rows"],
+        "total_bookings": grouped["total"],
         "calendar_api_errors": api_errors,
-        "missing_contact_link": missing_contact_link,
-        "contact_lookup_failures": contact_lookup_failures,
+        "missing_contact_link": grouped["missing_contact_link"],
+        "contact_lookup_failures": grouped["contact_lookup_failures"],
         "unique_contacts": len(contact_cache),
     }
 
@@ -2555,39 +2662,24 @@ def fetch_meetings_by_hear_about_us(
     meetings, api_errors = _calendar_meetings_in_start_time_range(
         since, until, location_id=location_id
     )
-
-    by_source: Counter[str] = Counter()
-    contact_cache: dict[str, dict[str, Any] | None] = {}
-    missing_contact_link = 0
-    contact_lookup_failures = 0
-
-    for event in meetings:
-        contact_id = event.get("contactId")
-        if not contact_id:
-            missing_contact_link += 1
-            by_source["(No contact linked)"] += 1
-            continue
-        cid = str(contact_id)
-        if cid not in contact_cache:
-            contact_cache[cid] = fetch_contact_by_id(cid, location_id=location_id)
-        contact = contact_cache[cid]
-        if not contact:
-            contact_lookup_failures += 1
-            by_source["(Contact not found)"] += 1
-            continue
-        label = _normalize_hear_about_label(contact_custom_field_value(contact, hear_id))
-        by_source[label] += 1
+    contact_ids = {str(event["contactId"]) for event in meetings if event.get("contactId")}
+    contact_cache = fetch_contacts_by_ids(contact_ids, location_id=location_id)
+    grouped = _aggregate_events_by_hear_about(
+        meetings,
+        hear_id=hear_id,
+        contact_cache=contact_cache,
+    )
 
     return {
         "since": since,
         "until": until,
         "field_id": hear_id,
         "field_name": field_name,
-        "rows": _hear_about_rows_from_counter(by_source),
-        "total_meetings": len(meetings),
+        "rows": grouped["rows"],
+        "total_meetings": grouped["total"],
         "calendar_api_errors": api_errors,
-        "missing_contact_link": missing_contact_link,
-        "contact_lookup_failures": contact_lookup_failures,
+        "missing_contact_link": grouped["missing_contact_link"],
+        "contact_lookup_failures": grouped["contact_lookup_failures"],
         "unique_contacts": len(contact_cache),
     }
 
