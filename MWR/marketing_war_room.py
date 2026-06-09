@@ -76,7 +76,7 @@ from ghl_client import HEAR_ABOUT_US_FIELD_NAME  # noqa: E402 — after war_room
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 # Bump when loader logic changes — invalidates @st.cache_data without a server restart.
-WAR_ROOM_LOADER_VERSION = "2026-06-09-team-ops-status-labels-v15"
+WAR_ROOM_LOADER_VERSION = "2026-06-09-team-ops-totals-v16"
 
 SPARKLINE_HEIGHT_PX = 44
 
@@ -407,12 +407,6 @@ def _inject_styles() -> None:
             font-size: 0.8rem;
             font-weight: 700;
             line-height: 1.2;
-            margin: 0 0 0.3rem 0;
-        }}
-        .war-room-board-scope {{
-            color: {COLORS["muted"]};
-            font-size: 0.66rem;
-            font-weight: 500;
             margin: 0 0 0.3rem 0;
         }}
         .war-room-board-empty {{
@@ -1669,16 +1663,10 @@ def _board_display_name(board_name: str) -> str:
 
 def _board_status_html(board: BoardTaskSummary) -> str:
     display_name = html.escape(_board_display_name(board.board_name))
-    scope_html = ""
-    if board.scope_label:
-        scope_html = (
-            f'<p class="war-room-board-scope">{html.escape(board.scope_label)} group</p>'
-        )
     if not board.by_status:
         return (
             f'<div class="war-room-board-block">'
             f'<div class="war-room-board-name">{display_name}</div>'
-            f"{scope_html}"
             f'<p class="war-room-board-empty">No open tasks</p>'
             f"</div>"
         )
@@ -1697,7 +1685,6 @@ def _board_status_html(board: BoardTaskSummary) -> str:
     return (
         f'<div class="war-room-board-block">'
         f'<div class="war-room-board-name">{display_name}</div>'
-        f"{scope_html}"
         f'<div class="war-room-board-statuses">{"".join(chips)}</div>'
         f"</div>"
     )
@@ -1709,6 +1696,13 @@ def _render_team_ops(data: TeamOpsMetrics) -> None:
         "Monday.com · open queue · current status",
         "war-room-team-ops",
     ):
+        _metric_row(
+            [
+                ("Open tasks", _fmt_count(data.total_open)),
+                ("Requested", _fmt_count(data.total_requested)),
+                ("Working on it", _fmt_count(data.total_working)),
+            ]
+        )
         if data.boards:
             blocks = "".join(_board_status_html(board) for board in data.boards)
             st.markdown(

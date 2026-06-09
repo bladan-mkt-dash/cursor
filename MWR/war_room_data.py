@@ -179,12 +179,6 @@ WAR_ROOM_MONDAY_BOARD_NAMES: tuple[str, ...] = (
     "We Have SEO",
 )
 
-# Je's board is organized into month groups; her queue view uses the current month only.
-WAR_ROOM_MONDAY_CURRENT_MONTH_GROUP_BOARDS: frozenset[str] = frozenset(
-    {"Je New To-Do List"}
-)
-
-
 @dataclass
 class StatusCountRow:
     status: str
@@ -223,7 +217,6 @@ TEAM_OPS_CLOSED_STATUSES: frozenset[str] = frozenset(
 class BoardTaskSummary:
     board_name: str
     requested: int = 0
-    scope_label: str = ""
     by_status: list[StatusCountRow] = field(default_factory=list)
 
 
@@ -231,6 +224,9 @@ class BoardTaskSummary:
 class TeamOpsMetrics:
     period_since: str = ""
     period_until: str = ""
+    total_open: int = 0
+    total_requested: int = 0
+    total_working: int = 0
     boards: list[BoardTaskSummary] = field(default_factory=list)
     missing_boards: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
@@ -700,24 +696,6 @@ def _open_team_ops_tasks(df):
     return df[df["status"].map(_is_open_team_ops_status)]
 
 
-def _current_month_group_title(*, as_of: date) -> str:
-    return f"{as_of.strftime('%B')} {as_of.year}"
-
-
-def _filter_board_scope(df, board_name: str, *, as_of: date) -> tuple[object, str]:
-    """Return board rows, optionally scoped to the current month group."""
-    if df.empty:
-        return df, ""
-    if board_name not in WAR_ROOM_MONDAY_CURRENT_MONTH_GROUP_BOARDS:
-        return df, ""
-    if "group_title" not in df.columns:
-        return df, ""
-
-    group_title = _current_month_group_title(as_of=as_of)
-    scoped = df[df["group_title"] == group_title]
-    return scoped, group_title
-
-
 def format_team_status_label(status: str) -> str:
     """Return the workflow Status column label verbatim (no display aliases)."""
     return (status or "").strip() or "No status"
@@ -747,7 +725,6 @@ def _count_tasks_by_status(df) -> list[StatusCountRow]:
 
 def load_team_ops(*, as_of: date | None = None) -> TeamOpsMetrics:
     """Team & projects — open Monday.com tasks by current workflow Status per board."""
-    today = as_of or date.today()
     metrics = TeamOpsMetrics()
 
     try:
@@ -777,21 +754,27 @@ def load_team_ops(*, as_of: date | None = None) -> TeamOpsMetrics:
             if not board_id:
                 continue
             board_df = open_df[open_df["board_id"] == board_id] if not open_df.empty else open_df
-            board_df, scope_label = _filter_board_scope(board_df, board_name, as_of=today)
             by_status = _count_tasks_by_status(board_df)
             summaries.append(
                 BoardTaskSummary(
                     board_name=board_name,
                     requested=status_count_for(by_status, "Requested"),
-                    scope_label=scope_label,
                     by_status=by_status,
                 )
             )
 
         metrics.boards = summaries
+        for board in summaries:
+            for row in board.by_status:
+                metrics.total_open += row.count
+                status_key = row.status.strip().casefold()
+                if status_key == "requested":
+                    metrics.total_requested += row.count
+                elif status_key == "working on it":
+                    metrics.total_working += row.count
         metrics.notes.append(
             "Open tasks by current workflow Status (excludes Done/Published) · "
-            "Je scoped to current month group · Status column, not Priority."
+            "Status column, not Priority."
         )
     except Exception as exc:
         metrics.errors.append(f"Monday.com: {exc}")
