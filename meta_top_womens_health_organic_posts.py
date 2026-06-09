@@ -547,7 +547,7 @@ def main() -> int:
         except (AttributeError, OSError, ValueError):
             pass
 
-    top, info = fetch_womens_health_organic_ranked(top_n=5, max_scan=400)
+    top, info = fetch_womens_health_organic_ranked(top_n=11, max_scan=400)
     if info.get("errors") and not top and not info.get("page_id"):
         for line in info["errors"]:
             print(line, file=sys.stderr)
