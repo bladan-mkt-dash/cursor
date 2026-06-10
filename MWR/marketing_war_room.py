@@ -303,7 +303,7 @@ def _inject_styles() -> None:
         div[class*="st-key-war-room-kpi-"][data-testid="stVerticalBlockBorderWrapper"] {{
             border: 1px solid rgba(93, 166, 138, 0.12) !important;
             border-radius: 10px !important;
-            background: {COLORS["panel_bg"]} !important;
+            background: {COLORS["panel_bg"]};
             box-shadow: 0 1px 2px rgba(38, 69, 64, 0.06) !important;
             padding: 0.35rem 0.5rem 0.3rem 0.5rem !important;
             min-width: 0;
@@ -876,6 +876,26 @@ def _kpi_container_key(label: str) -> str:
     return f"war-room-kpi-{_slugify_label(label)}"
 
 
+def _inject_spend_kpi_backgrounds(registry: dict[str, float | None]) -> None:
+    """Tint spend KPI cards after render — above prior = red, below = green."""
+    rules: list[str] = []
+    for container_key, delta_pct in registry.items():
+        if delta_pct is None or delta_pct == 0:
+            continue
+        if delta_pct > 0:
+            bg = "rgba(228, 87, 86, 0.24)"
+            border = "rgba(228, 87, 86, 0.45)"
+        else:
+            bg = "rgba(93, 166, 138, 0.28)"
+            border = "rgba(93, 166, 138, 0.48)"
+        rules.append(
+            f'div[class*="st-key-{container_key}"][data-testid="stVerticalBlockBorderWrapper"] '
+            f"{{ background: {bg} !important; border-color: {border} !important; }}"
+        )
+    if rules:
+        st.markdown(f"<style>{''.join(rules)}</style>", unsafe_allow_html=True)
+
+
 def _conversion_kpi_container_key(label: str) -> str:
     return f"war-room-conversion-{_slugify_label(label)}"
 
@@ -911,11 +931,18 @@ def _render_trend_metric(
     delta: str | None = None,
     delta_pct: float | None = None,
     invert_sparkline: bool | None = None,
+    spend_tone_registry: dict[str, float | None] | None = None,
 ) -> None:
     """Single KPI card: headline metric and sparkline share one bordered box."""
     if invert_sparkline is None:
         invert_sparkline = _is_spend_sparkline(label, trend)
-    with st.container(border=True, key=_kpi_container_key(label)):
+    container_key = _kpi_container_key(label)
+    effective_delta_pct = delta_pct
+    if effective_delta_pct is None and trend:
+        effective_delta_pct = trend.vs_prior_avg_pct
+    if invert_sparkline and spend_tone_registry is not None:
+        spend_tone_registry[container_key] = effective_delta_pct
+    with st.container(border=True, key=container_key):
         col_metric, col_spark = st.columns(
             [1.2, 0.9],
             gap="small",
@@ -928,7 +955,8 @@ def _render_trend_metric(
                 delta = _fmt_vs_prior_avg(delta_pct)
             elif delta is None and trend:
                 delta = _fmt_vs_prior_avg(trend.vs_prior_avg_pct)
-            st.metric(label, value, delta=delta, delta_color="normal")
+            metric_delta_color = "inverse" if invert_sparkline else "normal"
+            st.metric(label, value, delta=delta, delta_color=metric_delta_color)
         with col_spark:
             if trend:
                 _render_sparkline(
@@ -1324,10 +1352,12 @@ def _render_command_strip(data: CommandStripMetrics) -> None:
     ):
         st.caption(
             "7-day KPIs compare vs the prior 7 days. Ad spend (MTD) compares vs the same "
-            "calendar days last month; Ad spend (YTD) vs the same span last year. Today is "
-            "dimmed on paid/GA4 series (intraday may be incomplete)."
+            "calendar days last month; Ad spend (YTD) vs the same span last year. Spend cards "
+            "turn red when above prior and green when below. Today is dimmed on paid/GA4 series "
+            "(intraday may be incomplete)."
         )
 
+        spend_tones: dict[str, float | None] = {}
         row_mtd, row_ytd = st.columns(2, gap="small")
         with row_mtd:
             _render_trend_metric(
@@ -1337,6 +1367,7 @@ def _render_command_strip(data: CommandStripMetrics) -> None:
                 delta=_fmt_vs_prior_mtd(data.ad_spend_mtd_vs_prior_pct),
                 delta_pct=data.ad_spend_mtd_vs_prior_pct,
                 invert_sparkline=True,
+                spend_tone_registry=spend_tones,
             )
         with row_ytd:
             _render_trend_metric(
@@ -1346,6 +1377,7 @@ def _render_command_strip(data: CommandStripMetrics) -> None:
                 delta=_fmt_vs_prior_ytd(data.ad_spend_ytd_vs_prior_pct),
                 delta_pct=data.ad_spend_ytd_vs_prior_pct,
                 invert_sparkline=True,
+                spend_tone_registry=spend_tones,
             )
 
         row_spend, row_sessions, row_contacts, row_leads = st.columns(4, gap="small")
@@ -1355,6 +1387,7 @@ def _render_command_strip(data: CommandStripMetrics) -> None:
                 _fmt_currency(data.spend_7d),
                 data.spend_trend,
                 invert_sparkline=True,
+                spend_tone_registry=spend_tones,
             )
         with row_sessions:
             _render_trend_metric(
@@ -1377,6 +1410,8 @@ def _render_command_strip(data: CommandStripMetrics) -> None:
                 data.leads_trend,
                 invert_sparkline=False,
             )
+
+        _inject_spend_kpi_backgrounds(spend_tones)
 
         if data.notes:
             for note in data.notes:
