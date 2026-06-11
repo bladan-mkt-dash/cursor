@@ -197,6 +197,14 @@ TEAM_OPS_STATUS_ORDER: tuple[str, ...] = (
     "Done",
 )
 
+# Top-line totals and per-board chips — same buckets, same order (Open = all open tasks).
+TEAM_OPS_SUMMARY_BUCKETS: tuple[str, ...] = (
+    "Requested",
+    "Working On It",
+    "In Review",
+    "Ready for Publishing",
+)
+
 TEAM_OPS_CLOSED_STATUSES: frozenset[str] = frozenset(
     {
         "done",
@@ -218,6 +226,7 @@ class BoardTaskSummary:
     board_name: str
     requested: int = 0
     by_status: list[StatusCountRow] = field(default_factory=list)
+    tasks_by_bucket: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -227,6 +236,8 @@ class TeamOpsMetrics:
     total_open: int = 0
     total_requested: int = 0
     total_working: int = 0
+    total_in_review: int = 0
+    total_ready_for_publishing: int = 0
     boards: list[BoardTaskSummary] = field(default_factory=list)
     missing_boards: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
@@ -723,6 +734,28 @@ def _count_tasks_by_status(df) -> list[StatusCountRow]:
     return sorted(rows, key=lambda row: _status_sort_key(row.status))
 
 
+def _task_names_for_bucket(df, bucket: str) -> list[str]:
+    """Task names for a summary bucket label (workflow status or ``Open``)."""
+    if df.empty or "name" not in df.columns:
+        return []
+    if bucket.strip().casefold() == "open":
+        names = [str(name).strip() for name in df["name"].tolist()]
+        return sorted(name for name in names if name)
+
+    target = bucket.strip().casefold()
+    names: list[str] = []
+    for raw_status, name in zip(df["status"], df["name"], strict=False):
+        if (str(raw_status or "").strip().casefold() == target) and str(name).strip():
+            names.append(str(name).strip())
+    return sorted(names)
+
+
+def _tasks_by_bucket_for_board(df) -> dict[str, list[str]]:
+    buckets = {status: _task_names_for_bucket(df, status) for status in TEAM_OPS_SUMMARY_BUCKETS}
+    buckets["Open"] = _task_names_for_bucket(df, "Open")
+    return buckets
+
+
 def load_team_ops(*, as_of: date | None = None) -> TeamOpsMetrics:
     """Team & projects — open Monday.com tasks by current workflow Status per board."""
     metrics = TeamOpsMetrics()
@@ -760,6 +793,7 @@ def load_team_ops(*, as_of: date | None = None) -> TeamOpsMetrics:
                     board_name=board_name,
                     requested=status_count_for(by_status, "Requested"),
                     by_status=by_status,
+                    tasks_by_bucket=_tasks_by_bucket_for_board(board_df),
                 )
             )
 
@@ -772,6 +806,10 @@ def load_team_ops(*, as_of: date | None = None) -> TeamOpsMetrics:
                     metrics.total_requested += row.count
                 elif status_key == "working on it":
                     metrics.total_working += row.count
+                elif status_key == "in review":
+                    metrics.total_in_review += row.count
+                elif status_key == "ready for publishing":
+                    metrics.total_ready_for_publishing += row.count
         metrics.notes.append(
             "Open tasks by current workflow Status (excludes Done/Published) · "
             "Status column, not Priority."

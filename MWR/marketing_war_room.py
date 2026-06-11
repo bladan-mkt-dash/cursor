@@ -58,6 +58,8 @@ from war_room_data import (
     BoardTaskSummary,
     TeamOpsMetrics,
     format_team_status_label,
+    status_count_for,
+    TEAM_OPS_SUMMARY_BUCKETS,
     TrendSeries,
     WebsiteTrafficMetrics,
     load_alerts,
@@ -76,7 +78,7 @@ from ghl_client import HEAR_ABOUT_US_FIELD_NAME  # noqa: E402 — after war_room
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 # Bump when loader logic changes — invalidates @st.cache_data without a server restart.
-WAR_ROOM_LOADER_VERSION = "2026-06-09-team-ops-totals-v16"
+WAR_ROOM_LOADER_VERSION = "2026-06-11-tasks-due-date-v17"
 
 SPARKLINE_HEIGHT_PX = 44
 
@@ -394,6 +396,7 @@ def _inject_styles() -> None:
         .war-room-board-block {{
             padding-bottom: 0.45rem;
             border-bottom: 1px solid rgba(93, 166, 138, 0.14);
+            overflow: visible;
         }}
         .war-room-board-list .war-room-board-block:not(:first-child) {{
             margin-top: 10px;
@@ -419,6 +422,10 @@ def _inject_styles() -> None:
             display: flex;
             flex-wrap: wrap;
             gap: 0.28rem;
+            overflow: visible;
+        }}
+        .war-room-board-status-rows .war-room-board-statuses + .war-room-board-statuses {{
+            margin-top: 0.28rem;
         }}
         .war-room-board-status {{
             flex: 1 1 calc(50% - 0.28rem);
@@ -433,10 +440,54 @@ def _inject_styles() -> None:
             border-radius: 6px;
             padding: 0.22rem 0.38rem;
             box-shadow: 0 1px 2px rgba(38, 69, 64, 0.04);
+            position: relative;
+        }}
+        .war-room-board-status--has-tip {{
+            cursor: help;
+        }}
+        .war-room-board-status--has-tip:hover {{
+            border-color: rgba(93, 166, 138, 0.45);
+            box-shadow: 0 2px 6px rgba(38, 69, 64, 0.1);
+        }}
+        .war-room-board-status-tip {{
+            display: none;
+            position: absolute;
+            top: calc(100% + 4px);
+            left: 0;
+            z-index: 20;
+            min-width: 11rem;
+            max-width: 16rem;
+            max-height: 9.5rem;
+            overflow-y: auto;
+            padding: 0.38rem 0.45rem;
+            background: {COLORS["panel_bg"]};
+            border: 1px solid rgba(93, 166, 138, 0.35);
+            border-radius: 8px;
+            box-shadow: 0 6px 16px rgba(38, 69, 64, 0.16);
+            pointer-events: none;
+        }}
+        .war-room-board-status--has-tip:hover .war-room-board-status-tip {{
+            display: block;
+        }}
+        .war-room-board-status-tip ul {{
+            margin: 0;
+            padding-left: 1rem;
+        }}
+        .war-room-board-status-tip li {{
+            color: {COLORS["accent_dark"]};
+            font-size: 0.66rem;
+            line-height: 1.35;
+            margin: 0.12rem 0;
+        }}
+        .war-room-board-status-tip-more {{
+            color: {COLORS["muted"]} !important;
+            font-style: italic;
+            list-style: none;
+            margin-left: -1rem;
         }}
         .war-room-board-status-label {{
             color: {COLORS["accent_dark"]};
-            font-size: 0.66rem;
+            font-size: calc(0.66rem + 1pt);
             font-weight: 600;
             line-height: 1.2;
             overflow-wrap: anywhere;
@@ -531,6 +582,21 @@ def _inject_styles() -> None:
         div.st-key-war-room-content-seo [data-testid="stPopover"] button:hover {{
             color: {COLORS["accent_dark"]} !important;
             background: rgba(93, 166, 138, 0.1) !important;
+        }}
+        div.st-key-war-room-alerts-overdue-metric [data-testid="stMetricLabel"],
+        div.st-key-war-room-alerts-overdue-metric [data-testid="stMetricValue"],
+        div.st-key-war-room-alerts-overdue-metric [data-testid="stMetricValue"] > div {{
+            color: {COLORS["danger"]} !important;
+        }}
+        .war-room-alert-overdue {{
+            color: {COLORS["danger"]};
+            font-size: 0.9rem;
+            line-height: 1.45;
+            margin: 0.35rem 0;
+        }}
+        .war-room-alert-overdue strong,
+        .war-room-alert-overdue em {{
+            color: {COLORS["danger"]};
         }}
         {panel_rules}
         </style>
@@ -1696,6 +1762,32 @@ def _board_display_name(board_name: str) -> str:
     return board_name
 
 
+def _board_status_tooltip_html(task_names: list[str], *, max_show: int = 20) -> str:
+    if not task_names:
+        return ""
+    shown = task_names[:max_show]
+    items = "".join(f"<li>{html.escape(name)}</li>" for name in shown)
+    if len(task_names) > max_show:
+        items += (
+            f'<li class="war-room-board-status-tip-more">'
+            f"+ {len(task_names) - max_show} more</li>"
+        )
+    return f'<div class="war-room-board-status-tip"><ul>{items}</ul></div>'
+
+
+def _board_status_chip(label: str, count: int, task_names: list[str] | None = None) -> str:
+    safe_label = html.escape(label)
+    tip_class = " war-room-board-status--has-tip" if task_names else ""
+    tooltip = _board_status_tooltip_html(task_names or [])
+    return (
+        f'<div class="war-room-board-status{tip_class}">'
+        f'<span class="war-room-board-status-label">{safe_label}</span>'
+        f'<span class="war-room-board-status-value">{count:,}</span>'
+        f"{tooltip}"
+        f"</div>"
+    )
+
+
 def _board_status_html(board: BoardTaskSummary) -> str:
     display_name = html.escape(_board_display_name(board.board_name))
     if not board.by_status:
@@ -1706,22 +1798,32 @@ def _board_status_html(board: BoardTaskSummary) -> str:
             f"</div>"
         )
 
-    chips = []
-    for row in board.by_status:
-        label = html.escape(format_team_status_label(row.status))
-        chips.append(
-            (
-                f'<div class="war-room-board-status">'
-                f'<span class="war-room-board-status-label">{label}</span>'
-                f'<span class="war-room-board-status-value">{row.count:,}</span>'
-                f"</div>"
-            )
+    open_count = sum(row.count for row in board.by_status)
+    bucket_tasks = board.tasks_by_bucket
+    row_one = [
+        _board_status_chip(
+            format_team_status_label(status),
+            status_count_for(board.by_status, status),
+            bucket_tasks.get(status, []),
         )
+        for status in TEAM_OPS_SUMMARY_BUCKETS[:3]
+    ]
+    ready_status = TEAM_OPS_SUMMARY_BUCKETS[3]
+    row_two = [
+        _board_status_chip(
+            format_team_status_label(ready_status),
+            status_count_for(board.by_status, ready_status),
+            bucket_tasks.get(ready_status, []),
+        ),
+        _board_status_chip("Open", open_count, bucket_tasks.get("Open", [])),
+    ]
     return (
         f'<div class="war-room-board-block">'
         f'<div class="war-room-board-name">{display_name}</div>'
-        f'<div class="war-room-board-statuses">{"".join(chips)}</div>'
-        f"</div>"
+        f'<div class="war-room-board-status-rows">'
+        f'<div class="war-room-board-statuses">{"".join(row_one)}</div>'
+        f'<div class="war-room-board-statuses">{"".join(row_two)}</div>'
+        f"</div></div>"
     )
 
 
@@ -1733,9 +1835,15 @@ def _render_team_ops(data: TeamOpsMetrics) -> None:
     ):
         _metric_row(
             [
-                ("Open tasks", _fmt_count(data.total_open)),
                 ("Requested", _fmt_count(data.total_requested)),
-                ("Working on it", _fmt_count(data.total_working)),
+                ("Working On It", _fmt_count(data.total_working)),
+                ("In Review", _fmt_count(data.total_in_review)),
+            ]
+        )
+        _metric_row(
+            [
+                ("Ready for Publishing", _fmt_count(data.total_ready_for_publishing)),
+                ("Open", _fmt_count(data.total_open)),
             ]
         )
         if data.boards:
@@ -1786,19 +1894,31 @@ def _render_alerts(data: AlertsMetrics) -> None:
         "Google Tasks · overdue and upcoming due dates",
         "war-room-alerts",
     ):
-        _metric_row(
-            [
-                ("Overdue", _fmt_count(data.overdue_count)),
-                ("Due today", _fmt_count(data.due_today_count)),
-                ("Due soon", _fmt_count(data.due_soon_count)),
-            ]
-        )
+        cols = st.columns(3)
+        with cols[0]:
+            with st.container(key="war-room-alerts-overdue-metric"):
+                st.metric("Overdue", _fmt_count(data.overdue_count))
+        with cols[1]:
+            st.metric("Due today", _fmt_count(data.due_today_count))
+        with cols[2]:
+            st.metric("Due soon", _fmt_count(data.due_soon_count))
         if data.items:
             for item in data.items[:8]:
-                st.markdown(
-                    f"**{item.severity}** · {item.title} · _{item.due_label}_  \n"
-                    f"{item.list_name}"
-                )
+                title = html.escape(item.title)
+                due_label = html.escape(item.due_label)
+                list_name = html.escape(item.list_name)
+                if item.severity == "Overdue":
+                    st.markdown(
+                        f'<p class="war-room-alert-overdue">'
+                        f"<strong>{html.escape(item.severity)}</strong> · {title} · "
+                        f"<em>{due_label}</em><br>{list_name}</p>",
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        f"**{item.severity}** · {item.title} · _{item.due_label}_  \n"
+                        f"{item.list_name}"
+                    )
         elif not data.errors:
             st.caption("No overdue or upcoming tasks with due dates.")
         if data.notes:

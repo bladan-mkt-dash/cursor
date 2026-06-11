@@ -116,7 +116,10 @@ def _parse_due(value: str | None) -> date | None:
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone().date()
+    # Google Tasks due dates are calendar days stored at midnight UTC; the time
+    # portion is not meaningful. Do not convert to local time or tasks appear
+    # one day early (overdue) in US timezones.
+    return dt.astimezone(timezone.utc).date()
 
 
 def _severity_for_due(due: date, *, today: date, due_soon_days: int) -> TaskAlertSeverity | None:
