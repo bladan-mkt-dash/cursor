@@ -78,7 +78,7 @@ from ghl_client import HEAR_ABOUT_US_FIELD_NAME  # noqa: E402 — after war_room
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 # Bump when loader logic changes — invalidates @st.cache_data without a server restart.
-WAR_ROOM_LOADER_VERSION = "2026-06-11-tasks-due-date-v17"
+WAR_ROOM_LOADER_VERSION = "2026-06-12-traffic-hover-only-v20"
 
 SPARKLINE_HEIGHT_PX = 44
 
@@ -1179,15 +1179,31 @@ def _traffic_legend_html(rows: list[HearAboutCountRow]) -> str:
     )
 
 
+def _traffic_contributor_hover_customdata(row: HearAboutCountRow) -> tuple[str, str]:
+    if row.prior_count is None:
+        return ("Prior 7d: unavailable", "")
+    prior_line = f"Prior 7d: {row.prior_count:,} sessions"
+    if row.vs_prior_pct is None:
+        if row.prior_count == 0 and row.count > 0:
+            delta_line = "vs prior 7d: new"
+        else:
+            delta_line = "vs prior 7d: —"
+    else:
+        delta_line = f"vs prior 7d: {row.vs_prior_pct:+.0f}%"
+    return (prior_line, delta_line)
+
+
 def _traffic_contributors_pie_figure(rows: list[HearAboutCountRow]) -> go.Figure | None:
     if not rows:
         return None
     labels = [row.source for row in rows]
     values = [row.count for row in rows]
+    customdata = [_traffic_contributor_hover_customdata(row) for row in rows]
     fig = go.Figure(
         go.Pie(
             labels=labels,
             values=values,
+            customdata=customdata,
             hole=0.38,
             sort=False,
             direction="clockwise",
@@ -1201,7 +1217,11 @@ def _traffic_contributors_pie_figure(rows: list[HearAboutCountRow]) -> go.Figure
                 line=dict(color="#FFFFFF", width=1.5),
             ),
             hovertemplate=(
-                "<b>%{label}</b><br>%{value:,} sessions<br>%{percent}<extra></extra>"
+                "<b>%{label}</b><br>"
+                "%{value:,} sessions · %{percent}<br>"
+                "%{customdata[0]}<br>"
+                "%{customdata[1]}"
+                "<extra></extra>"
             ),
             showlegend=False,
         )
@@ -1219,13 +1239,14 @@ def _render_traffic_contributors_card(
     rows: list[HearAboutCountRow],
     *,
     total_sessions: int | None,
+    delta_pct: float | None = None,
 ) -> None:
     """Traffic contributors card — GA4 top channel groups as a pie chart."""
     with st.container(border=True, key=_conversion_kpi_container_key("Traffic contributors (7d)")):
         _render_conversion_driver_headline(
             "Traffic contributors (7d)",
             _fmt_count(total_sessions),
-            delta_pct=None,
+            delta_pct=delta_pct,
         )
         fig = _traffic_contributors_pie_figure(rows)
         if fig is None:
@@ -1505,7 +1526,7 @@ def _render_conversion_drivers(
             "Bookings = calendar events by date added · "
             "Meetings = calendar events by start time · "
             "Signups = Sign Up Date in range with Committed? = Yes · "
-            "deltas vs prior 7d (bookings, meetings & signups)"
+            "deltas vs prior 7d (traffic, bookings, meetings & signups)"
         )
         row_top = st.columns(2, gap="medium")
         row_bottom = st.columns(2, gap="medium")
@@ -1528,6 +1549,7 @@ def _render_conversion_drivers(
             _render_traffic_contributors_card(
                 data.traffic_contributors,
                 total_sessions=data.total_sessions_7d,
+                delta_pct=data.total_sessions_7d_vs_prior_pct,
             )
         with row_top[1]:
             _render_conversion_driver_card(

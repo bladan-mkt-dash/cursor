@@ -61,6 +61,8 @@ class TrendSeries:
 class HearAboutCountRow:
     source: str
     count: int
+    prior_count: int | None = None
+    vs_prior_pct: float | None = None
 
 
 @dataclass
@@ -69,6 +71,7 @@ class ConversionDriversMetrics:
     period_until: str = ""
     traffic_contributors: list[HearAboutCountRow] = field(default_factory=list)
     total_sessions_7d: int | None = None
+    total_sessions_7d_vs_prior_pct: float | None = None
     bookings_by_source: list[HearAboutCountRow] = field(default_factory=list)
     meetings_by_source: list[HearAboutCountRow] = field(default_factory=list)
     committed_by_source: list[HearAboutCountRow] = field(default_factory=list)
@@ -1197,6 +1200,64 @@ def _rows_from_ghl_payload(rows: list[dict]) -> list[HearAboutCountRow]:
     ]
 
 
+def _traffic_contributor_rows(channels) -> list[HearAboutCountRow]:
+    """Top five GA4 channel groups by sessions plus an Other bucket."""
+    if channels.empty:
+        return []
+    top5 = channels.head(5)
+    rows: list[HearAboutCountRow] = [
+        HearAboutCountRow(
+            source=str(row["Session_default_channel_group"]),
+            count=int(row["Sessions"]),
+        )
+        for _, row in top5.iterrows()
+    ]
+    other_sessions = int(channels.iloc[5:]["Sessions"].sum()) if len(channels) > 5 else 0
+    if other_sessions > 0:
+        rows.append(HearAboutCountRow(source="Other", count=other_sessions))
+    return rows
+
+
+def _prior_count_for_traffic_row(
+    row: HearAboutCountRow,
+    *,
+    prior_by_channel: dict[str, int],
+    current_top_channels: set[str],
+) -> int:
+    if row.source == "Other":
+        return sum(
+            count for channel, count in prior_by_channel.items() if channel not in current_top_channels
+        )
+    return prior_by_channel.get(row.source, 0)
+
+
+def _enrich_traffic_contributors_with_prior(
+    rows: list[HearAboutCountRow],
+    prior_channels,
+) -> list[HearAboutCountRow]:
+    prior_by_channel = {
+        str(channel_row["Session_default_channel_group"]): int(channel_row["Sessions"])
+        for _, channel_row in prior_channels.iterrows()
+    }
+    current_top_channels = {row.source for row in rows if row.source != "Other"}
+    enriched: list[HearAboutCountRow] = []
+    for row in rows:
+        prior_count = _prior_count_for_traffic_row(
+            row,
+            prior_by_channel=prior_by_channel,
+            current_top_channels=current_top_channels,
+        )
+        enriched.append(
+            HearAboutCountRow(
+                source=row.source,
+                count=row.count,
+                prior_count=prior_count,
+                vs_prior_pct=_pct_vs_prior_period(float(row.count), float(prior_count)),
+            )
+        )
+    return enriched
+
+
 def load_conversion_drivers(*, as_of: date | None = None) -> ConversionDriversMetrics:
     """
     Discovery Call & Conversion Drivers — GA4 traffic contributors, GHL bookings,
@@ -1210,23 +1271,39 @@ def load_conversion_drivers(*, as_of: date | None = None) -> ConversionDriversMe
     try:
         from google_data import get_sessions_by_session_default_channel_group
 
+        prior_since, prior_until = _last_n_days_range(
+            as_of=today - timedelta(days=7),
+            days=7,
+        )
         channels = get_sessions_by_session_default_channel_group(since, until)
         if channels.empty:
             metrics.notes.append("GA4 returned no channel rows for traffic contributors.")
         else:
             metrics.total_sessions_7d = int(channels["Sessions"].sum())
-            top5 = channels.head(5)
-            rows: list[HearAboutCountRow] = [
-                HearAboutCountRow(
-                    source=str(row["Session_default_channel_group"]),
-                    count=int(row["Sessions"]),
+            rows = _traffic_contributor_rows(channels)
+            try:
+                prior_channels = get_sessions_by_session_default_channel_group(
+                    prior_since,
+                    prior_until,
                 )
-                for _, row in top5.iterrows()
-            ]
-            other_sessions = int(channels.iloc[5:]["Sessions"].sum()) if len(channels) > 5 else 0
-            if other_sessions > 0:
-                rows.append(HearAboutCountRow(source="Other", count=other_sessions))
-            metrics.traffic_contributors = rows
+                if prior_channels.empty:
+                    metrics.notes.append(
+                        "GA4 returned no channel rows for prior-7d traffic comparison."
+                    )
+                    metrics.traffic_contributors = rows
+                else:
+                    prior_total = int(prior_channels["Sessions"].sum())
+                    metrics.total_sessions_7d_vs_prior_pct = _pct_vs_prior_period(
+                        float(metrics.total_sessions_7d),
+                        float(prior_total),
+                    )
+                    metrics.traffic_contributors = _enrich_traffic_contributors_with_prior(
+                        rows,
+                        prior_channels,
+                    )
+            except Exception as prior_exc:
+                metrics.notes.append(f"GA4 prior-7d traffic: {prior_exc}")
+                metrics.traffic_contributors = rows
     except Exception as exc:
         metrics.errors.append(f"GA4 traffic: {exc}")
 

@@ -78,7 +78,7 @@ def get_credentials(*, allow_interactive: bool = False) -> Credentials:
 
     if not allow_interactive:
         raise RuntimeError(
-            "Google Tasks is not authorized. Run:\n  python auth_google_tasks.py\n"
+            "Google Tasks is not authorized. Run:\n  python3 auth_google_tasks.py\n"
             f"Token path: {TASKS_TOKEN_PATH}"
         )
 
