@@ -4,7 +4,7 @@ from __future__ import annotations
 
 # Bump when exports or loaders change — marketing_war_room.py reloads this module
 # when the revision differs (Streamlit caches imports across reruns).
-WAR_ROOM_DATA_REVISION = "2026-06-09-team-ops-status-labels-v13"
+WAR_ROOM_DATA_REVISION = "2026-06-12-team-ops-status-buckets-v14"
 
 import calendar
 import importlib
@@ -223,6 +223,15 @@ TEAM_OPS_CLOSED_STATUSES: frozenset[str] = frozenset(
     }
 )
 
+# Map board-specific Monday status labels onto the shared War Room summary buckets.
+TEAM_OPS_STATUS_TO_BUCKET: dict[str, str] = {
+    "request made": "Requested",
+    "for approval": "In Review",
+    "initiated": "Working On It",
+    "stuck": "Working On It",
+    "approved": "Ready for Publishing",
+}
+
 
 @dataclass
 class BoardTaskSummary:
@@ -428,6 +437,31 @@ def _google_daily_dict(df, *, value_col: str, dates: list[str]) -> dict[str, flo
         if day in out:
             out[day] += float(row[value_col])
     return out
+
+
+def _filter_meta_daily_rows(
+    daily_rows: list[dict],
+    since: str,
+    until: str,
+) -> list[dict]:
+    return [
+        row
+        for row in daily_rows
+        if since <= str(row.get("date_start") or "") <= until
+    ]
+
+
+def _sum_meta_metric(daily_rows: list[dict], metric: str) -> float:
+    total = 0.0
+    for row in daily_rows:
+        raw = row.get(metric)
+        if raw in (None, ""):
+            continue
+        try:
+            total += float(raw)
+        except (TypeError, ValueError):
+            continue
+    return total
 
 
 def _meta_daily_dict(daily_rows: list[dict], *, value_key: str, dates: list[str]) -> dict[str, float]:
@@ -704,6 +738,20 @@ def _is_open_team_ops_status(status: str) -> bool:
     return (status or "").strip().casefold() not in TEAM_OPS_CLOSED_STATUSES
 
 
+def canonical_team_ops_bucket(status: str) -> str | None:
+    """Normalize a board-specific status label to a War Room summary bucket."""
+    raw = (status or "").strip()
+    if not raw or raw.casefold() == "no status":
+        return None
+    mapped = TEAM_OPS_STATUS_TO_BUCKET.get(raw.casefold())
+    if mapped:
+        return mapped
+    for bucket in TEAM_OPS_SUMMARY_BUCKETS:
+        if bucket.casefold() == raw.casefold():
+            return bucket
+    return None
+
+
 def _open_team_ops_tasks(df):
     if df.empty or "status" not in df.columns:
         return df
@@ -732,8 +780,16 @@ def _status_sort_key(status: str) -> tuple[int, str]:
 def _count_tasks_by_status(df) -> list[StatusCountRow]:
     if df.empty or "status" not in df.columns:
         return []
-    counts = df["status"].value_counts()
-    rows = [StatusCountRow(status=str(label), count=int(count)) for label, count in counts.items()]
+    bucket_counts = {bucket: 0 for bucket in TEAM_OPS_SUMMARY_BUCKETS}
+    for raw_status in df["status"]:
+        bucket = canonical_team_ops_bucket(str(raw_status))
+        if bucket:
+            bucket_counts[bucket] += 1
+    rows = [
+        StatusCountRow(status=bucket, count=count)
+        for bucket, count in bucket_counts.items()
+        if count > 0
+    ]
     return sorted(rows, key=lambda row: _status_sort_key(row.status))
 
 
@@ -748,7 +804,8 @@ def _task_names_for_bucket(df, bucket: str) -> list[str]:
     target = bucket.strip().casefold()
     names: list[str] = []
     for raw_status, name in zip(df["status"], df["name"], strict=False):
-        if (str(raw_status or "").strip().casefold() == target) and str(name).strip():
+        mapped = canonical_team_ops_bucket(str(raw_status))
+        if mapped and mapped.casefold() == target and str(name).strip():
             names.append(str(name).strip())
     return sorted(names)
 
@@ -802,8 +859,8 @@ def load_team_ops(*, as_of: date | None = None) -> TeamOpsMetrics:
 
         metrics.boards = summaries
         for board in summaries:
+            metrics.total_open += len(board.tasks_by_bucket.get("Open", []))
             for row in board.by_status:
-                metrics.total_open += row.count
                 status_key = row.status.strip().casefold()
                 if status_key == "requested":
                     metrics.total_requested += row.count
@@ -815,7 +872,7 @@ def load_team_ops(*, as_of: date | None = None) -> TeamOpsMetrics:
                     metrics.total_ready_for_publishing += row.count
         metrics.notes.append(
             "Open tasks by current workflow Status (excludes Done/Published) · "
-            "Status column, not Priority."
+            "Board-specific labels mapped to shared buckets (e.g. Request Made → Requested)."
         )
     except Exception as exc:
         metrics.errors.append(f"Monday.com: {exc}")
@@ -886,25 +943,35 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
     try:
         from meta_client import fetch_account_daily_insights
 
-        meta = fetch_account_daily_insights(since=prior_since, until=today_iso)
-        meta_daily = meta["daily"]
-        meta_mtd = fetch_account_daily_insights(since=month_start_iso, until=today_iso)
-        meta_month_daily = meta_mtd["daily"]
-        meta_mtd_spend = meta_mtd["totals"]["spend"]
-        meta_ytd = fetch_account_daily_insights(since=year_start_iso, until=today_iso)
-        meta_ytd_daily = meta_ytd["daily"]
-        meta_ytd_spend = meta_ytd["totals"]["spend"]
-        meta_prior_mtd = fetch_account_daily_insights(
-            since=prior_mtd_since,
-            until=prior_mtd_until,
+        meta_since = min(
+            prior_since,
+            prior_mtd_since,
+            prior_ytd_since,
+            year_start_iso,
         )
-        meta_prior_mtd_spend = meta_prior_mtd["totals"]["spend"]
-        meta_prior_ytd = fetch_account_daily_insights(
-            since=prior_ytd_since,
-            until=prior_ytd_until,
+        meta_all = fetch_account_daily_insights(since=meta_since, until=today_iso)
+        all_meta_daily = meta_all["daily"]
+        meta_daily = _filter_meta_daily_rows(all_meta_daily, prior_since, today_iso)
+        meta_month_daily = _filter_meta_daily_rows(
+            all_meta_daily, month_start_iso, today_iso
         )
-        meta_prior_ytd_spend = meta_prior_ytd["totals"]["spend"]
+        meta_mtd_spend = _sum_meta_metric(meta_month_daily, "spend")
+        meta_ytd_daily = _filter_meta_daily_rows(all_meta_daily, year_start_iso, today_iso)
+        meta_ytd_spend = _sum_meta_metric(meta_ytd_daily, "spend")
+        meta_prior_mtd_daily = _filter_meta_daily_rows(
+            all_meta_daily, prior_mtd_since, prior_mtd_until
+        )
+        meta_prior_mtd_spend = _sum_meta_metric(meta_prior_mtd_daily, "spend")
+        meta_prior_ytd_daily = _filter_meta_daily_rows(
+            all_meta_daily, prior_ytd_since, prior_ytd_until
+        )
+        meta_prior_ytd_spend = _sum_meta_metric(meta_prior_ytd_daily, "spend")
+        partial = meta_all.get("partial_errors") or []
         metrics.notes.append("Meta daily totals may lag until the day completes.")
+        if partial:
+            metrics.notes.append(
+                f"Meta partial data ({len(partial)} chunk(s) failed); totals may be low."
+            )
     except Exception as exc:
         metrics.errors.append(f"Meta: {exc}")
 

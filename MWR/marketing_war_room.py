@@ -1,5 +1,5 @@
 """
-Marketing War Room — single-screen operational pulse.
+Marketing Pulse — single-screen operational pulse.
 
 Run (from this folder):
   streamlit run marketing_war_room.py
@@ -31,6 +31,7 @@ from __future__ import annotations
 import html
 import pickle
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -78,7 +79,7 @@ from ghl_client import HEAR_ABOUT_US_FIELD_NAME  # noqa: E402 — after war_room
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 # Bump when loader logic changes — invalidates @st.cache_data without a server restart.
-WAR_ROOM_LOADER_VERSION = "2026-06-12-traffic-hover-only-v20"
+WAR_ROOM_LOADER_VERSION = "2026-06-12-meta-rate-limit-hardening-v23"
 
 SPARKLINE_HEIGHT_PX = 44
 
@@ -1398,10 +1399,66 @@ def _resolve_data_source(
     return empty_factory()
 
 
+_DATA_SOURCE_LABELS: dict[str, str] = {key: label for key, label, _ in _DATA_SOURCE_SPECS}
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _load_alerts(_loader_version: str = WAR_ROOM_LOADER_VERSION) -> AlertsMetrics:
     """Google Tasks — overdue, due today, and due soon."""
     return _cache_safe_metrics(load_alerts())
+
+
+_WAR_ROOM_LOAD_SPECS: tuple[
+    tuple[str, Callable[[], object], Callable[[], object]], ...
+] = (
+    ("command_strip", _load_command_strip, CommandStripMetrics),
+    ("conversion_drivers", _load_conversion_drivers, ConversionDriversMetrics),
+    ("paid_media", _load_paid_media, PaidMediaMetrics),
+    ("crm_funnel", _load_crm_funnel, CrmFunnelMetrics),
+    ("website_traffic", _load_website_traffic, WebsiteTrafficMetrics),
+    ("organic_social", _load_organic_social, OrganicSocialMetrics),
+    ("content_seo", _load_content_seo, ContentSeoMetrics),
+    ("alerts", _load_alerts, AlertsMetrics),
+    ("team_ops", _load_team_ops, TeamOpsMetrics),
+)
+
+
+def _load_war_room_metrics(status_slot: object | None = None) -> dict[str, object]:
+    """Fetch enabled sources in parallel; reuse snapshots for skipped sources."""
+    _init_data_source_prefs()
+    snapshots: dict[str, object] = st.session_state.war_room_data_snapshots
+    results: dict[str, object] = {}
+    pending: list[tuple[str, Callable[[], object], Callable[[], object]]] = []
+
+    for key, loader, empty_factory in _WAR_ROOM_LOAD_SPECS:
+        if _data_source_enabled(key):
+            pending.append((key, loader, empty_factory))
+            continue
+        snapshot = _load_data_snapshot(snapshots, key)
+        results[key] = snapshot if snapshot is not None else empty_factory()
+
+    if not pending:
+        return results
+
+    workers = min(len(pending), 8)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        future_map = {
+            pool.submit(loader): (key, empty_factory)
+            for key, loader, empty_factory in pending
+        }
+        for future in as_completed(future_map):
+            key, empty_factory = future_map[future]
+            try:
+                data = future.result()
+            except Exception:
+                data = empty_factory()
+            _store_data_snapshot(snapshots, key, data)
+            results[key] = data
+            if status_slot is not None:
+                label = _DATA_SOURCE_LABELS.get(key, key)
+                status_slot.write(f"Loaded {label}")
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -1415,7 +1472,7 @@ def _render_header(last_refresh: datetime) -> None:
     st.markdown(
         f"""
         <div class="war-room-header">
-            <h1>Marketing War Room</h1>
+            <h1>Marketing Pulse</h1>
             <div class="war-room-status">
                 Last refresh · {ts}<br>
                 2-column pulse · 9 panels live
@@ -1958,7 +2015,7 @@ def _render_alerts(data: AlertsMetrics) -> None:
 
 def main() -> None:
     st.set_page_config(
-        page_title="Marketing War Room",
+        page_title="Marketing Pulse",
         layout="wide",
         page_icon="🎯",
         initial_sidebar_state="collapsed",
@@ -1966,7 +2023,7 @@ def main() -> None:
     _inject_styles()
 
     with st.sidebar:
-        st.header("War Room controls")
+        st.header("Marketing Pulse controls")
         _render_data_source_controls()
         refresh_minutes = st.selectbox("Auto-refresh interval", [0, 5, 15, 30], index=0, format_func=lambda m: "Off" if m == 0 else f"{m} min")
         if st.button("Refresh now", type="primary", use_container_width=True):
@@ -1982,26 +2039,19 @@ def main() -> None:
 
     col_main, col_side = st.columns([2, 1], gap="medium")
 
-    with st.spinner("Loading War Room…"):
-        command = _resolve_data_source(
-            "command_strip", _load_command_strip, CommandStripMetrics
-        )
-        conversion = _resolve_data_source(
-            "conversion_drivers", _load_conversion_drivers, ConversionDriversMetrics
-        )
-        paid = _resolve_data_source("paid_media", _load_paid_media, PaidMediaMetrics)
-        crm = _resolve_data_source("crm_funnel", _load_crm_funnel, CrmFunnelMetrics)
-        traffic = _resolve_data_source(
-            "website_traffic", _load_website_traffic, WebsiteTrafficMetrics
-        )
-        organic = _resolve_data_source(
-            "organic_social", _load_organic_social, OrganicSocialMetrics
-        )
-        content = _resolve_data_source(
-            "content_seo", _load_content_seo, ContentSeoMetrics
-        )
-        alerts = _resolve_data_source("alerts", _load_alerts, AlertsMetrics)
-        team = _resolve_data_source("team_ops", _load_team_ops, TeamOpsMetrics)
+    with st.status("Loading Marketing Pulse…", expanded=True) as load_status:
+        metrics = _load_war_room_metrics(status_slot=load_status)
+        load_status.update(label="Marketing Pulse data loaded", state="complete", expanded=False)
+
+    command = metrics["command_strip"]  # type: ignore[assignment]
+    conversion = metrics["conversion_drivers"]  # type: ignore[assignment]
+    paid = metrics["paid_media"]  # type: ignore[assignment]
+    crm = metrics["crm_funnel"]  # type: ignore[assignment]
+    traffic = metrics["website_traffic"]  # type: ignore[assignment]
+    organic = metrics["organic_social"]  # type: ignore[assignment]
+    content = metrics["content_seo"]  # type: ignore[assignment]
+    alerts = metrics["alerts"]  # type: ignore[assignment]
+    team = metrics["team_ops"]  # type: ignore[assignment]
 
     with col_main:
         with st.container(key="war-room-scroll-main"):

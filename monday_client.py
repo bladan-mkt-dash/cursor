@@ -255,10 +255,72 @@ def build_column_map(columns: list[dict[str, Any]]) -> dict[str, str | None]:
     }
 
 
+def status_labels_from_settings(settings_str: str | None) -> dict[str, str]:
+    """Map Monday status index (as str) to its display label from column settings."""
+    if not settings_str:
+        return {}
+    try:
+        settings = json.loads(settings_str) if isinstance(settings_str, str) else settings_str
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(settings, dict):
+        return {}
+    labels = settings.get("labels")
+    if not isinstance(labels, dict):
+        return {}
+    return {
+        str(index): str(label).strip()
+        for index, label in labels.items()
+        if label not in (None, "")
+    }
+
+
+def parse_status_column_value(
+    column_value: dict[str, Any] | None,
+    labels_map: dict[str, str],
+) -> str:
+    """Resolve workflow status text/index to a board-defined label."""
+    if not column_value:
+        return ""
+
+    text = (column_value.get("text") or "").strip()
+    raw = column_value.get("value")
+    parsed: Any = None
+    if raw not in (None, "", "null"):
+        if isinstance(raw, dict):
+            parsed = raw
+        elif isinstance(raw, str):
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                parsed = None
+
+    label = ""
+    index: str | None = None
+    if isinstance(parsed, dict):
+        raw_label = parsed.get("label")
+        if raw_label not in (None, ""):
+            label = str(raw_label).strip()
+        if parsed.get("index") is not None:
+            index = str(parsed["index"])
+
+    if label:
+        return label
+    if index is not None and index in labels_map:
+        return labels_map[index]
+    if text:
+        if text in labels_map:
+            return labels_map[text]
+        if not text.isdigit():
+            return text
+    return ""
+
+
 def parse_column_value(column_value: dict[str, Any]) -> str:
     """Extract a display string from a Monday column_values entry."""
     text = (column_value.get("text") or "").strip()
-    if text:
+    col_type = (column_value.get("type") or "").casefold()
+    if text and col_type != "status":
         return text
 
     raw = column_value.get("value")
@@ -273,9 +335,7 @@ def parse_column_value(column_value: dict[str, Any]) -> str:
             return raw.strip()
 
     if not isinstance(parsed, dict):
-        return str(parsed).strip()
-
-    col_type = (column_value.get("type") or "").casefold()
+        return str(parsed).strip() if col_type != "status" else (text if text and not text.isdigit() else "")
 
     if col_type == "date":
         d = parsed.get("date") or parsed.get("time")
@@ -293,8 +353,12 @@ def parse_column_value(column_value: dict[str, Any]) -> str:
         return ", ".join(names)
 
     if col_type == "status":
-        label = parsed.get("label") or parsed.get("index")
-        return str(label).strip() if label is not None else ""
+        label = parsed.get("label")
+        if label not in (None, ""):
+            return str(label).strip()
+        if text and not text.isdigit():
+            return text
+        return ""
 
     for key in ("label", "text", "value", "name"):
         val = parsed.get(key)
@@ -329,6 +393,7 @@ def item_to_row(
     board_name: str,
     column_map: dict[str, str | None],
     column_titles: dict[str, str],
+    status_labels: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Convert a Monday item payload into a flat, DataFrame-friendly row."""
     values_by_id: dict[str, dict[str, Any]] = {}
@@ -336,12 +401,19 @@ def item_to_row(
         if isinstance(cv, dict) and cv.get("id"):
             values_by_id[str(cv["id"])] = cv
 
+    status_col_id = column_map.get("status")
+    labels_map = status_labels or {}
+
     def _value_for(role: str) -> str:
         col_id = column_map.get(role)
         if not col_id:
             return ""
         cv = values_by_id.get(col_id)
-        return parse_column_value(cv) if cv else ""
+        if not cv:
+            return ""
+        if role == "status" and labels_map:
+            return parse_status_column_value(cv, labels_map)
+        return parse_column_value(cv)
 
     status = _value_for("status")
     assignee = _value_for("assignee")
@@ -469,6 +541,13 @@ def fetch_board_items(
     columns = [c for c in (board.get("columns") or []) if isinstance(c, dict)]
     column_map = build_column_map(columns)
     column_titles = {str(c["id"]): str(c.get("title") or "") for c in columns if c.get("id")}
+    status_col_id = column_map.get("status")
+    status_labels: dict[str, str] = {}
+    if status_col_id:
+        for col in columns:
+            if str(col.get("id")) == status_col_id:
+                status_labels = status_labels_from_settings(col.get("settings_str"))
+                break
 
     rows: list[dict[str, Any]] = []
     page = board.get("items_page") or {}
@@ -482,6 +561,7 @@ def fetch_board_items(
                     board_name=resolved_name,
                     column_map=column_map,
                     column_titles=column_titles,
+                    status_labels=status_labels,
                 )
             )
 
@@ -501,6 +581,7 @@ def fetch_board_items(
                         board_name=resolved_name,
                         column_map=column_map,
                         column_titles=column_titles,
+                        status_labels=status_labels,
                     )
                 )
         pages += 1

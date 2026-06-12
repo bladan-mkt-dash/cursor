@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +18,7 @@ load_dotenv(_PROJECT_DIR / ".env")
 
 GRAPH_API_VERSION = "v21.0"
 BASE_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
+_GRAPH_MAX_RETRIES = 5
 
 
 @dataclass
@@ -47,17 +49,64 @@ def _access_token() -> str:
     )
 
 
-def _graph(path: str, params: dict[str, Any], *, timeout: int = 60) -> dict[str, Any]:
-    response = requests.get(f"{BASE_URL}/{path.lstrip('/')}", params=params, timeout=timeout)
+def _graph_error_message(response: requests.Response) -> str:
+    if response.status_code == 429:
+        return "Meta rate limit (HTTP 429). Too many Graph API calls — retry shortly."
+    text = (response.text or "").strip()
+    if text.startswith("<!DOCTYPE") or text.startswith("<html"):
+        return (
+            f"Meta returned an HTML error page (HTTP {response.status_code}). "
+            "Usually a temporary outage or rate limit."
+        )
     try:
         payload = response.json()
     except ValueError:
-        payload = {}
-    if not response.ok:
-        raise RuntimeError(f"HTTP {response.status_code}\n{response.text}")
+        return f"HTTP {response.status_code}: {text[:300]}"
     if payload.get("error"):
-        raise RuntimeError(json.dumps(payload["error"]))
-    return payload
+        return json.dumps(payload["error"])
+    return f"HTTP {response.status_code}: {text[:300]}"
+
+
+def _is_retryable_graph_response(response: requests.Response) -> bool:
+    if response.status_code in (429, 500, 502, 503, 504):
+        return True
+    text = (response.text or "").strip()
+    return text.startswith("<!DOCTYPE") or text.startswith("<html")
+
+
+def _graph(path: str, params: dict[str, Any], *, timeout: int = 60) -> dict[str, Any]:
+    from meta_client import _META_API_LOCK
+
+    url = f"{BASE_URL}/{path.lstrip('/')}"
+    last_error = "Meta Graph request failed"
+    for attempt in range(_GRAPH_MAX_RETRIES):
+        with _META_API_LOCK:
+            response = requests.get(url, params=params, timeout=timeout)
+        if response.ok:
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                last_error = _graph_error_message(response)
+                if attempt + 1 < _GRAPH_MAX_RETRIES:
+                    time.sleep(min(60, 2**attempt * (3 if response.status_code == 429 else 1)))
+                    continue
+                raise RuntimeError(last_error) from exc
+            if payload.get("error"):
+                last_error = json.dumps(payload["error"])
+                code = payload["error"].get("code") if isinstance(payload["error"], dict) else None
+                if attempt + 1 < _GRAPH_MAX_RETRIES and code in {1, 2, 4, 17, 32, 613}:
+                    time.sleep(min(60, 2**attempt * 2))
+                    continue
+                raise RuntimeError(last_error)
+            return payload
+
+        last_error = _graph_error_message(response)
+        if attempt + 1 < _GRAPH_MAX_RETRIES and _is_retryable_graph_response(response):
+            time.sleep(min(60, 2**attempt * (3 if response.status_code == 429 else 1)))
+            continue
+        raise RuntimeError(last_error)
+
+    raise RuntimeError(last_error)
 
 
 def _epoch_seconds(day: date, *, end_of_day: bool = False) -> int:
@@ -88,59 +137,127 @@ def _truncate_caption(text: str | None, *, limit: int = 72) -> str | None:
     return cleaned[: limit - 1].rstrip() + "…"
 
 
+def _env_page_access_token() -> str:
+    return (
+        os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN")
+        or os.getenv("META_PAGE_ACCESS_TOKEN")
+        or ""
+    ).strip()
+
+
+def _fetch_page_details(
+    page_id: str,
+    access_token: str,
+) -> tuple[str, str, str | None]:
+    """
+    Load Page name, access token, and linked IG user id via GET /{page-id}.
+
+    Meta sometimes omits ``access_token`` on ``/me/accounts`` rows (common with
+    system-user tokens); this endpoint is the reliable fallback.
+    """
+    payload = _graph(
+        page_id,
+        {
+            "fields": "access_token,name,instagram_business_account",
+            "access_token": access_token,
+        },
+    )
+    page_token = str(payload.get("access_token") or "").strip()
+    page_name = str(payload.get("name") or "").strip()
+    ig_id = str((payload.get("instagram_business_account") or {}).get("id") or "").strip()
+    return page_token, page_name, ig_id or None
+
+
+def _choose_page_from_accounts(
+    pages: list[dict[str, Any]],
+    *,
+    page_pref: str | None,
+) -> dict[str, Any] | None:
+    for page in pages:
+        name = (page.get("name") or "").lower()
+        if "five journeys" in name or "fivejourneys" in name:
+            return page
+
+    if page_pref:
+        for page in pages:
+            if str(page.get("id")) == page_pref:
+                return page
+
+    return pages[0] if pages else None
+
+
 def resolve_instagram_context(access_token: str) -> tuple[str, str, str, str]:
     """
     Return ``(ig_user_id, page_id, page_token, page_name)``.
 
     Prefers a Page whose name contains "five journeys", then ``FACEBOOK_PAGE_ID``,
-    then the first Page returned.
+    then the first Page returned. When ``/me/accounts`` omits ``access_token``,
+    falls back to GET /{page-id} or ``FACEBOOK_PAGE_ACCESS_TOKEN`` in .env.
     """
     page_pref = (os.getenv("FACEBOOK_PAGE_ID") or "").strip() or None
-    payload = _graph(
-        "me/accounts",
-        {"fields": "id,name,access_token", "limit": 200, "access_token": access_token},
-    )
-    pages: list[dict[str, Any]] = payload.get("data") or []
-    if not pages:
-        raise RuntimeError("No Facebook Pages returned for this Meta token.")
+    ig_pref = (os.getenv("INSTAGRAM_BUSINESS_ACCOUNT_ID") or "").strip() or None
+    page_token_env = _env_page_access_token()
 
-    chosen: dict[str, Any] | None = None
-    for page in pages:
-        name = (page.get("name") or "").lower()
-        if "five journeys" in name or "fivejourneys" in name:
-            chosen = page
-            break
+    if page_pref and page_token_env and ig_pref:
+        return ig_pref, page_pref, page_token_env, page_pref
 
-    if chosen is None and page_pref:
-        for page in pages:
-            if str(page.get("id")) == page_pref:
-                chosen = page
-                break
+    pages: list[dict[str, Any]] = []
+    try:
+        payload = _graph(
+            "me/accounts",
+            {"fields": "id,name,access_token", "limit": 200, "access_token": access_token},
+        )
+        pages = payload.get("data") or []
+    except Exception:
+        pages = []
 
-    if chosen is None:
-        chosen = pages[0]
+    chosen = _choose_page_from_accounts(pages, page_pref=page_pref)
+    page_id = str((chosen or {}).get("id") or page_pref or "").strip()
+    page_token = str((chosen or {}).get("access_token") or "").strip()
+    page_name = str((chosen or {}).get("name") or "").strip()
 
-    page_id = str(chosen.get("id") or "").strip()
-    page_token = str(chosen.get("access_token") or "").strip()
-    page_name = str(chosen.get("name") or "").strip()
-    if not page_id or not page_token:
-        raise RuntimeError("Could not read Page id/access_token from /me/accounts.")
+    if not page_id:
+        raise RuntimeError(
+            "No Facebook Pages returned for this Meta token. "
+            "Set FACEBOOK_PAGE_ID in .env or grant pages_show_list on the token."
+        )
 
-    ig_payload = _graph(
-        page_id,
-        {"fields": "instagram_business_account", "access_token": page_token},
-    )
-    ig_id = str((ig_payload.get("instagram_business_account") or {}).get("id") or "").strip()
+    ig_id = ig_pref or None
+    if not page_token or page_token_env:
+        fetched_token, fetched_name, fetched_ig = _fetch_page_details(page_id, access_token)
+        if fetched_token:
+            page_token = fetched_token
+        elif page_token_env:
+            page_token = page_token_env
+        if fetched_name:
+            page_name = fetched_name
+        if fetched_ig:
+            ig_id = fetched_ig
+
+    if not page_token:
+        # Some tokens can call Instagram Graph endpoints directly.
+        page_token = access_token
+
+    if not page_token:
+        raise RuntimeError(
+            "Could not read Page access token. Set FACEBOOK_PAGE_ACCESS_TOKEN in .env "
+            "or ensure the Meta token can access FACEBOOK_PAGE_ID."
+        )
+
     if not ig_id:
-        fallback = (os.getenv("INSTAGRAM_BUSINESS_ACCOUNT_ID") or "").strip()
-        if fallback:
-            ig_id = fallback
+        ig_payload = _graph(
+            page_id,
+            {"fields": "instagram_business_account", "access_token": page_token},
+        )
+        ig_id = str((ig_payload.get("instagram_business_account") or {}).get("id") or "").strip()
+
     if not ig_id:
         raise RuntimeError(
             "No linked Instagram business account. Link IG to the Facebook Page or set "
             "INSTAGRAM_BUSINESS_ACCOUNT_ID in .env."
         )
-    return ig_id, page_id, page_token, page_name
+
+    return ig_id, page_id, page_token, page_name or page_id
 
 
 def _fetch_daily_insight_values(
@@ -211,7 +328,6 @@ def _fetch_media_in_range(
     until_dt = datetime.combine(until, datetime.max.time(), tzinfo=timezone.utc)
 
     fields = "id,caption,timestamp,like_count,comments_count"
-    url: str | None = None
     params: dict[str, Any] = {
         "fields": fields,
         "limit": 100,
@@ -219,21 +335,13 @@ def _fetch_media_in_range(
     }
     matched: list[dict[str, Any]] = []
     scanned = 0
+    after: str | None = None
 
     while scanned < max_scan:
-        if url:
-            response = requests.get(url, timeout=60)
-        else:
-            response = requests.get(
-                f"{BASE_URL}/{ig_user_id}/media",
-                params=params,
-                timeout=60,
-            )
-        if not response.ok:
-            raise RuntimeError(f"HTTP {response.status_code}\n{response.text}")
-        data = response.json()
-        if data.get("error"):
-            raise RuntimeError(json.dumps(data["error"]))
+        page_params = dict(params)
+        if after:
+            page_params["after"] = after
+        data = _graph(f"{ig_user_id}/media", page_params, timeout=60)
 
         batch = data.get("data") or []
         scanned += len(batch)
@@ -248,12 +356,13 @@ def _fetch_media_in_range(
             if since_dt <= ts <= until_dt:
                 matched.append(media)
 
-        next_url = (data.get("paging") or {}).get("next")
-        if not next_url:
+        paging = data.get("paging") if isinstance(data.get("paging"), dict) else {}
+        cursors = paging.get("cursors") if isinstance(paging.get("cursors"), dict) else {}
+        after = str(cursors.get("after") or "").strip() or None
+        if not after:
             break
         if oldest_in_batch and oldest_in_batch < since_dt:
             break
-        url = str(next_url)
 
     return matched
 
