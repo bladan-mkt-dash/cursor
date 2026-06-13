@@ -1,0 +1,17 @@
+---
+description: Work Week In Review report uses Sunday–Friday date windows
+globs: Op Reports/work_week_in_review.py
+alwaysApply: false
+---
+
+# Work Week In Review
+
+When running `Op Reports/work_week_in_review.py`:
+
+- **Current period** always starts on **Sunday** and ends on the report end date (Friday on Saturday runs; today on Sun–Fri runs).
+- **Prior period** is the **previous Sunday–Friday**, with the same day-count when the current week is partial.
+- Run from the `Op Reports` folder: `python3 work_week_in_review.py`
+- Optional override: `python3 work_week_in_review.py --end YYYY-MM-DD`
+- Do **not** use trailing `--days` windows; the script encodes Sun–Fri logic.
+
+Example (end Friday 2026-06-12): current `2026-06-07 .. 2026-06-12`, prior `2026-05-31 .. 2026-06-05`.
