@@ -49,16 +49,21 @@ def _inject_styles() -> None:
     st.markdown(
         """
         <style>
-        .block-container { padding-top: 1.5rem; max-width: 1400px; }
+        .block-container { padding-top: 1.5rem; max-width: 100%; }
         [data-testid="stMetric"] {
             background: white;
             border-radius: 12px;
-            padding: 0.75rem 1rem;
+            padding: 0.5rem 0.6rem;
             box-shadow: 0 1px 3px rgba(38,69,64,0.08);
             border: 1px solid rgba(93,166,138,0.15);
         }
-        [data-testid="stMetricLabel"] { color: #264540; font-weight: 600; }
-        [data-testid="stMetricValue"] { color: #5DA68A; }
+        [data-testid="stMetricLabel"] {
+            color: #264540;
+            font-weight: 600;
+            font-size: 0.72rem;
+            white-space: nowrap;
+        }
+        [data-testid="stMetricValue"] { color: #5DA68A; font-size: 1.05rem; }
         h5 { color: #264540; margin-top: 1rem !important; }
         [data-testid="stSidebar"] { background: #f7fbff; }
         </style>
@@ -132,13 +137,15 @@ def _line_chart(df: pd.DataFrame, y_cols: list[str], title: str, y_label: str) -
 
 
 def _cpl_over_time_chart(monthly: pd.DataFrame) -> go.Figure | None:
-    """Monthly CPL (spend ÷ leads) for the current filter selection."""
+    """Monthly CPL (spend / leads) for the current filter selection."""
     if monthly.empty:
         return None
 
     plot_df = monthly.copy()
     plot_df["cpl"] = plot_df.apply(
-        lambda r: r["spend"] / r["leads"] if r["leads"] and r["leads"] > 0 else pd.NA,
+        lambda r: r["spend"] / r["leads"]
+        if r["leads"] and r["leads"] > 0
+        else pd.NA,
         axis=1,
     )
     plot_df["month_label"] = plot_df["month"].dt.strftime("%b %Y")
@@ -168,7 +175,10 @@ def _cpl_over_time_chart(monthly: pd.DataFrame) -> go.Figure | None:
     fig.update_traces(
         line=dict(width=2.5, color=COLORS["2024"]),
         marker=dict(size=7),
-        hovertemplate="%{x}<br>CPL: $%{y:,.2f}<extra></extra>",
+        hovertemplate=(
+            "%{x}<br>CPL: $%{y:,.2f}<br>Leads: %{customdata[0]:,.0f}<extra></extra>"
+        ),
+        customdata=plot_df[["leads"]].values,
     )
     return fig
 
@@ -240,9 +250,13 @@ def _scorecard_leads_total(
     lead_summary: dict[str, int],
 ) -> float:
     """
-    Headline lead count: all new GHL contacts when both channels and all campaigns
-    are in view; channel totals for a single channel; otherwise allocated row sum.
+    Headline lead count from filtered rows (sheet baseline + live GHL), with GHL
+    summary totals as fallback when row sums are empty.
     """
+    row_leads = float(df["leads"].sum())
+    if row_leads > 0:
+        return row_leads
+
     all_channels_selected = set(selected_channels) >= set(all_channels)
     all_campaigns_selected = (
         len(selected_campaigns) == len(campaign_pool) if campaign_pool else True
@@ -253,12 +267,7 @@ def _scorecard_leads_total(
         if selected_channels == [CHANNEL_META]:
             return float(lead_summary.get("meta_leads") or 0)
         if all_channels_selected and len(all_channels) > 1:
-            total = float(lead_summary.get("total_new_contacts") or 0)
-            if total > 0:
-                return total
-    row_leads = float(df["leads"].sum())
-    if row_leads > 0:
-        return row_leads
+            return float(lead_summary.get("total_new_contacts") or 0)
     return float(lead_summary.get("total_new_contacts") or 0)
 
 
@@ -305,11 +314,30 @@ def _weighted_scorecard_metrics(
 @st.cache_data(ttl=86400, show_spinner=False)
 def _load_data(
     since: str, until: str
-) -> tuple[pd.DataFrame, tuple[str, ...], dict[str, int], pd.DataFrame]:
-    df, notes, lead_summary, conv_by_level = load_live_campaign_data(
-        since=since, until=until
+) -> tuple[
+    pd.DataFrame,
+    tuple[str, ...],
+    dict[str, int],
+    pd.DataFrame,
+    pd.DataFrame,
+    frozenset[pd.Timestamp],
+]:
+    (
+        df,
+        notes,
+        lead_summary,
+        conv_by_level,
+        unallocated_conv,
+        sheet_months,
+    ) = load_live_campaign_data(since=since, until=until)
+    return (
+        df,
+        tuple(notes),
+        lead_summary,
+        conv_by_level,
+        unallocated_conv,
+        frozenset(sheet_months),
     )
-    return df, tuple(notes), lead_summary, conv_by_level
 
 
 def main() -> None:
@@ -323,12 +351,13 @@ def main() -> None:
     st.title("Digital Channel Dashboard")
     st.caption(
         "Live data from **Google Ads**, **Meta**, and **GoHighLevel**. "
-        "Leads = new GHL contacts (Meta: meta lead tag / Meta pixel; "
-        "Google: dc thru g-ad tag / Google Tag). "
+        "Leads through Jun 2025 use **Digital Channel Dashboard 2024-25** Data tab; "
+        "later months use GHL (meta lead tag / pixel; Google tag). "
         "**First load** for a wide date range can take a few minutes while GHL "
         "lead data is pulled day-by-day; **repeat loads use cache** and are much faster. "
-        "**New patients** use GHL **Committed?** = Yes, **Sign Up Date** (by month), and "
-        "**Membership Level** (slicer)."
+        "**Signups** through Aug 2025: **GRAND TOTAL New Members** from Digital Cross-Channel "
+        "Tracker sheets; from Sep 2025: GHL **Committed?** = Yes + **Sign Up Date**, with "
+        "**Membership Level** slicer (sheet months ignore membership filter)."
     )
 
     today = date.today()
@@ -351,6 +380,13 @@ def main() -> None:
             st.error("Start date must be on or before end date.")
             st.stop()
 
+        st.markdown("**Refresh**")
+        if st.button(
+            "Design only",
+            help="Reload layout and styles only. Uses cached data — no Google Ads, Meta, or GHL calls.",
+        ):
+            st.rerun()
+
         if st.button("Refresh data", help="Reload ads + GHL. Keeps cached GHL daily lead files."):
             _load_data.clear()
             st.rerun()
@@ -369,7 +405,7 @@ def main() -> None:
     )
     with st.spinner(load_label):
         try:
-            raw_df, notes, lead_summary, conv_by_level_df = _load_data(
+            raw_df, notes, lead_summary, conv_by_level_df, unallocated_conv_df, sheet_months = _load_data(
                 since.isoformat(), until.isoformat()
             )
         except Exception as exc:
@@ -427,8 +463,8 @@ def main() -> None:
             membership_options,
             default=membership_options,
             help=(
-                "New patients (conversions): GHL Committed? = Yes, Sign Up Date in range, "
-                "filtered by Membership Level (Standard, Silver, Gold, Platinum)."
+                "Signups from Sep 2025: GHL Committed? = Yes, Sign Up Date in range, "
+                "filtered by Membership Level. Pre-Sep 2025 uses tracker sheet totals."
             ),
         )
         if not selected_membership_levels:
@@ -447,7 +483,11 @@ def main() -> None:
 
     df = raw_df.loc[mask].copy()
     df = apply_membership_conversion_filter(
-        df, conv_by_level_df, selected_membership_levels
+        df,
+        conv_by_level_df,
+        selected_membership_levels,
+        unallocated_conv_df=unallocated_conv_df,
+        sheet_signup_months=set(sheet_months),
     )
     monthly = monthly_campaign_summary(df)
     scores = _weighted_scorecard_metrics(
@@ -459,30 +499,17 @@ def main() -> None:
         lead_summary=lead_summary,
     )
 
-    st.markdown("##### Paid media performance")
     _metric_row(
         [
             ("Spend", _fmt_currency(scores["spend"])),
             ("Clicks", _fmt_int(scores["clicks"])),
             ("Cost per click", _fmt_currency(scores["cpc"])),
-        ],
-    )
-
-    st.markdown("##### Lead funnel")
-    _metric_row(
-        [
             ("Leads", _fmt_int(scores["leads"])),
             ("Cost per lead", _fmt_currency(scores["cpl"])),
             ("DCs", _fmt_int(scores["dcs"])),
             ("Avg. $ per DC", _fmt_currency(scores["cpdc"])),
-        ],
-    )
-
-    st.markdown("##### Patient acquisition")
-    _metric_row(
-        [
-            ("New patient count", _fmt_int(scores["conversions"])),
-            ("Avg. $ CAC (CPA)", _fmt_currency(scores["cac"])),
+            ("Signups", _fmt_int(scores["conversions"])),
+            ("Avg. CPA", _fmt_currency(scores["cac"])),
             ("Patient to DC %", _fmt_pct(scores["lead_to_patient_pct"])),
         ],
     )
