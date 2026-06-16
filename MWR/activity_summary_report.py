@@ -18,6 +18,7 @@ import html
 import re
 import sys
 import webbrowser
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -37,6 +38,8 @@ from gmail_client import (
 from google_tasks_client import list_tasklists, tasks_service
 
 OUTPUT_DIR = _MWR_DIR / "outputs"
+JE_TODO_BOARD_ID = "4125103989"
+JE_APPROVAL_STATUS = "Ready for Publishing"
 
 _SKIP_TASK_RE = re.compile(
     r"^(re:|fwd:|fw:)|pay vas|welcome to your workplace|^hi bruno\.",
@@ -154,9 +157,157 @@ def _task_text(task: CompletedTask) -> str:
     return f"{task.title} {task.notes}".lower()
 
 
-def _consolidate_completed_tasks(tasks: list[CompletedTask]) -> list[tuple[str, list[str]]]:
+def _short_date(d: date) -> str:
+    return f"{d.strftime('%b')} {d.day}"
+
+
+def _is_ig_item(name: str) -> bool:
+    lower = name.lower()
+    return lower.startswith("ig ") or lower.startswith("ig:") or " ig " in lower
+
+
+def _fetch_je_monday_approvals(
+    *,
+    start: date,
+    end: date,
+) -> tuple[list[str], str | None]:
+    """Je approvals = items moved to Ready for Publishing on her Monday board."""
+    try:
+        from monday_client import fetch_items_from_boards
+    except ImportError:
+        return [], None
+
+    try:
+        df, _ = fetch_items_from_boards(
+            [JE_TODO_BOARD_ID],
+            board_names={JE_TODO_BOARD_ID: "Je New To-Do List"},
+        )
+    except Exception as exc:
+        return [], f"Monday (Je approvals): {exc}"
+
+    if df.empty:
+        return [], None
+
+    start_dt = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
+    end_dt = datetime(end.year, end.month, end.day, tzinfo=timezone.utc) + timedelta(days=1)
+
+    approved: list[tuple[date, str]] = []
+    for _, row in df.iterrows():
+        if str(row.get("status") or "") != JE_APPROVAL_STATUS:
+            continue
+        updated_raw = row.get("updated_at")
+        if not updated_raw:
+            continue
+        updated = datetime.fromisoformat(str(updated_raw).replace("Z", "+00:00"))
+        if not (start_dt <= updated < end_dt):
+            continue
+        name = str(row.get("name") or "").strip()
+        if name:
+            approved.append((updated.date(), name))
+
+    if not approved:
+        return [], None
+
+    highlights: list[str] = []
+    ig_by_day: dict[date, int] = defaultdict(int)
+    other_by_day: dict[date, list[str]] = defaultdict(list)
+
+    for day, name in approved:
+        lower = name.lower()
+        if "summer solstice" in lower:
+            highlights.append(f"Summer Solstice Sale creative approved ({_short_date(day)})")
+        elif _is_ig_item(name):
+            ig_by_day[day] += 1
+        else:
+            other_by_day[day].append(name)
+
+    bullets: list[str] = []
+    bullets.extend(highlights)
+    for day in sorted(ig_by_day):
+        count = ig_by_day[day]
+        label = "IG post" if count == 1 else "IG posts/reels"
+        bullets.append(f"{count} {label} approved for publishing ({_short_date(day)})")
+    for day in sorted(other_by_day):
+        for name in other_by_day[day][:3]:
+            bullets.append(f"{name} approved ({_short_date(day)})")
+        extra = len(other_by_day[day]) - 3
+        if extra > 0:
+            bullets.append(f"+{extra} more non-IG items approved ({_short_date(day)})")
+
+    return [f"Je — {'; '.join(bullets)}"], None
+
+
+def _build_staff_oversight(
+    tasks: list[CompletedTask],
+    *,
+    start: date,
+    end: date,
+) -> tuple[list[str], list[str]]:
+    staff: list[str] = []
+    errors: list[str] = []
+
+    sam_notes: list[str] = []
+    for task in tasks:
+        text = _task_text(task)
+        if "staff oversight" in text and "sam" in text:
+            if "monday board" in text:
+                sam_notes.append("Monday board cleanup")
+            if "nurture" in text:
+                sam_notes.append("nurture sequence rebalance")
+            if "vidiq" in text or "a/b" in text:
+                sam_notes.append("VidIQ A/B test")
+            if "newsletter" in text or "solstice" in text or "khafagy" in text:
+                sam_notes.append("newsletter, Khafagy copy, Solstice banner")
+    if sam_notes:
+        unique = list(dict.fromkeys(sam_notes))
+        staff.append(f"Sam — {', '.join(unique)}")
+
+    je_task_notes: list[str] = []
+    for task in tasks:
+        text = _task_text(task)
+        if "staff oversight" in text and re.search(r"\bje\b", text):
+            note = task.notes.strip() or task.title.strip()
+            if note:
+                je_task_notes.append(note)
+        elif re.search(r"\bwith je\b|\bto je\b", text) and "share creative theme" in text:
+            je_task_notes.append("briefed on Summer Solstice sale creative theme")
+    if je_task_notes:
+        unique = list(dict.fromkeys(je_task_notes))
+        staff.append(f"Je — {', '.join(unique)}")
+
+    je_monday, je_err = _fetch_je_monday_approvals(start=start, end=end)
+    if je_err:
+        errors.append(je_err)
+    elif je_monday:
+        if any(line.startswith("Je —") for line in staff):
+            staff = [
+                f"{line}; {je_monday[0].removeprefix('Je — ')}"
+                if line.startswith("Je —")
+                else line
+                for line in staff
+            ]
+        else:
+            staff.extend(je_monday)
+
+    if any("voltaire" in _task_text(t) or "blog #20" in _task_text(t) for t in tasks):
+        staff.append("Voltaire — blog #20 approved; blogs 17–19 cleared to proceed")
+
+    return staff, errors
+
+
+def _consolidate_completed_tasks(
+    tasks: list[CompletedTask],
+    *,
+    start: date,
+    end: date,
+) -> tuple[list[tuple[str, list[str]]], list[str]]:
+    staff, staff_errors = _build_staff_oversight(tasks, start=start, end=end)
+
     if not tasks:
-        return []
+        sections: list[tuple[str, list[str]]] = []
+        if staff:
+            sections.append(("Staff Oversight", staff))
+        return sections, staff_errors
 
     campaigns: list[str] = []
     if any(k in " ".join(_task_text(t) for t in tasks) for k in ("women", "zigi", "solstice", "ad campaign")):
@@ -180,25 +331,6 @@ def _consolidate_completed_tasks(tasks: list[CompletedTask]) -> list[tuple[str, 
     if any("subscription" in _task_text(t) and "token" in _task_text(t) for t in tasks):
         vendor.append("Subscription renewal token failures triaged with tech support (16 tokens)")
 
-    staff: list[str] = []
-    sam_notes: list[str] = []
-    for task in tasks:
-        text = _task_text(task)
-        if "staff oversight" in text and "sam" in text:
-            if "monday board" in text:
-                sam_notes.append("Monday board cleanup")
-            if "nurture" in text:
-                sam_notes.append("nurture sequence rebalance")
-            if "vidiq" in text or "a/b" in text:
-                sam_notes.append("VidIQ A/B test")
-            if "newsletter" in text or "solstice" in text or "khafagy" in text:
-                sam_notes.append("newsletter, Khafagy copy, Solstice banner")
-    if sam_notes:
-        unique = list(dict.fromkeys(sam_notes))
-        staff.append(f"Sam — {', '.join(unique)}")
-    if any("voltaire" in _task_text(t) or "blog #20" in _task_text(t) for t in tasks):
-        staff.append("Voltaire — blog #20 approved; blogs 17–19 cleared to proceed")
-
     print_items: list[str] = []
     blob = " ".join(_task_text(t) for t in tasks)
     if "welcome packet" in blob or "meet the team" in blob:
@@ -221,7 +353,7 @@ def _consolidate_completed_tasks(tasks: list[CompletedTask]) -> list[tuple[str, 
         sections.append(("Staff Oversight", staff))
     if print_items:
         sections.append(("Print & Collateral", print_items))
-    return sections
+    return sections, staff_errors
 
 
 def _detect_milestones(
@@ -410,6 +542,8 @@ def load_activity_summary_report(
         errors.append(f"Google Tasks: {exc}")
 
     milestones = _detect_milestones(sent, tasks)
+    completed_sections, staff_errors = _consolidate_completed_tasks(tasks, start=start, end=end)
+    errors.extend(staff_errors)
     net_read = _build_net_read(
         sent_count=len(sent),
         inbox_count=len(inbox),
@@ -424,7 +558,7 @@ def load_activity_summary_report(
         net_read=net_read,
         meta_line=meta_line,
         milestones=milestones,
-        completed_sections=_consolidate_completed_tasks(tasks),
+        completed_sections=completed_sections,
         email_sections=_consolidate_other_email(sent, milestones),
         errors=errors,
     )
