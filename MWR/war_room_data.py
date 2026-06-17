@@ -1242,8 +1242,8 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
 
 def _format_hear_about_source_label(source: str) -> str:
     text = (source or "").strip()
-    if not text:
-        return "(Not set)"
+    if not text or text.casefold() == "(not set)":
+        return "Organic"
     fold = text.casefold()
     if "word of mouth" in fold:
         return "WOM"

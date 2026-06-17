@@ -79,7 +79,7 @@ from ghl_client import HEAR_ABOUT_US_FIELD_NAME  # noqa: E402 — after war_room
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 # Bump when loader logic changes — invalidates @st.cache_data without a server restart.
-WAR_ROOM_LOADER_VERSION = "2026-06-12-meta-rate-limit-hardening-v23"
+WAR_ROOM_LOADER_VERSION = "2026-06-17-organic-not-set-label-v24"
 
 SPARKLINE_HEIGHT_PX = 44
 
@@ -1041,8 +1041,8 @@ def _render_trend_metric(
 
 def _format_hear_about_source_label(source: str) -> str:
     text = (source or "").strip()
-    if not text:
-        return "(Not set)"
+    if not text or text.casefold() == "(not set)":
+        return "Organic"
     fold = text.casefold()
     if "word of mouth" in fold:
         return "WOM"
