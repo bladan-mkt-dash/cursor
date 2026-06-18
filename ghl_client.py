@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 # Bump when hear-about normalization or fetch helpers change (war_room_data reloads).
-GHL_CLIENT_REVISION = "2026-06-09-calendar-hear-about-batch-v2"
+GHL_CLIENT_REVISION = "2026-06-18-signup-search-resilient-v1"
 
 import os
 import time
@@ -1957,25 +1957,45 @@ def search_contacts_custom_field_date_range(
     combined: dict[str, dict[str, Any]] = {}
     truncated = False
     total_reported = 0
+    skipped_days = 0
     for chunk_index, (chunk_since, chunk_until) in enumerate(
         _calendar_day_chunks(since, until)
     ):
         if chunk_index > 0:
-            time.sleep(0.15)
-        batch, part_truncated, part_total = _search_contacts_custom_field_date_window(
-            fid,
-            chunk_since,
-            chunk_until,
-            location_id=location_id,
-            page_limit=page_limit,
-            max_pages=max_pages,
-        )
+            time.sleep(0.2)
+        last_exc: RuntimeError | None = None
+        for attempt in range(3):
+            try:
+                batch, part_truncated, part_total = (
+                    _search_contacts_custom_field_date_window(
+                        fid,
+                        chunk_since,
+                        chunk_until,
+                        location_id=location_id,
+                        page_limit=page_limit,
+                        max_pages=max_pages,
+                    )
+                )
+                last_exc = None
+                break
+            except RuntimeError as exc:
+                last_exc = exc
+                if attempt + 1 < 3:
+                    time.sleep(0.6 * (attempt + 1))
+        if last_exc is not None:
+            skipped_days += 1
+            truncated = True
+            continue
+
         truncated = truncated or part_truncated
         total_reported += part_total
         for contact in batch:
             cid = str(contact.get("id") or "")
             if cid:
                 combined[cid] = contact
+
+    if skipped_days:
+        truncated = True
 
     return list(combined.values()), truncated, total_reported
 
@@ -2220,6 +2240,83 @@ class CalendarFunnelCounts:
     calendar_api_errors: int
 
 
+DISCOVERY_CALL_CALENDAR_IDS = frozenset(
+    {
+        "qja10C2jumapTz3SYfm6",
+        "1iZockuvSA2XXTgotgPt",
+        "8GkEgvCZuwmB0CLMSRCN",
+        "DqCs4ObnGQ4ln3y79dzK",
+        "DtpoxOu9BzWYlUFYUL9t",
+        "EpmLirh2HfRdGdea3hDJ",
+        "Hd6SnZY1XHxEwDlBLUeR",
+        "NB9LY4dVs46qcRipazXf",
+        "Nh5QeId7mOTJC0iNuurI",
+        "OVtjGmf8UJVRXkGNxuuP",
+        "RotbRQw8mJruB2jI3dCz",
+        "XnKWvTEUGHksSNMF14uW",
+        "Y4Koluh4AEZTEZW6BhEg",
+        "Yuk70OiiCvjbbWX9myWx",
+        "eXQ31j1E0L7Ge6OCMPRp",
+        "jiAljaBAjymPM6Tj9aPX",
+        "oMuSGis05uOyYuZdVymi",
+        "sTjhbFgjjytqHiJHdVO3",
+        "tjOTr2nk5qqfKCBx7Eit",
+        "vqsYIK9VZZvgZb8vrhP8",
+        "xf47OvgHxUd7dJVN7M4t",
+        "4HmoxX3GIyKy5yQfl1s2",
+        "8eCfJpto3VFl86P9MHAD",
+        "AnyJeUUWpJNW53j1MqnV",
+        "Hvr63hIMIuWT8f1Vewwj",
+        "PqQSqi0C6kujYZud0slp",
+        "ZLT2UxrQ39leknYZYBuq",
+    }
+)
+
+DISCOVERY_CALL_APPOINTMENT_STATUSES = frozenset(
+    {"confirmed", "showed", "completed", "active", "new"}
+)
+
+_DISCOVERY_CALL_CANCELLED_STATUSES = frozenset(
+    {"cancelled", "canceled", "no_show", "noshow", "invalid"}
+)
+
+
+def discovery_call_calendar_ids() -> frozenset[str]:
+    """Discovery-call calendar IDs (override via ``GHL_DISCOVERY_CALL_CALENDAR_IDS``)."""
+    raw = os.getenv("GHL_DISCOVERY_CALL_CALENDAR_IDS", "").strip()
+    if raw:
+        return frozenset(part.strip() for part in raw.split(",") if part.strip())
+    return DISCOVERY_CALL_CALENDAR_IDS
+
+
+def paid_media_channel_for_hear_about(raw: str) -> str | None:
+    """Map hear-about text to ``google`` or ``meta`` for paid-media DC attribution."""
+    text = (raw or "").strip()
+    if not text:
+        return None
+    lower = text.casefold()
+    if lower in {"facebook", "instagram"}:
+        return "meta"
+    if classify_hear_about_wom_vs_google(text) == "Google":
+        return "google"
+    if "google" in lower:
+        return "google"
+    if "facebook" in lower or "instagram" in lower or "fb" in lower:
+        return "meta"
+    return None
+
+
+def _discovery_call_meeting_ok(event: dict[str, Any]) -> bool:
+    status = (
+        event.get("appointmentStatus") or event.get("appoinmentStatus") or ""
+    ).casefold()
+    if status in _DISCOVERY_CALL_CANCELLED_STATUSES:
+        return False
+    if not status:
+        return True
+    return status in DISCOVERY_CALL_APPOINTMENT_STATUSES
+
+
 def _fetch_location_calendars(
     location_id: str,
 ) -> tuple[list[dict[str, Any]], int]:
@@ -2264,9 +2361,12 @@ def _fetch_calendar_events_deduped(
     until: str,
     *,
     location_id: str | None = None,
+    calendar_ids: frozenset[str] | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """
     Non-deleted calendar events in the scan window, deduped by event id.
+
+    When ``calendar_ids`` is set, only those calendars are queried (faster).
 
     Cached in-process for five minutes so command strip, CRM funnel, and
     conversion drivers share one calendar pass per date range.
@@ -2278,7 +2378,8 @@ def _fetch_calendar_events_deduped(
     if not loc:
         raise ValueError("Set GHL_LOCATION_ID in .env")
 
-    cache_key = (since, until, loc)
+    cal_key = tuple(sorted(calendar_ids)) if calendar_ids else ()
+    cache_key = (since, until, loc, cal_key)
     now = time.time()
     cached = _calendar_events_cache.get(cache_key)
     if cached and now - cached[0] < _CALENDAR_EVENTS_CACHE_TTL_SEC:
@@ -2286,7 +2387,11 @@ def _fetch_calendar_events_deduped(
 
     start_ms, end_ms = _calendar_fetch_window_ms(since, until)
     headers = _request_headers()
-    calendars, api_errors = _fetch_location_calendars(loc)
+    api_errors = 0
+    if calendar_ids:
+        calendars = [{"id": calendar_id} for calendar_id in sorted(calendar_ids)]
+    else:
+        calendars, api_errors = _fetch_location_calendars(loc)
 
     seen_ids: set[str] = set()
     events: list[dict[str, Any]] = []
@@ -2553,6 +2658,101 @@ def _aggregate_events_by_hear_about(
         "total": len(events),
         "missing_contact_link": missing_contact_link,
         "contact_lookup_failures": contact_lookup_failures,
+    }
+
+
+def fetch_discovery_call_meetings_monthly_by_channel(
+    since: str,
+    until: str,
+    *,
+    location_id: str | None = None,
+    calendar_ids: frozenset[str] | None = None,
+    field_name: str = HEAR_ABOUT_US_FIELD_NAME,
+) -> dict[str, Any]:
+    """
+    Discovery-call **meetings** (``startTime`` in range) on configured calendars.
+
+    Returns monthly Google / Meta / unallocated counts using hear-about on the
+    linked contact (same paid-media mapping as the Digital Channel Dashboard).
+    """
+    cal_ids = calendar_ids or discovery_call_calendar_ids()
+    hear_id = resolve_hear_about_us_custom_field_id(location_id, field_name=field_name)
+    allowed_days = _calendar_allowed_days(since, until)
+    events, api_errors = _fetch_calendar_events_deduped(
+        since, until, location_id=location_id, calendar_ids=cal_ids
+    )
+
+    meeting_events = [
+        event
+        for event in events
+        if _event_start_time_ymd(event) in allowed_days
+        and _discovery_call_meeting_ok(event)
+    ]
+
+    contact_ids = {
+        str(event["contactId"]) for event in meeting_events if event.get("contactId")
+    }
+    contact_cache = fetch_contacts_by_ids(contact_ids, location_id=location_id)
+
+    per_month: dict[str, dict[str, int]] = {}
+    missing_contact_link = 0
+    unattributed = 0
+
+    for event in meeting_events:
+        day = _event_start_time_ymd(event)
+        if not day:
+            continue
+        ym = day[:7]
+        bucket = per_month.setdefault(ym, {"google": 0, "meta": 0, "unallocated": 0})
+
+        contact_id = event.get("contactId")
+        if not contact_id:
+            missing_contact_link += 1
+            bucket["unallocated"] += 1
+            continue
+
+        contact = contact_cache.get(str(contact_id))
+        if not contact:
+            bucket["unallocated"] += 1
+            continue
+
+        channel = paid_media_channel_for_hear_about(
+            contact_custom_field_value(contact, hear_id)
+        )
+        if channel == "google":
+            bucket["google"] += 1
+        elif channel == "meta":
+            bucket["meta"] += 1
+        else:
+            unattributed += 1
+            bucket["unallocated"] += 1
+
+    monthly: list[dict[str, Any]] = []
+    for month_start, month_label in _month_periods_inclusive(since, until):
+        ym = month_start[:7]
+        vals = per_month.get(ym, {"google": 0, "meta": 0, "unallocated": 0})
+        monthly.append(
+            {
+                "month_start": month_start,
+                "month_label": month_label,
+                "google": int(vals["google"]),
+                "meta": int(vals["meta"]),
+                "unallocated": int(vals["unallocated"]),
+            }
+        )
+
+    return {
+        "since": since,
+        "until": until,
+        "calendar_ids": sorted(cal_ids),
+        "calendar_count": len(cal_ids),
+        "field_id": hear_id,
+        "field_name": field_name,
+        "meetings_total": len(meeting_events),
+        "monthly": monthly,
+        "calendar_api_errors": api_errors,
+        "missing_contact_link": missing_contact_link,
+        "unattributed_hear_about": unattributed,
     }
 
 

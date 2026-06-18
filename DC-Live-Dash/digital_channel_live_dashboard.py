@@ -10,6 +10,8 @@ Open:
 
 from __future__ import annotations
 
+import importlib
+import sys
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -19,13 +21,32 @@ import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
 
+_DC_LIVE_DIR = Path(__file__).resolve().parent
+if str(_DC_LIVE_DIR) not in sys.path:
+    sys.path.insert(0, str(_DC_LIVE_DIR))
+
+import digital_channel_live_data as _live_data_mod
+
+_EXPECTED_LIVE_DATA_REVISION = "2026-06-18-cpl-monthly-leads-v1"
+if (
+    getattr(_live_data_mod, "LIVE_DATA_REVISION", None)
+    != _EXPECTED_LIVE_DATA_REVISION
+):
+    _live_data_mod = importlib.reload(_live_data_mod)
+
 from digital_channel_live_data import (
     DEFAULT_SINCE,
+    GHL_ATTRIBUTION_HEAR_ABOUT,
+    GHL_ATTRIBUTION_OPTIONS,
+    GHL_ATTRIBUTION_TRACKER,
+    LIVE_DATA_REVISION,
     MEMBERSHIP_LEVELS,
-    apply_membership_conversion_filter,
+    apply_dashboard_ghl_attribution,
+    channel_month_leads_total,
     clear_ghl_leads_day_cache,
     load_live_campaign_data,
     monthly_campaign_summary,
+    overlay_monthly_leads_for_trends,
     scorecard_metrics,
 )
 
@@ -43,6 +64,45 @@ MONTH_ORDER = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "O
 
 CHANNEL_GOOGLE = "Google Ads"
 CHANNEL_META = "FB/IG"
+
+_QUARTERLY_RANGE_MONTHS = 9
+
+
+def _use_quarterly_grouping(since: date, until: date) -> bool:
+    """Monthly x-axis through 9 calendar months; quarterly when the range is longer."""
+    return pd.Timestamp(until) > pd.Timestamp(since) + pd.DateOffset(
+        months=_QUARTERLY_RANGE_MONTHS
+    )
+
+
+def _time_period_summary(
+    monthly: pd.DataFrame, since: date, until: date
+) -> tuple[pd.DataFrame, bool]:
+    """Monthly totals, or quarterly rollups when the selected range exceeds 9 months."""
+    if monthly.empty:
+        return monthly, False
+
+    if not _use_quarterly_grouping(since, until):
+        out = monthly.copy()
+        out["period_label"] = out["month"].dt.strftime("%b %Y")
+        return out, False
+
+    df = monthly.copy()
+    df["quarter"] = df["month"].dt.to_period("Q")
+    out = (
+        df.groupby("quarter", as_index=False)
+        .agg(
+            spend=("spend", "sum"),
+            clicks=("clicks", "sum"),
+            leads=("leads", "sum"),
+            dcs=("dcs", "sum"),
+            conversions=("conversions", "sum"),
+        )
+        .sort_values("quarter")
+    )
+    out["month"] = out["quarter"].dt.to_timestamp()
+    out["period_label"] = out["quarter"].apply(lambda p: f"Q{p.quarter} {p.year}")
+    return out, True
 
 
 def _inject_styles() -> None:
@@ -96,36 +156,146 @@ def _metric_row(items: list[tuple[str, str]]) -> None:
         col.metric(label, value)
 
 
-def _line_chart(df: pd.DataFrame, y_cols: list[str], title: str, y_label: str) -> go.Figure:
-    plot_df = df.copy()
-    plot_df["month_label"] = plot_df["month"].dt.strftime("%b %Y")
-    melted = plot_df.melt(
-        id_vars=["month_label"],
-        value_vars=y_cols,
-        var_name="Metric",
-        value_name="Value",
+def _prior_year_date(d: date) -> date:
+    """Same calendar day one year earlier (Feb 29 → Feb 28)."""
+    try:
+        return d.replace(year=d.year - 1)
+    except ValueError:
+        return d.replace(year=d.year - 1, day=28)
+
+
+def _spend_over_time_chart(
+    period_df: pd.DataFrame,
+    prior_monthly: pd.DataFrame,
+    *,
+    prior_since: date,
+    prior_until: date,
+) -> go.Figure:
+    """Spend for the selected range with prior-year same-period spend overlaid."""
+    x_order = period_df["period_label"].tolist()
+    current_y = period_df["spend"].tolist()
+
+    prior_period_df, _ = _time_period_summary(
+        prior_monthly, prior_since, prior_until
     )
+    prior_by_month = (
+        prior_period_df.set_index("month")["spend"].to_dict()
+        if not prior_period_df.empty
+        else {}
+    )
+
+    prior_y: list[float | None] = []
+    for _, row in period_df.iterrows():
+        prior_key = row["month"] - pd.DateOffset(years=1)
+        val = prior_by_month.get(prior_key)
+        prior_y.append(float(val) if val is not None and not pd.isna(val) else None)
+
+    has_prior = any(v is not None for v in prior_y)
+    prior_label = (
+        f"{prior_since.strftime('%b %Y')}–{prior_until.strftime('%b %Y')}"
+    )
+
+    fig = go.Figure()
+    if has_prior:
+        fig.add_trace(
+            go.Scatter(
+                x=x_order,
+                y=prior_y,
+                mode="lines+markers",
+                name=f"Spend ({prior_label})",
+                line=dict(color=COLORS["muted"], width=2, dash="dash"),
+                marker=dict(size=6, color=COLORS["muted"]),
+            )
+        )
+    fig.add_trace(
+        go.Scatter(
+            x=x_order,
+            y=current_y,
+            mode="lines+markers",
+            name="Spend (selected range)",
+            line=dict(color=COLORS["accent"], width=2.5),
+            marker=dict(size=7, color=COLORS["accent"]),
+        )
+    )
+
+    bottom_margin = 70 if has_prior else 20
+    fig.update_layout(
+        height=320,
+        title="Spend Over Time",
+        margin=dict(l=20, r=20, t=56, b=bottom_margin),
+        showlegend=has_prior,
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.28,
+            x=0.5,
+            xanchor="center",
+            title_text="",
+        ),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Roboto, sans-serif", color=COLORS["accent_dark"]),
+        xaxis_title="",
+        yaxis_title="Spend ($)",
+        xaxis=dict(categoryorder="array", categoryarray=x_order),
+    )
+    return fig
+
+
+def _line_chart(
+    df: pd.DataFrame,
+    y_cols: list[str],
+    title: str,
+    y_label: str,
+    *,
+    y_count_ticks: bool = False,
+    height: int = 320,
+) -> go.Figure:
+    plot_df = df.copy()
     label_map = {
         "spend": "Spend",
         "leads": "Leads",
         "dcs": "DCs",
-        "conversions": "Conversions",
+        "conversions": "Signups",
     }
-    melted["Metric"] = melted["Metric"].map(label_map).fillna(melted["Metric"])
+    melted = plot_df.melt(
+        id_vars=["period_label"],
+        value_vars=y_cols,
+        var_name="series",
+        value_name="Value",
+    )
+    melted["series"] = melted["series"].map(label_map).fillna(melted["series"])
+    show_legend = len(y_cols) > 1
 
     fig = px.line(
         melted,
-        x="month_label",
+        x="period_label",
         y="Value",
-        color="Metric",
+        color="series",
         markers=True,
         title=title,
-        color_discrete_sequence=[COLORS["accent"], COLORS["2024"], COLORS["2023"]],
+        labels={"series": "", "period_label": "", "Value": y_label},
+        color_discrete_map={
+            "Spend": COLORS["accent"],
+            "Leads": COLORS["accent"],
+            "DCs": COLORS["2023"],
+            "Signups": COLORS["2024"],
+        },
+        category_orders={"period_label": plot_df["period_label"].tolist()},
     )
+    bottom_margin = 70 if show_legend else 20
     fig.update_layout(
-        height=320,
-        margin=dict(l=20, r=20, t=50, b=20),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        height=height,
+        margin=dict(l=20, r=20, t=56, b=bottom_margin),
+        showlegend=show_legend,
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.28,
+            x=0.5,
+            xanchor="center",
+            title_text="",
+        ),
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
         font=dict(family="Roboto, sans-serif", color=COLORS["accent_dark"]),
@@ -133,6 +303,25 @@ def _line_chart(df: pd.DataFrame, y_cols: list[str], title: str, y_label: str) -
         yaxis_title=y_label,
     )
     fig.update_traces(line=dict(width=2.5), marker=dict(size=7))
+
+    if y_count_ticks:
+        max_val = float(melted["Value"].max() or 0)
+        upper = max(100, int((max_val + 49) // 50) * 50)
+        fig.update_yaxes(
+            range=[0, upper + upper * 0.05],
+            tick0=0,
+            dtick=50,
+            showgrid=True,
+            gridcolor="rgba(107,124,147,0.14)",
+            griddash="dot",
+        )
+        for y in range(100, upper + 1, 100):
+            fig.add_hline(
+                y=y,
+                line_color="rgba(38,69,64,0.35)",
+                line_width=1.2,
+            )
+
     return fig
 
 
@@ -142,24 +331,20 @@ def _cpl_over_time_chart(monthly: pd.DataFrame) -> go.Figure | None:
         return None
 
     plot_df = monthly.copy()
-    plot_df["cpl"] = plot_df.apply(
-        lambda r: r["spend"] / r["leads"]
-        if r["leads"] and r["leads"] > 0
-        else pd.NA,
-        axis=1,
-    )
-    plot_df["month_label"] = plot_df["month"].dt.strftime("%b %Y")
+    leads = pd.to_numeric(plot_df["leads"], errors="coerce").fillna(0)
+    plot_df["cpl"] = plot_df["spend"] / leads.where(leads > 0)
     plot_df = plot_df.dropna(subset=["cpl"])
     if plot_df.empty:
         return None
 
     fig = px.line(
         plot_df,
-        x="month_label",
+        x="period_label",
         y="cpl",
         markers=True,
         title="CPL Over Time",
         color_discrete_sequence=[COLORS["2024"]],
+        category_orders={"period_label": plot_df["period_label"].tolist()},
     )
     fig.update_layout(
         height=320,
@@ -201,12 +386,19 @@ def _spend_click_correlation(df: pd.DataFrame) -> go.Figure | None:
         barmode="group",
         title="Spend / Click Correlation Per Campaign",
         color_discrete_sequence=["#0B5394", "#C9DAF8"],
-        labels={"value": "Amount", "variable": "Metric", "campaign": "Campaign"},
+        labels={"value": "Amount", "variable": "", "campaign": "Campaign"},
     )
     fig.update_layout(
         height=420,
-        margin=dict(l=20, r=20, t=60, b=120),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        margin=dict(l=20, r=20, t=56, b=120),
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=-0.22,
+            x=0.5,
+            xanchor="center",
+            title_text="",
+        ),
         xaxis_tickangle=-35,
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
@@ -248,14 +440,30 @@ def _scorecard_leads_total(
     selected_campaigns: list[str],
     campaign_pool: list[str],
     lead_summary: dict[str, int],
+    channel_month_leads: pd.DataFrame,
+    since_month: pd.Timestamp,
+    until_month: pd.Timestamp,
+    use_hear_about: bool,
+    use_tracker: bool,
 ) -> float:
     """
-    Headline lead count from filtered rows (sheet baseline + live GHL), with GHL
-    summary totals as fallback when row sums are empty.
+    Headline lead count from filtered rows (sheet baseline + live GHL), with
+    channel-month totals as fallback when row sums are empty.
     """
     row_leads = float(df["leads"].sum())
     if row_leads > 0:
         return row_leads
+
+    range_leads = channel_month_leads_total(
+        channel_month_leads,
+        since_month=since_month,
+        until_month=until_month,
+        selected_channels=selected_channels,
+        use_hear_about=use_hear_about,
+        use_tracker=use_tracker,
+    )
+    if range_leads > 0:
+        return range_leads
 
     all_channels_selected = set(selected_channels) >= set(all_channels)
     all_campaigns_selected = (
@@ -263,10 +471,32 @@ def _scorecard_leads_total(
     )
     if all_channels_selected and all_campaigns_selected:
         if selected_channels == [CHANNEL_GOOGLE]:
-            return float(lead_summary.get("google_leads") or 0)
+            if use_hear_about and use_tracker:
+                key = "google_leads_combined"
+            elif use_hear_about:
+                key = "google_leads_hear_about"
+            else:
+                key = "google_leads"
+            return float(lead_summary.get(key) or 0)
         if selected_channels == [CHANNEL_META]:
-            return float(lead_summary.get("meta_leads") or 0)
+            if use_hear_about and use_tracker:
+                key = "meta_leads_combined"
+            elif use_hear_about:
+                key = "meta_leads_hear_about"
+            else:
+                key = "meta_leads"
+            return float(lead_summary.get(key) or 0)
         if all_channels_selected and len(all_channels) > 1:
+            if use_hear_about and use_tracker:
+                return float(
+                    (lead_summary.get("meta_leads_combined") or 0)
+                    + (lead_summary.get("google_leads_combined") or 0)
+                )
+            if use_hear_about:
+                return float(
+                    (lead_summary.get("meta_leads_hear_about") or 0)
+                    + (lead_summary.get("google_leads_hear_about") or 0)
+                )
             return float(lead_summary.get("total_new_contacts") or 0)
     return float(lead_summary.get("total_new_contacts") or 0)
 
@@ -279,6 +509,11 @@ def _weighted_scorecard_metrics(
     selected_campaigns: list[str],
     campaign_pool: list[str],
     lead_summary: dict[str, int],
+    channel_month_leads: pd.DataFrame,
+    since_month: pd.Timestamp,
+    until_month: pd.Timestamp,
+    use_hear_about: bool,
+    use_tracker: bool,
 ) -> dict[str, float | None]:
     """Scorecard totals with properly weighted averages for rate metrics."""
     if df.empty:
@@ -293,6 +528,11 @@ def _weighted_scorecard_metrics(
         selected_campaigns=selected_campaigns,
         campaign_pool=campaign_pool,
         lead_summary=lead_summary,
+        channel_month_leads=channel_month_leads,
+        since_month=since_month,
+        until_month=until_month,
+        use_hear_about=use_hear_about,
+        use_tracker=use_tracker,
     )
     dcs = df["dcs"].sum()
     conversions = df["conversions"].sum()
@@ -313,14 +553,23 @@ def _weighted_scorecard_metrics(
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def _load_data(
-    since: str, until: str
+    since: str,
+    until: str,
+    _revision: str = LIVE_DATA_REVISION,
 ) -> tuple[
     pd.DataFrame,
     tuple[str, ...],
     dict[str, int],
     pd.DataFrame,
     pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
     frozenset[pd.Timestamp],
+    pd.DataFrame,
 ]:
     (
         df,
@@ -328,7 +577,13 @@ def _load_data(
         lead_summary,
         conv_by_level,
         unallocated_conv,
+        wom_conv,
+        tracker_conv_by_level,
+        tracker_unallocated,
+        combined_conv_by_level,
+        combined_unallocated,
         sheet_months,
+        channel_month_leads,
     ) = load_live_campaign_data(since=since, until=until)
     return (
         df,
@@ -336,7 +591,13 @@ def _load_data(
         lead_summary,
         conv_by_level,
         unallocated_conv,
+        wom_conv,
+        tracker_conv_by_level,
+        tracker_unallocated,
+        combined_conv_by_level,
+        combined_unallocated,
         frozenset(sheet_months),
+        channel_month_leads,
     )
 
 
@@ -403,10 +664,13 @@ def main() -> None:
         "Loading Google Ads, Meta, and GoHighLevel… "
         "(GHL leads may take several minutes on first load for a wide range)"
     )
+    prior_since = _prior_year_date(since)
+    prior_until = _prior_year_date(until)
+    load_since = min(since, prior_since)
     with st.spinner(load_label):
         try:
-            raw_df, notes, lead_summary, conv_by_level_df, unallocated_conv_df, sheet_months = _load_data(
-                since.isoformat(), until.isoformat()
+            raw_df, notes, lead_summary, conv_by_level_df, unallocated_conv_df, wom_conv_df, tracker_conv_by_level_df, tracker_unallocated_conv_df, combined_conv_by_level_df, combined_unallocated_conv_df, sheet_months, channel_month_leads = _load_data(
+                load_since.isoformat(), until.isoformat()
             )
         except Exception as exc:
             st.error(f"Could not load live data.\n\n{exc}")
@@ -470,26 +734,116 @@ def main() -> None:
         if not selected_membership_levels:
             selected_membership_levels = membership_options
 
+        st.markdown("**GHL leads & signup attribution** (Sep 2025+)")
+        attribution_labels = {key: label for key, label in GHL_ATTRIBUTION_OPTIONS}
+        use_hear_about = st.checkbox(
+            attribution_labels[GHL_ATTRIBUTION_HEAR_ABOUT],
+            value=True,
+            help=(
+                "Self-reported **How did you hear about us?** field. Available for "
+                "full history; recommended for conservative CPA/CPL."
+            ),
+        )
+        use_tracker = st.checkbox(
+            attribution_labels[GHL_ATTRIBUTION_TRACKER],
+            value=False,
+            help=(
+                "Google: **dc thru g-ad** tag or gaClientId. Meta: meta lead tag or "
+                "pixel (sparse for older months — Google tracking was added to GHL "
+                "more recently). With both boxes on, each contact counts once if "
+                "either source matches (conflicts are unallocated)."
+            ),
+        )
+        if not use_hear_about and not use_tracker:
+            st.warning(
+                "Select at least one attribution source for GHL leads and signups."
+            )
+
+        include_wom_signups = False
+        if use_hear_about:
+            include_wom_signups = st.checkbox(
+                "Include Word of Mouth signups",
+                value=True,
+                help=(
+                    "Hear-about only. When on, signups whose hear-about contains "
+                    "\"word of mouth\" are spread by spend share (lowers CPA). "
+                    "Pre-Sep 2025 tracker sheet months are unchanged."
+                ),
+            )
+
+    attr_kwargs = dict(
+        conv_by_level_df=conv_by_level_df,
+        tracker_conv_by_level_df=tracker_conv_by_level_df,
+        combined_conv_by_level_df=combined_conv_by_level_df,
+        selected_levels=selected_membership_levels,
+        unallocated_conv_df=unallocated_conv_df,
+        tracker_unallocated_conv_df=tracker_unallocated_conv_df,
+        combined_unallocated_conv_df=combined_unallocated_conv_df,
+        wom_conv_df=wom_conv_df,
+        include_wom_signups=include_wom_signups,
+        sheet_signup_months=set(sheet_months),
+    )
+
+    if "month" not in raw_df.columns:
+        raw_df = raw_df.copy()
+        raw_df["month"] = raw_df["date"].dt.to_period("M").dt.to_timestamp()
+
+    since_month = pd.Timestamp(since).to_period("M").to_timestamp()
+    until_month = pd.Timestamp(until).to_period("M").to_timestamp()
+    prior_since_month = pd.Timestamp(prior_since).to_period("M").to_timestamp()
+    prior_until_month = pd.Timestamp(prior_until).to_period("M").to_timestamp()
+
+    raw_selected = raw_df[
+        (raw_df["month"] >= since_month) & (raw_df["month"] <= until_month)
+    ].copy()
+
+    filtered = apply_dashboard_ghl_attribution(
+        raw_selected,
+        use_hear_about=use_hear_about,
+        use_tracker=use_tracker,
+        **attr_kwargs,
+    )
+
     mask = (
-        raw_df["channel"].isin(selected_channels)
-        & (raw_df["campaign"].isin(selected_campaigns))
-        & (raw_df["creative_type"].isin(selected_creatives))
+        filtered["channel"].isin(selected_channels)
+        & (filtered["campaign"].isin(selected_campaigns))
+        & (filtered["creative_type"].isin(selected_creatives))
     )
     if meta_types:
-        meta_type_mask = (raw_df["channel"] != "FB/IG") | (
-            raw_df["fb_ig_type"].isin(selected_meta_types)
+        meta_type_mask = (filtered["channel"] != "FB/IG") | (
+            filtered["fb_ig_type"].isin(selected_meta_types)
         )
         mask &= meta_type_mask
 
-    df = raw_df.loc[mask].copy()
-    df = apply_membership_conversion_filter(
-        df,
-        conv_by_level_df,
-        selected_membership_levels,
-        unallocated_conv_df=unallocated_conv_df,
-        sheet_signup_months=set(sheet_months),
-    )
+    df = filtered.loc[mask].copy()
+    if "month" not in df.columns:
+        df["month"] = df["date"].dt.to_period("M").dt.to_timestamp()
+
+    prior_df = raw_df.loc[
+        (raw_df["month"] >= prior_since_month)
+        & (raw_df["month"] <= prior_until_month)
+    ].copy()
+    prior_df = prior_df.loc[
+        prior_df["channel"].isin(selected_channels)
+        & (prior_df["campaign"].isin(selected_campaigns))
+        & (prior_df["creative_type"].isin(selected_creatives))
+    ].copy()
+    if meta_types:
+        prior_meta_mask = (prior_df["channel"] != "FB/IG") | (
+            prior_df["fb_ig_type"].isin(selected_meta_types)
+        )
+        prior_df = prior_df.loc[prior_meta_mask].copy()
+    prior_monthly = monthly_campaign_summary(prior_df)
+
     monthly = monthly_campaign_summary(df)
+    monthly = overlay_monthly_leads_for_trends(
+        monthly,
+        channel_month_leads,
+        selected_channels=selected_channels,
+        use_hear_about=use_hear_about,
+        use_tracker=use_tracker,
+    )
+    period_df, use_quarterly = _time_period_summary(monthly, since, until)
     scores = _weighted_scorecard_metrics(
         df,
         selected_channels=selected_channels,
@@ -497,6 +851,11 @@ def main() -> None:
         selected_campaigns=selected_campaigns,
         campaign_pool=campaign_pool,
         lead_summary=lead_summary,
+        channel_month_leads=channel_month_leads,
+        since_month=since_month,
+        until_month=until_month,
+        use_hear_about=use_hear_about,
+        use_tracker=use_tracker,
     )
 
     _metric_row(
@@ -510,47 +869,84 @@ def main() -> None:
             ("Avg. $ per DC", _fmt_currency(scores["cpdc"])),
             ("Signups", _fmt_int(scores["conversions"])),
             ("Avg. CPA", _fmt_currency(scores["cac"])),
-            ("Patient to DC %", _fmt_pct(scores["lead_to_patient_pct"])),
+            ("Signup to DC %", _fmt_pct(scores["lead_to_patient_pct"])),
         ],
     )
 
+    if use_hear_about and use_tracker:
+
+        def _signup_cpa(use_hear: bool, use_track: bool) -> str:
+            snap = apply_dashboard_ghl_attribution(
+                raw_selected.copy(),
+                use_hear_about=use_hear,
+                use_tracker=use_track,
+                **attr_kwargs,
+            )
+            snap = snap.loc[mask]
+            spend = float(snap["spend"].sum())
+            signups = float(snap["conversions"].sum())
+            return _fmt_currency(spend / signups if signups else None)
+
+        st.caption(
+            "Signup CPA with current filters — "
+            f"Hear-about only: {_signup_cpa(True, False)} · "
+            f"Tracker only: {_signup_cpa(False, True)} · "
+            f"Both (deduped OR): {_signup_cpa(True, True)}"
+        )
+
     st.markdown("---")
     st.subheader("Trends over time")
+    if use_quarterly:
+        st.caption(
+            "Date range exceeds 9 months — trend charts show **quarterly** totals on the x-axis."
+        )
+    else:
+        st.caption("Trend charts show **monthly** totals on the x-axis.")
 
-    c1, c2 = st.columns(2)
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.plotly_chart(
-            _line_chart(monthly, ["spend"], "Spend Over Time", "Spend ($)"),
-            use_container_width=True,
-        )
-    with c2:
-        st.plotly_chart(
-            _line_chart(
-                monthly,
-                ["conversions"],
-                "Patient Acquisition Over Time",
-                "Conversions",
+            _spend_over_time_chart(
+                period_df,
+                prior_monthly,
+                prior_since=prior_since,
+                prior_until=prior_until,
             ),
             use_container_width=True,
         )
-
-    c3, c4 = st.columns(2)
-    with c3:
-        cpl_chart = _cpl_over_time_chart(monthly)
+    with c2:
+        cpl_chart = _cpl_over_time_chart(period_df)
         if cpl_chart:
             st.plotly_chart(cpl_chart, use_container_width=True)
         else:
             st.info("CPL over time unavailable (no leads in the selected range).")
+    with c3:
+        st.plotly_chart(
+            _line_chart(period_df, ["dcs"], "DCs Over Time", "DCs"),
+            use_container_width=True,
+        )
     with c4:
         st.plotly_chart(
             _line_chart(
-                monthly,
-                ["leads", "dcs"],
-                "Lead Acquisition & DCs Over Time",
-                "Count",
+                period_df,
+                ["conversions"],
+                "Signups Over Time",
+                "Signups",
             ),
             use_container_width=True,
         )
+
+    st.plotly_chart(
+        _line_chart(
+            period_df,
+            ["leads", "dcs", "conversions"],
+            "Leads, DCs & Signups Over Time",
+            "Count",
+            y_count_ticks=True,
+            height=380,
+        ),
+        use_container_width=True,
+    )
 
     st.markdown("---")
     st.subheader("Campaign breakdown")
