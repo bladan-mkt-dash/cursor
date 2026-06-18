@@ -4,13 +4,13 @@ Build Digital Channel Dashboard rows from live Google Ads, Meta, and GoHighLevel
 Replaces the Google Sheet **Data** tab as the source of truth. Metrics mapping:
 
 - **Spend / clicks / impressions** — Google Ads & Meta campaign insights (daily → month-end rows).
-- **Leads** — GHL new contacts (``dateAdded``): Meta = ``meta lead`` tag and/or Meta pixel
-  (``fbp`` / ``fbc``); Google = ``dc thru g-ad`` tag and/or Google Tag (``gaClientId``).
-  Campaign rows receive channel-month totals allocated by spend share.
+- **Leads** — GHL new contacts (``dateAdded``) from Sep 2025 onward where available; earlier
+  months use **Digital Channel Dashboard 2024-25** Data tab totals (allocated by spend share).
 - **DCs** — Google Ads conversions by month; Meta = GHL Facebook/Instagram contacts (date added),
   allocated to campaigns by spend share within channel-month.
-- **Conversions (new patients)** — GHL committed members with Sign Up Date in range, classified
-  by *How did you hear about us?*, allocated by spend share within channel-month.
+- **Conversions (signups)** — Through Aug 2025: **GRAND TOTAL New Members** from Digital
+  Cross-Channel Tracker Google Sheets; from Sep 2025: GHL committed members with Sign Up Date
+  in range (hear-about attribution where available, remainder by spend share).
 """
 
 from __future__ import annotations
@@ -32,7 +32,13 @@ from facebook_business.exceptions import FacebookRequestError
 from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
 
-from digital_channel_sheets import DATA_COLUMNS, monthly_campaign_summary, scorecard_metrics
+from digital_channel_sheets import (
+    DATA_COLUMNS,
+    SPREADSHEET_NAME,
+    load_campaign_data,
+    monthly_campaign_summary,
+    scorecard_metrics,
+)
 from ghl_client import (
     HEAR_ABOUT_US_FIELD_NAME,
     classify_hear_about_wom_vs_google,
@@ -70,9 +76,13 @@ def norm_membership_level(raw: str) -> str:
             return level
     return "n/a"
 
-DEFAULT_SINCE = "2025-01-01"
+DEFAULT_SINCE = "2023-01-01"
+GHL_SIGNUPS_SINCE = "2025-09-01"
+SHEETS_SIGNUPS_UNTIL = "2025-08-31"
 _GHL_LEADS_CACHE_DIR = _PROJECT_ROOT / ".cache" / "ghl_daily_leads"
 _GHL_LEADS_FETCH_WORKERS = 8
+
+UNALLOCATED_CONV_COLUMNS = ["month", "membership_level", "conversions"]
 
 _GADS_CHANNEL_TO_CREATIVE = {
     "SEARCH": "Text",
@@ -104,6 +114,168 @@ _META_OBJECTIVE_TO_TYPE = {
 
 def _month_end(ts: pd.Timestamp) -> pd.Timestamp:
     return ts + pd.offsets.MonthEnd(0)
+
+
+def _fetch_tracker_grand_total_signups(
+    since: str, until: str
+) -> tuple[dict[pd.Timestamp, float], set[pd.Timestamp], list[str]]:
+    """
+    Monthly GRAND TOTAL New Members from Digital Cross-Channel Tracker sheets.
+
+    Used for signups through ``SHEETS_SIGNUPS_UNTIL`` (Aug 30, 2025).
+    """
+    from googleapiclient.discovery import build
+    from total_new_members_yoy_chart import (
+        DEFAULT_SHEET,
+        TRACKERS,
+        _credentials,
+        _find_spreadsheet,
+        _load_year_series,
+        _resolve_sheet_name,
+    )
+
+    since_d = pd.Timestamp(since)
+    until_d = pd.Timestamp(until)
+    sheet_until = min(until_d, pd.Timestamp(SHEETS_SIGNUPS_UNTIL))
+    if since_d > sheet_until:
+        return {}, set(), []
+
+    creds = _credentials()
+    drive = build("drive", "v3", credentials=creds)
+    sheets = build("sheets", "v4", credentials=creds)
+
+    totals: dict[pd.Timestamp, float] = {}
+    notes: list[str] = []
+    years_needed = set(range(since_d.year, sheet_until.year + 1))
+
+    for meta in TRACKERS.values():
+        year = meta["year"]
+        if year not in years_needed:
+            continue
+        file_info = _find_spreadsheet(drive, meta["name"])
+        sheet_name = _resolve_sheet_name(sheets, file_info["id"], DEFAULT_SHEET)
+        series = _load_year_series(sheets, file_info["id"], sheet_name, year)
+        for month_num, val in series.items():
+            month_ts = pd.Timestamp(year=year, month=int(month_num), day=1)
+            if since_d.to_period("M") <= month_ts.to_period("M") <= sheet_until.to_period(
+                "M"
+            ):
+                totals[month_ts] = float(val)
+        notes.append(
+            f"Signups (sheet): {meta['name']} / {sheet_name} — "
+            "GRAND TOTAL New Members row."
+        )
+
+    return totals, set(totals.keys()), notes
+
+
+def _allocate_monthly_signup_totals(
+    df: pd.DataFrame,
+    monthly_totals: dict[pd.Timestamp, float],
+) -> pd.DataFrame:
+    """Spread undifferentiated monthly signup totals across rows by spend share."""
+    if df.empty or not monthly_totals:
+        return df
+
+    out = df.copy()
+    if "month" not in out.columns:
+        out["month"] = out["date"].dt.to_period("M").dt.to_timestamp()
+
+    for month, total in monthly_totals.items():
+        if total <= 0:
+            continue
+        mask = out["month"] == month
+        chunk = out.loc[mask]
+        if chunk.empty:
+            continue
+        total_spend = chunk["spend"].sum()
+        if total_spend > 0:
+            weights = chunk["spend"] / total_spend
+            out.loc[mask, "conversions"] = weights * total
+        else:
+            share = total / len(chunk)
+            out.loc[mask, "conversions"] = share
+
+    return out
+
+
+def _sheet_leads_by_month_channel(
+    since: str, until: str
+) -> tuple[pd.DataFrame, pd.Timestamp | None, list[str]]:
+    """Channel-month lead totals from the Digital Channel Dashboard Data tab."""
+    try:
+        sheet_df = load_campaign_data()
+    except Exception as exc:
+        return pd.DataFrame(), None, [f"Sheet lead baseline skipped: {exc}"]
+
+    if sheet_df.empty:
+        return pd.DataFrame(), None, []
+
+    sheet_max_month = sheet_df["date"].max().to_period("M").to_timestamp()
+    since_month = pd.Timestamp(since).to_period("M").to_timestamp()
+    until_month = min(
+        pd.Timestamp(until).to_period("M").to_timestamp(), sheet_max_month
+    )
+
+    subset = sheet_df[
+        (sheet_df["month"] >= since_month) & (sheet_df["month"] <= until_month)
+    ]
+    if subset.empty:
+        return pd.DataFrame(), sheet_max_month, []
+
+    monthly = (
+        subset.groupby(["month", "channel"], as_index=False)
+        .agg(leads=("leads", "sum"))
+        .sort_values(["month", "channel"])
+    )
+    notes = [
+        f"Leads (sheet baseline): {SPREADSHEET_NAME} Data tab through "
+        f"{sheet_df['date'].max().date()}."
+    ]
+    return monthly, sheet_max_month, notes
+
+
+def _apply_sheet_lead_baseline(
+    df: pd.DataFrame,
+    sheet_monthly: pd.DataFrame,
+    sheet_max_month: pd.Timestamp | None,
+) -> pd.DataFrame:
+    """
+    Fill channel-month lead counts from the sheet when live GHL allocation is zero.
+
+    Live GHL leads take precedence when present for a channel-month.
+    """
+    if df.empty or sheet_monthly.empty:
+        return df
+
+    out = df.copy()
+    if "month" not in out.columns:
+        out["month"] = out["date"].dt.to_period("M").dt.to_timestamp()
+
+    for row in sheet_monthly.itertuples(index=False):
+        month, channel, sheet_leads = row.month, row.channel, float(row.leads)
+        if sheet_leads <= 0:
+            continue
+        if sheet_max_month is not None and month > sheet_max_month:
+            continue
+
+        mask = (out["month"] == month) & (out["channel"] == channel)
+        if float(out.loc[mask, "leads"].sum()) > 0:
+            continue
+
+        chunk = out.loc[mask]
+        if chunk.empty:
+            continue
+
+        total_spend = chunk["spend"].sum()
+        if total_spend > 0:
+            weights = chunk["spend"] / total_spend
+            out.loc[mask, "leads"] = weights * sheet_leads
+        else:
+            share = sheet_leads / len(chunk)
+            out.loc[mask, "leads"] = share
+
+    return out
 
 
 def _escape_gaql(value: str) -> str:
@@ -559,11 +731,12 @@ def _fetch_ghl_leads_by_date_added(since: str, until: str) -> dict[str, Any]:
 
 def fetch_ghl_channel_monthly(
     since: str, until: str
-) -> tuple[pd.DataFrame, dict[str, Any], list[str]]:
+) -> tuple[pd.DataFrame, dict[str, Any], list[str], pd.DataFrame, pd.DataFrame]:
     """
     Channel-month GHL funnel metrics not available at campaign level in ads APIs.
 
-    Returns a frame with columns: month, channel, leads, dcs, conversions
+    Returns channel-month frame plus conversions by membership level and
+    unallocated committed signups (no paid-media hear-about match).
     """
     notes: list[str] = []
     lead_summary: dict[str, Any] = {
@@ -630,39 +803,53 @@ def fetch_ghl_channel_monthly(
         notes.append(f"GHL Facebook/Instagram DCs skipped: {exc}")
 
     # New patients: committed + sign-up date + hear-about channel + membership level
+    # (GHL only from GHL_SIGNUPS_SINCE; earlier months come from tracker sheets.)
     conv_by_month_channel: dict[tuple[pd.Timestamp, str], float] = {}
     conv_by_month_channel_level: dict[tuple[pd.Timestamp, str, str], float] = {}
+    unallocated_by_month_level: dict[tuple[pd.Timestamp, str], float] = {}
+    ghl_conv_since = max(since, GHL_SIGNUPS_SINCE)
     try:
-        hear_id = resolve_hear_about_us_custom_field_id()
-        signup = fetch_signup_date_range_committed_yes_contacts(since, until)
-        if signup.get("truncated_pages"):
+        if pd.Timestamp(until) >= pd.Timestamp(ghl_conv_since):
+            hear_id = resolve_hear_about_us_custom_field_id()
+            signup = fetch_signup_date_range_committed_yes_contacts(
+                ghl_conv_since, until
+            )
+            if signup.get("truncated_pages"):
+                notes.append(
+                    "GHL sign-up date search hit pagination cap; new-patient counts may be low."
+                )
+            mid = signup.get("membership_level_field_id") or ""
+            for contact in signup.get("contacts") or []:
+                raw_signup = contact_custom_field_value(
+                    contact, signup["sign_up_date_field_id"]
+                ).strip()
+                if not raw_signup:
+                    continue
+                try:
+                    signup_day = pd.to_datetime(raw_signup[:10])
+                except (ValueError, TypeError):
+                    continue
+                month = signup_day.to_period("M").to_timestamp()
+                hear = contact_custom_field_value(contact, hear_id)
+                channel = _ghl_channel_for_hear_about(hear)
+                level = norm_membership_level(
+                    contact_custom_field_value(contact, mid) if mid else ""
+                )
+                if channel is None:
+                    key_ul = (month, level)
+                    unallocated_by_month_level[key_ul] = (
+                        unallocated_by_month_level.get(key_ul, 0.0) + 1.0
+                    )
+                    continue
+                key = (month, channel)
+                conv_by_month_channel[key] = conv_by_month_channel.get(key, 0.0) + 1.0
+                key_level = (month, channel, level)
+                conv_by_month_channel_level[key_level] = (
+                    conv_by_month_channel_level.get(key_level, 0.0) + 1.0
+                )
+        else:
             notes.append(
-                "GHL sign-up date search hit pagination cap; new-patient counts may be low."
-            )
-        mid = signup.get("membership_level_field_id") or ""
-        for contact in signup.get("contacts") or []:
-            raw_signup = contact_custom_field_value(
-                contact, signup["sign_up_date_field_id"]
-            ).strip()
-            if not raw_signup:
-                continue
-            try:
-                signup_day = pd.to_datetime(raw_signup[:10])
-            except (ValueError, TypeError):
-                continue
-            month = signup_day.to_period("M").to_timestamp()
-            hear = contact_custom_field_value(contact, hear_id)
-            channel = _ghl_channel_for_hear_about(hear)
-            if channel is None:
-                continue
-            level = norm_membership_level(
-                contact_custom_field_value(contact, mid) if mid else ""
-            )
-            key = (month, channel)
-            conv_by_month_channel[key] = conv_by_month_channel.get(key, 0.0) + 1.0
-            key_level = (month, channel, level)
-            conv_by_month_channel_level[key_level] = (
-                conv_by_month_channel_level.get(key_level, 0.0) + 1.0
+                f"GHL signups not queried (range ends before {GHL_SIGNUPS_SINCE})."
             )
     except Exception as exc:
         notes.append(f"GHL new-patient counts skipped: {exc}")
@@ -709,7 +896,23 @@ def fetch_ghl_channel_monthly(
         else pd.DataFrame(columns=CONV_BY_LEVEL_COLUMNS)
     )
 
-    return pd.DataFrame(records), lead_summary, notes, conv_by_level_df
+    unallocated_records = [
+        {"month": month, "membership_level": level, "conversions": count}
+        for (month, level), count in unallocated_by_month_level.items()
+    ]
+    unallocated_conv_df = (
+        pd.DataFrame(unallocated_records, columns=UNALLOCATED_CONV_COLUMNS)
+        if unallocated_records
+        else pd.DataFrame(columns=UNALLOCATED_CONV_COLUMNS)
+    )
+
+    return (
+        pd.DataFrame(records),
+        lead_summary,
+        notes,
+        conv_by_level_df,
+        unallocated_conv_df,
+    )
 
 
 def _aggregate_to_month_end(df: pd.DataFrame) -> pd.DataFrame:
@@ -792,12 +995,14 @@ def apply_membership_conversion_filter(
     df: pd.DataFrame,
     conv_by_level_df: pd.DataFrame,
     selected_levels: list[str],
+    *,
+    unallocated_conv_df: pd.DataFrame | None = None,
+    sheet_signup_months: set[pd.Timestamp] | None = None,
 ) -> pd.DataFrame:
     """
     Re-allocate new-patient (conversion) counts for selected membership tiers.
 
-    Leads, DCs, spend, and clicks are unchanged. Uses the same spend-share rules as
-    :func:`_allocate_ghl_metrics` for conversions only.
+    Sheet-sourced months (pre-Sep 2025 tracker totals) are preserved unchanged.
     """
     if df.empty:
         return df
@@ -806,39 +1011,76 @@ def apply_membership_conversion_filter(
     if "month" not in out.columns:
         out["month"] = out["date"].dt.to_period("M").dt.to_timestamp()
 
-    out["conversions"] = 0.0
-    if conv_by_level_df is None or conv_by_level_df.empty:
-        return _update_conversion_derived_columns(out)
+    sheet_months = sheet_signup_months or set()
+    sheet_mask = out["month"].isin(sheet_months)
+    preserved = out.loc[sheet_mask, ["conversions"]].copy()
 
+    out["conversions"] = 0.0
     levels = [lv for lv in selected_levels if lv in MEMBERSHIP_LEVELS]
     if not levels:
+        if not preserved.empty:
+            out.loc[sheet_mask, "conversions"] = preserved["conversions"]
         return _update_conversion_derived_columns(out)
 
-    filtered = conv_by_level_df[
-        conv_by_level_df["membership_level"].isin(levels)
-    ]
-    if filtered.empty:
-        return _update_conversion_derived_columns(out)
+    ghl_month_mask = ~out["month"].isin(sheet_months)
 
-    totals = (
-        filtered.groupby(["month", "channel"], as_index=False)["conversions"]
-        .sum()
-    )
-    for row in totals.itertuples(index=False):
-        month, channel, channel_conv = row.month, row.channel, float(row.conversions)
-        if channel_conv <= 0:
-            continue
-        mask = (out["month"] == month) & (out["channel"] == channel)
-        chunk = out.loc[mask]
-        if chunk.empty:
-            continue
-        total_spend = chunk["spend"].sum()
-        if total_spend > 0:
-            weights = chunk["spend"] / total_spend
-            out.loc[mask, "conversions"] = weights * channel_conv
-        else:
-            share = channel_conv / len(chunk)
-            out.loc[mask, "conversions"] = share
+    if conv_by_level_df is not None and not conv_by_level_df.empty:
+        filtered = conv_by_level_df[
+            conv_by_level_df["membership_level"].isin(levels)
+        ]
+        if not filtered.empty:
+            totals = (
+                filtered.groupby(["month", "channel"], as_index=False)["conversions"]
+                .sum()
+            )
+            for row in totals.itertuples(index=False):
+                month, channel, channel_conv = (
+                    row.month,
+                    row.channel,
+                    float(row.conversions),
+                )
+                if channel_conv <= 0:
+                    continue
+                mask = ghl_month_mask & (out["month"] == month) & (
+                    out["channel"] == channel
+                )
+                chunk = out.loc[mask]
+                if chunk.empty:
+                    continue
+                total_spend = chunk["spend"].sum()
+                if total_spend > 0:
+                    weights = chunk["spend"] / total_spend
+                    out.loc[mask, "conversions"] = weights * channel_conv
+                else:
+                    share = channel_conv / len(chunk)
+                    out.loc[mask, "conversions"] = share
+
+    if unallocated_conv_df is not None and not unallocated_conv_df.empty:
+        unalloc = unallocated_conv_df[
+            unallocated_conv_df["membership_level"].isin(levels)
+        ]
+        if not unalloc.empty:
+            by_month = (
+                unalloc.groupby("month", as_index=False)["conversions"].sum()
+            )
+            for row in by_month.itertuples(index=False):
+                month, month_conv = row.month, float(row.conversions)
+                if month_conv <= 0:
+                    continue
+                mask = ghl_month_mask & (out["month"] == month)
+                chunk = out.loc[mask]
+                if chunk.empty:
+                    continue
+                total_spend = chunk["spend"].sum()
+                if total_spend > 0:
+                    weights = chunk["spend"] / total_spend
+                    out.loc[mask, "conversions"] += weights * month_conv
+                else:
+                    share = month_conv / len(chunk)
+                    out.loc[mask, "conversions"] += share
+
+    if not preserved.empty:
+        out.loc[sheet_mask, "conversions"] = preserved["conversions"]
 
     return _update_conversion_derived_columns(out)
 
@@ -896,26 +1138,34 @@ def _add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
 def load_live_campaign_data(
     since: str | None = None,
     until: str | None = None,
-) -> tuple[pd.DataFrame, list[str], dict[str, int], pd.DataFrame]:
+) -> tuple[
+    pd.DataFrame,
+    list[str],
+    dict[str, int],
+    pd.DataFrame,
+    pd.DataFrame,
+    set[pd.Timestamp],
+]:
     """
     Fetch and normalize paid-media rows for the Digital Channel Dashboard.
 
     Returns:
-        (dataframe matching DATA_COLUMNS schema, list of warning/info notes,
-         GHL lead summary with total_new_contacts, meta_leads, google_leads,
-         conversions broken down by month, channel, and membership_level)
+        (dataframe, notes, GHL lead summary, conv_by_level, unallocated_conv,
+         sheet_signup_months)
     """
     today = date.today()
     until_eff = until or (today - timedelta(days=1)).isoformat()
     since_eff = since or DEFAULT_SINCE
     notes: list[str] = [
         f"Google Ads + Meta insights: {since_eff} → {until_eff} (Meta excludes today).",
-        "GHL leads: all new contacts (date added); Meta = meta lead tag and/or Meta pixel; "
-        "Google = dc thru g-ad tag and/or Google Tag (gaClientId).",
+        "GHL leads: new GHL contacts (date added) from live APIs where available; "
+        f"earlier months use {SPREADSHEET_NAME} Data tab (allocated by spend share).",
         "GHL DCs (Meta): Facebook/Instagram contacts by date added.",
-        "GHL conversions: Committed? = Yes, Sign Up Date (by month) + hear-about attribution; "
-        "membership level from GHL Membership Level field.",
-        "Campaign-level GHL metrics are allocated by spend share within channel-month.",
+        f"Signups (GHL): Committed? = Yes, Sign Up Date from {GHL_SIGNUPS_SINCE} onward; "
+        "hear-about maps to Google/Meta, remainder allocated by spend share.",
+        f"Signups (sheet): GRAND TOTAL New Members through {SHEETS_SIGNUPS_UNTIL} from "
+        "Digital Cross-Channel Tracker workbooks.",
+        "Campaign-level signups are allocated by spend share within channel-month.",
     ]
 
     gads_daily = fetch_google_ads_campaign_daily(since_eff, until_eff)
@@ -940,9 +1190,13 @@ def load_live_campaign_data(
     daily = pd.concat([gads_daily, meta_daily], ignore_index=True)
 
     monthly_ads = _aggregate_to_month_end(daily)
-    ghl_monthly, lead_summary, ghl_notes, conv_by_level_df = fetch_ghl_channel_monthly(
-        since_eff, until_eff
-    )
+    (
+        ghl_monthly,
+        lead_summary,
+        ghl_notes,
+        conv_by_level_df,
+        unallocated_conv_df,
+    ) = fetch_ghl_channel_monthly(since_eff, until_eff)
     notes.extend(ghl_notes)
     notes.append(
         "GHL new contacts in range: "
@@ -951,10 +1205,47 @@ def load_live_campaign_data(
         f"{lead_summary.get('google_leads', 0):,} Google."
     )
 
+    sheet_totals, sheet_months, sheet_notes = _fetch_tracker_grand_total_signups(
+        since_eff, until_eff
+    )
+    notes.extend(sheet_notes)
+    if sheet_totals:
+        notes.append(
+            f"Tracker sheet signups loaded for {len(sheet_totals)} month(s) "
+            f"({int(sum(sheet_totals.values())):,} total)."
+        )
+
     if monthly_ads.empty:
-        return pd.DataFrame(columns=DATA_COLUMNS), notes, lead_summary, conv_by_level_df
+        return (
+            pd.DataFrame(columns=DATA_COLUMNS),
+            notes,
+            lead_summary,
+            conv_by_level_df,
+            unallocated_conv_df,
+            sheet_months,
+        )
+
+    if sheet_months and not ghl_monthly.empty:
+        ghl_monthly = ghl_monthly.copy()
+        ghl_monthly.loc[ghl_monthly["month"].isin(sheet_months), "conversions"] = 0.0
 
     merged = _allocate_ghl_metrics(monthly_ads, ghl_monthly)
+    merged = _allocate_monthly_signup_totals(merged, sheet_totals)
+
+    sheet_leads_monthly, sheet_leads_max, sheet_lead_notes = (
+        _sheet_leads_by_month_channel(since_eff, until_eff)
+    )
+    notes.extend(sheet_lead_notes)
+    if not sheet_leads_monthly.empty:
+        merged = _apply_sheet_lead_baseline(
+            merged, sheet_leads_monthly, sheet_leads_max
+        )
+        filled_months = sheet_leads_monthly["month"].nunique()
+        notes.append(
+            f"Sheet lead baseline applied to {filled_months} month(s) where live GHL "
+            "lead counts were zero."
+        )
+
     merged = _add_derived_columns(merged)
 
     for col in DATA_COLUMNS:
@@ -963,11 +1254,20 @@ def load_live_campaign_data(
 
     result = merged[DATA_COLUMNS].copy()
     result["month"] = result["date"].dt.to_period("M").dt.to_timestamp()
-    return result, notes, lead_summary, conv_by_level_df
+    return (
+        result,
+        notes,
+        lead_summary,
+        conv_by_level_df,
+        unallocated_conv_df,
+        sheet_months,
+    )
 
 
 __all__ = [
     "MEMBERSHIP_LEVELS",
+    "GHL_SIGNUPS_SINCE",
+    "SHEETS_SIGNUPS_UNTIL",
     "apply_membership_conversion_filter",
     "clear_ghl_leads_day_cache",
     "load_live_campaign_data",
