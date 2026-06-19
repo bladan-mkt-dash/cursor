@@ -20,7 +20,11 @@ CHART_COLORS = ["#4C78A8", "#F58518", "#54A24B", "#B279A2"]
 TRACKERS = {
     "2023": {"year": 2023, "name": "2023 Digital Cross-Channel Tracker"},
     "2024": {"year": 2024, "name": "2024 Digital Cross-Channel Tracker"},
-    "2025": {"year": 2025, "name": "2025 Digital Cross-Channel Tracker"},
+    "2025": {
+        "year": 2025,
+        "name": "2025 Digital Cross-Channel Tracker",
+        "id": "1oPIba48QuaDhfUP0l6JvoIAQYHQDPgU2JanerfsmYJM",
+    },
     "2026": {"year": 2026, "name": "2026 Digital Cross-Channel Tracker"},
 }
 
@@ -32,6 +36,14 @@ OUT_HTML = OUTPUT_DIR / "total_new_members_report.html"
 def _credentials() -> Credentials:
     info = json.loads(TOKEN_PATH.read_text(encoding="utf-8"))
     return Credentials.from_authorized_user_info(info, info["scopes"])
+
+
+def _resolve_tracker_spreadsheet(drive, meta: dict) -> dict:
+    """Return tracker file metadata, using a pinned spreadsheet id when configured."""
+    pinned = meta.get("id")
+    if pinned:
+        return {"id": pinned, "name": meta["name"]}
+    return _find_spreadsheet(drive, meta["name"])
 
 
 def _find_spreadsheet(drive, name: str) -> dict:
@@ -141,6 +153,8 @@ def _find_total_new_members_row(sheets, spreadsheet_id: str, sheet_name: str) ->
         .execute()
         .get("values", [])
     )
+    total_row: int | None = None
+    grand_total_row: int | None = None
     candidates: list[tuple[int, str]] = []
     for i, row in enumerate(col_c, start=1):
         label = str(row[0]).strip() if row else ""
@@ -149,15 +163,34 @@ def _find_total_new_members_row(sheets, spreadsheet_id: str, sheet_name: str) ->
         norm = label.lower()
         if "average" in norm:
             continue
-        if label == "GRAND TOTAL New Members":
-            return i
         if label == "TOTAL New Members":
-            candidates.append((i, label))
+            total_row = i
+        elif label == "GRAND TOTAL New Members":
+            grand_total_row = i
         elif label.startswith("TOTAL New Members") and "Boston" not in label and "Newton" not in label:
             candidates.append((i, label))
+    if total_row is not None:
+        return total_row
+    if grand_total_row is not None:
+        return grand_total_row
     if candidates:
         return candidates[0][0]
     raise SystemExit(f"Could not find TOTAL New Members row in {spreadsheet_id}")
+
+
+def _find_calls_completed_row(sheets, spreadsheet_id: str, sheet_name: str) -> int:
+    col_c = (
+        sheets.spreadsheets()
+        .values()
+        .get(spreadsheetId=spreadsheet_id, range=f"'{sheet_name}'!C1:C250")
+        .execute()
+        .get("values", [])
+    )
+    for i, row in enumerate(col_c, start=1):
+        label = str(row[0]).strip() if row else ""
+        if label == "Calls completed":
+            return i
+    raise SystemExit(f"Could not find Calls completed row in {spreadsheet_id}")
 
 
 def _to_numeric(value: str) -> float | None:
@@ -196,11 +229,10 @@ def _month_num(label: str) -> int | None:
     return None
 
 
-def _load_year_series(
-    sheets, spreadsheet_id: str, sheet_name: str, year: int
+def _load_row_year_series(
+    sheets, spreadsheet_id: str, sheet_name: str, year: int, row_num: int
 ) -> pd.Series:
     headers = _header_row(sheets, spreadsheet_id, sheet_name)
-    row_num = _find_total_new_members_row(sheets, spreadsheet_id, sheet_name)
     values = _row_values(sheets, spreadsheet_id, sheet_name, row_num)
 
     month_values: dict[int, float] = {}
@@ -217,6 +249,20 @@ def _load_year_series(
         month_values[month_num] = val
 
     return pd.Series(month_values, name=str(year)).sort_index()
+
+
+def _load_year_series(
+    sheets, spreadsheet_id: str, sheet_name: str, year: int
+) -> pd.Series:
+    row_num = _find_total_new_members_row(sheets, spreadsheet_id, sheet_name)
+    return _load_row_year_series(sheets, spreadsheet_id, sheet_name, year, row_num)
+
+
+def _load_calls_completed_year_series(
+    sheets, spreadsheet_id: str, sheet_name: str, year: int
+) -> pd.Series:
+    row_num = _find_calls_completed_row(sheets, spreadsheet_id, sheet_name)
+    return _load_row_year_series(sheets, spreadsheet_id, sheet_name, year, row_num)
 
 
 def _plot(df: pd.DataFrame, out_path: Path) -> None:
@@ -339,7 +385,7 @@ def build_report() -> tuple[pd.DataFrame, list[str], Path, Path]:
     sources: list[str] = []
 
     for meta in TRACKERS.values():
-        file_info = _find_spreadsheet(drive, meta["name"])
+        file_info = _resolve_tracker_spreadsheet(drive, meta)
         year = meta["year"]
         sheet_name = _resolve_sheet_name(sheets, file_info["id"], DEFAULT_SHEET)
         row_num = _find_total_new_members_row(sheets, file_info["id"], sheet_name)

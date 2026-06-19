@@ -2,9 +2,14 @@
 Monthly funnel totals for the Leads / DCs / Signups over-time chart.
 
 Sources (no campaign attribution, no spend weighting):
-- Before Sep 2025: **Digital Channel Dashboard 2024-25** Data tab (all channels summed).
-- From Sep 2025: GoHighLevel — new contacts (dateAdded), discovery-call meetings
-  (configured calendar IDs, startTime), committed signups (Sign Up Date).
+- Through Aug 30, 2025:
+  - **Leads** — HubSpot migration export (deduped new contacts by create date).
+    Months after the HubSpot snapshot (Aug 2025) have no GHL bridge — GHL starts
+    only after Aug 30.
+  - **Discovery calls** — Digital Cross-Channel Tracker **Calls completed** row.
+  - **Signups** — Tracker **GRAND TOTAL New Members** (same as Signups Over Time).
+- From Sep 1, 2025 (after Aug 30): GoHighLevel — new contacts (dateAdded),
+  discovery-call meetings (calendar startTime), committed signups (Sign Up Date).
 """
 
 from __future__ import annotations
@@ -20,7 +25,12 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+_DC_LIVE_DASH = Path(__file__).resolve().parent
+if str(_DC_LIVE_DASH) not in sys.path:
+    sys.path.insert(0, str(_DC_LIVE_DASH))
+
 from digital_channel_sheets import SPREADSHEET_NAME, load_campaign_data
+from hubspot_migration_data import HUBSPOT_DATA_UNTIL, load_hubspot_leads_monthly
 from ghl_client import (
     contact_custom_field_value,
     discovery_call_calendar_ids,
@@ -29,9 +39,8 @@ from ghl_client import (
 )
 
 # Bump when loader logic changes (Streamlit cache key).
-FUNNEL_OVER_TIME_REVISION = "2026-06-19-funnel-v1"
+FUNNEL_OVER_TIME_REVISION = "2026-06-19-funnel-aligned-signups-v1"
 
-GHL_FUNNEL_SINCE = "2025-09-01"
 _FUNNEL_COLUMNS = ("month", "leads", "dcs", "signups", "source")
 
 
@@ -51,40 +60,111 @@ def _empty_funnel() -> pd.DataFrame:
 
 
 def load_sheet_funnel_monthly(since: str, until: str) -> tuple[pd.DataFrame, list[str]]:
-    """Channel-agnostic monthly leads, DCs, and signups from the Data tab."""
+    """
+    Pre-GHL org-wide funnel through Aug 30, 2025.
+
+    HubSpot leads, tracker completed calls and signups (signups match Signups Over Time).
+    """
+    from digital_channel_live_data import (
+        GHL_SIGNUPS_SINCE,
+        SHEETS_DCS_UNTIL,
+        SHEETS_SIGNUPS_UNTIL,
+        _fetch_tracker_calls_completed,
+        _fetch_tracker_grand_total_signups,
+    )
+
     notes: list[str] = []
-    try:
-        sheet_df = load_campaign_data()
-    except Exception as exc:
-        return _empty_funnel(), [f"Sheet funnel skipped: {exc}"]
-
-    if sheet_df.empty:
-        return _empty_funnel(), notes
-
     since_month = pd.Timestamp(since).to_period("M").to_timestamp()
     until_month = pd.Timestamp(until).to_period("M").to_timestamp()
-    ghl_cutoff = pd.Timestamp(GHL_FUNNEL_SINCE).to_period("M").to_timestamp()
-    sheet_until = min(until_month, ghl_cutoff - pd.offsets.MonthBegin(1))
-
-    subset = sheet_df[
-        (sheet_df["month"] >= since_month) & (sheet_df["month"] <= sheet_until)
-    ]
-    if subset.empty:
+    sheet_until = min(
+        until_month,
+        pd.Timestamp(SHEETS_SIGNUPS_UNTIL).to_period("M").to_timestamp(),
+    )
+    if since_month > sheet_until:
         return _empty_funnel(), notes
 
-    monthly = (
-        subset.groupby("month", as_index=False)
-        .agg(
-            leads=("leads", "sum"),
-            dcs=("dcs", "sum"),
-            signups=("conversions", "sum"),
-        )
-        .sort_values("month")
+    range_until = (sheet_until + pd.offsets.MonthEnd(0)).strftime("%Y-%m-%d")
+
+    hubspot_leads, lead_notes = load_hubspot_leads_monthly(
+        since_month.strftime("%Y-%m-%d"),
+        range_until,
     )
-    monthly["source"] = "sheet"
+    notes.extend(lead_notes)
+
+    tracker_signups, _, tracker_signup_notes = _fetch_tracker_grand_total_signups(
+        since_month.strftime("%Y-%m-%d"),
+        range_until,
+    )
+    notes.extend(tracker_signup_notes)
+
+    tracker_dcs, _, tracker_dc_notes = _fetch_tracker_calls_completed(
+        since_month.strftime("%Y-%m-%d"),
+        range_until,
+    )
+    notes.extend(tracker_dc_notes)
+
+    data_tab_leads: dict[pd.Timestamp, float] = {}
+    hubspot_until = pd.Timestamp(HUBSPOT_DATA_UNTIL).to_period("M").to_timestamp()
+    if sheet_until > hubspot_until:
+        try:
+            sheet_df = load_campaign_data()
+            subset = sheet_df[
+                (sheet_df["month"] > hubspot_until)
+                & (sheet_df["month"] >= since_month)
+                & (sheet_df["month"] <= sheet_until)
+            ]
+            if not subset.empty:
+                leads_grp = subset.groupby("month", as_index=False)["leads"].sum()
+                for _, row in leads_grp.iterrows():
+                    val = float(row["leads"])
+                    if val > 0:
+                        data_tab_leads[pd.Timestamp(row["month"])] = val
+                if data_tab_leads:
+                    notes.append(
+                        f"Funnel fallback: {SPREADSHEET_NAME} Data tab for leads after "
+                        f"{hubspot_until.strftime('%b %Y')} (no GHL before "
+                        f"{pd.Timestamp(GHL_SIGNUPS_SINCE).strftime('%b %d, %Y')})."
+                    )
+        except Exception as exc:
+            notes.append(f"Data tab fallback skipped: {exc}")
+
+    sheet_signup_cutoff = pd.Timestamp(SHEETS_SIGNUPS_UNTIL).to_period("M").to_timestamp()
+    sheet_dcs_cutoff = pd.Timestamp(SHEETS_DCS_UNTIL).to_period("M").to_timestamp()
+
+    rows: list[dict[str, Any]] = []
+    for month in _month_range(since_month.strftime("%Y-%m-%d"), sheet_until.strftime("%Y-%m-%d")):
+        if month > hubspot_until:
+            leads = float(data_tab_leads.get(month, 0.0))
+        else:
+            leads = float(hubspot_leads.get(month, 0.0))
+
+        if month <= sheet_dcs_cutoff:
+            dcs = float(tracker_dcs.get(month, 0.0))
+        else:
+            dcs = 0.0
+
+        if month <= sheet_signup_cutoff:
+            signups = float(tracker_signups.get(month, 0.0))
+        else:
+            signups = 0.0
+
+        rows.append(
+            {
+                "month": month,
+                "leads": leads,
+                "dcs": dcs,
+                "signups": signups,
+                "source": "hubspot+tracker",
+            }
+        )
+
+    if not rows:
+        return _empty_funnel(), notes
+
+    monthly = pd.DataFrame(rows).sort_values("month").reset_index(drop=True)
     notes.append(
-        f"Funnel (sheet): {SPREADSHEET_NAME} Data tab through "
-        f"{sheet_until.strftime('%b %Y')} — all channels summed."
+        "Funnel (through Aug 30, 2025): HubSpot leads; tracker GRAND TOTAL signups "
+        "(aligned with Signups Over Time) and Calls completed for DCs."
     )
     return monthly, notes
 
@@ -191,8 +271,10 @@ def _ghl_signups_monthly(since: str, until: str) -> tuple[dict[pd.Timestamp, int
 
 
 def load_ghl_funnel_monthly(since: str, until: str) -> tuple[pd.DataFrame, list[str]]:
-    """Monthly funnel from GHL (Sep 2025+ in production use)."""
-    ghl_since = max(since, GHL_FUNNEL_SINCE)
+    """Monthly funnel from GHL (from Sep 1, 2025 — after Aug 30)."""
+    from digital_channel_live_data import GHL_SIGNUPS_SINCE
+
+    ghl_since = max(since, GHL_SIGNUPS_SINCE)
     if pd.Timestamp(until) < pd.Timestamp(ghl_since):
         return _empty_funnel(), []
 
@@ -220,10 +302,10 @@ def load_ghl_funnel_monthly(since: str, until: str) -> tuple[pd.DataFrame, list[
 
 def load_funnel_over_time(since: str, until: str) -> tuple[pd.DataFrame, list[str]]:
     """
-    Stitch sheet months (before Sep 2025) with GHL months (Sep 2025 onward).
+    Stitch pre-GHL months (through Aug 30, 2025) with GHL months (Sep 2025 onward).
 
     Returns one row per calendar month in range with columns:
-    month, leads, dcs, signups, source ('sheet' | 'ghl').
+    month, leads, dcs, signups, source ('hubspot+tracker' | 'ghl').
     """
     notes: list[str] = []
     sheet_df, sheet_notes = load_sheet_funnel_monthly(since, until)
@@ -256,3 +338,13 @@ __all__ = [
     "load_sheet_funnel_monthly",
     "load_ghl_funnel_monthly",
 ]
+
+
+def _ghl_funnel_since() -> str:
+    from digital_channel_live_data import GHL_SIGNUPS_SINCE
+
+    return GHL_SIGNUPS_SINCE
+
+
+# Same cutover as Signups Over Time / DCs charts (GHL after Aug 30, 2025).
+GHL_FUNNEL_SINCE = _ghl_funnel_since()

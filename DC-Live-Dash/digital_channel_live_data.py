@@ -33,7 +33,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 # Bump when loader logic or ghl_client signup/DC helpers change — Streamlit keeps
 # imported modules across reruns; reload ghl_client when its revision differs.
-LIVE_DATA_REVISION = "2026-06-19-cpl-jul-2025-smooth-v1"
+LIVE_DATA_REVISION = "2026-06-19-signups-tracker-q2-v1"
 GHL_ATTRIBUTION_HEAR_ABOUT = "hear_about"
 GHL_ATTRIBUTION_TRACKER = "tracker"
 GHL_ATTRIBUTION_OPTIONS: tuple[tuple[str, str], ...] = (
@@ -99,6 +99,9 @@ def norm_membership_level(raw: str) -> str:
 DEFAULT_SINCE = "2023-01-01"
 GHL_SIGNUPS_SINCE = "2025-09-01"
 SHEETS_SIGNUPS_UNTIL = "2025-08-31"
+# DCs trend chart uses the same sheet / GHL cutover as signups.
+SHEETS_DCS_UNTIL = SHEETS_SIGNUPS_UNTIL
+GHL_DCS_SINCE = GHL_SIGNUPS_SINCE
 SHEET_LEADS_UNTIL = "2025-06-30"
 # Jul 2025 GHL bulk import from legacy CRM — CPL trend uses Jun/Aug average.
 GHL_CRM_DUMP_MONTH = pd.Timestamp("2025-07-01")
@@ -144,7 +147,7 @@ def _fetch_tracker_grand_total_signups(
     since: str, until: str
 ) -> tuple[dict[pd.Timestamp, float], set[pd.Timestamp], list[str]]:
     """
-    Monthly GRAND TOTAL New Members from Digital Cross-Channel Tracker sheets.
+    Monthly TOTAL / GRAND TOTAL New Members from Digital Cross-Channel Tracker sheets.
 
     Used for signups through ``SHEETS_SIGNUPS_UNTIL`` (Aug 30, 2025).
     """
@@ -153,7 +156,7 @@ def _fetch_tracker_grand_total_signups(
         DEFAULT_SHEET,
         TRACKERS,
         _credentials,
-        _find_spreadsheet,
+        _resolve_tracker_spreadsheet,
         _load_year_series,
         _resolve_sheet_name,
     )
@@ -176,7 +179,7 @@ def _fetch_tracker_grand_total_signups(
         year = meta["year"]
         if year not in years_needed:
             continue
-        file_info = _find_spreadsheet(drive, meta["name"])
+        file_info = _resolve_tracker_spreadsheet(drive, meta)
         sheet_name = _resolve_sheet_name(sheets, file_info["id"], DEFAULT_SHEET)
         series = _load_year_series(sheets, file_info["id"], sheet_name, year)
         for month_num, val in series.items():
@@ -188,6 +191,60 @@ def _fetch_tracker_grand_total_signups(
         notes.append(
             f"Signups (sheet): {meta['name']} / {sheet_name} — "
             "GRAND TOTAL New Members row."
+        )
+
+    return totals, set(totals.keys()), notes
+
+
+def _fetch_tracker_calls_completed(
+    since: str, until: str
+) -> tuple[dict[pd.Timestamp, float], set[pd.Timestamp], list[str]]:
+    """
+    Monthly **Calls completed** from Digital Cross-Channel Tracker sheets (2023–2025).
+
+    Used for DCs through ``SHEETS_DCS_UNTIL`` (Aug 30, 2025).
+    """
+    from googleapiclient.discovery import build
+    from total_new_members_yoy_chart import (
+        DEFAULT_SHEET,
+        TRACKERS,
+        _credentials,
+        _resolve_tracker_spreadsheet,
+        _load_calls_completed_year_series,
+        _resolve_sheet_name,
+    )
+
+    since_d = pd.Timestamp(since)
+    until_d = pd.Timestamp(until)
+    sheet_until = min(until_d, pd.Timestamp(SHEETS_DCS_UNTIL))
+    if since_d > sheet_until:
+        return {}, set(), []
+
+    creds = _credentials()
+    drive = build("drive", "v3", credentials=creds)
+    sheets = build("sheets", "v4", credentials=creds)
+
+    totals: dict[pd.Timestamp, float] = {}
+    notes: list[str] = []
+    years_needed = set(range(since_d.year, sheet_until.year + 1))
+
+    for meta in TRACKERS.values():
+        year = meta["year"]
+        if year not in years_needed or year > 2025:
+            continue
+        file_info = _resolve_tracker_spreadsheet(drive, meta)
+        sheet_name = _resolve_sheet_name(sheets, file_info["id"], DEFAULT_SHEET)
+        series = _load_calls_completed_year_series(
+            sheets, file_info["id"], sheet_name, year
+        )
+        for month_num, val in series.items():
+            month_ts = pd.Timestamp(year=year, month=int(month_num), day=1)
+            if since_d.to_period("M") <= month_ts.to_period("M") <= sheet_until.to_period(
+                "M"
+            ):
+                totals[month_ts] = float(val)
+        notes.append(
+            f"DCs (sheet): {meta['name']} / {sheet_name} — Calls completed row."
         )
 
     return totals, set(totals.keys()), notes
@@ -1000,6 +1057,8 @@ def fetch_ghl_channel_monthly(
     pd.DataFrame,
     dict[pd.Timestamp, float],
     dict[str, dict[pd.Timestamp, float]],
+    dict[pd.Timestamp, float],
+    dict[pd.Timestamp, float],
 ]:
     """
     Channel-month GHL funnel metrics not available at campaign level in ads APIs.
@@ -1098,6 +1157,7 @@ def fetch_ghl_channel_monthly(
     meta_dcs_by_month: dict[pd.Timestamp, float] = {}
     google_dcs_by_month: dict[pd.Timestamp, float] = {}
     unallocated_dcs_by_month: dict[pd.Timestamp, float] = {}
+    ghl_dcs_by_month: dict[pd.Timestamp, float] = {}
     try:
         dc_meetings = fetch_discovery_call_meetings_monthly_by_channel(since, until)
         if dc_meetings.get("calendar_api_errors"):
@@ -1125,6 +1185,11 @@ def fetch_ghl_channel_monthly(
             unallocated = float(row.get("unallocated") or 0)
             if unallocated:
                 unallocated_dcs_by_month[month] = unallocated
+            ghl_dcs_by_month[month] = (
+                float(row.get("google") or 0)
+                + float(row.get("meta") or 0)
+                + unallocated
+            )
     except Exception as exc:
         notes.append(f"GHL discovery-call meetings skipped: {exc}")
 
@@ -1138,6 +1203,7 @@ def fetch_ghl_channel_monthly(
     tracker_unallocated_by_month_level: dict[tuple[pd.Timestamp, str], float] = {}
     combined_unallocated_by_month_level: dict[tuple[pd.Timestamp, str], float] = {}
     wom_by_month_level: dict[tuple[pd.Timestamp, str], float] = {}
+    ghl_signups_by_month: dict[pd.Timestamp, float] = {}
     ghl_conv_since = max(since, GHL_SIGNUPS_SINCE)
     since_month = pd.Timestamp(since).to_period("M").to_timestamp()
     until_month = pd.Timestamp(until).to_period("M").to_timestamp()
@@ -1171,6 +1237,7 @@ def fetch_ghl_channel_monthly(
                 month = signup_day.to_period("M").to_timestamp()
                 if month < since_month or month > until_month:
                     continue
+                ghl_signups_by_month[month] = ghl_signups_by_month.get(month, 0.0) + 1.0
                 hear = contact_custom_field_value(contact, hear_id)
                 level = norm_membership_level(
                     contact_custom_field_value(contact, mid) if mid else ""
@@ -1403,6 +1470,8 @@ def fetch_ghl_channel_monthly(
         combined_unallocated_conv_df,
         unallocated_dcs_by_month,
         unallocated_leads_by_attr,
+        ghl_signups_by_month,
+        ghl_dcs_by_month,
     )
 
 
@@ -1760,6 +1829,15 @@ def _attribution_leads_column(*, use_hear_about: bool, use_tracker: bool) -> str
     return "leads"
 
 
+def _unallocated_leads_attr_key(*, use_hear_about: bool, use_tracker: bool) -> str:
+    """Key in ``unallocated_leads_by_attr`` for organic (non–paid-attributed) leads."""
+    if use_hear_about and use_tracker:
+        return "leads_combined"
+    if use_hear_about:
+        return "leads_hear_about"
+    return "leads"
+
+
 def build_spend_trend_monthly(df: pd.DataFrame) -> pd.DataFrame:
     """Monthly spend totals only — independent of leads, DCs, and signups aggregation."""
     if df.empty:
@@ -1778,43 +1856,170 @@ def _cpl_source_leads_column(*, use_hear_about: bool, use_tracker: bool) -> str:
 
 def build_cpl_trend_monthly(
     df: pd.DataFrame,
+    cpl_channel_month_leads: pd.DataFrame,
     *,
+    selected_channels: list[str],
     use_hear_about: bool,
     use_tracker: bool,
+    include_organic: bool = False,
+    unallocated_leads_by_attr: dict[str, dict[pd.Timestamp, float]] | None = None,
 ) -> pd.DataFrame:
     """
-    Monthly spend and attributed leads for CPL trend charts.
+    Monthly spend and leads for CPL trend charts.
 
-    Excludes unallocated GHL contacts spread by spend share — CPL is spend divided
-    by paid-attributed leads only (sheet baseline through Jun 2025; GHL hear-about
-    or tracker from Jul 2025 onward).
+    Paid-attributed leads follow sidebar filters (channel, campaign, asset type).
+    Organic contacts (unallocated for the active attribution mode) are optional and
+    added at month level when ``include_organic`` is True — not channel-filtered.
+    Sheet baseline through Jun 2025; GHL attribution from Jul 2025 onward.
     """
     spend = build_spend_trend_monthly(df)
-    if df.empty:
+    if df.empty and cpl_channel_month_leads.empty:
         return pd.DataFrame(columns=["month", "spend", "leads"])
 
-    work = df.copy()
-    cpl_col = _cpl_source_leads_column(
-        use_hear_about=use_hear_about, use_tracker=use_tracker
-    )
-    attr_col = _attribution_leads_column(
-        use_hear_about=use_hear_about, use_tracker=use_tracker
-    )
-    if cpl_col in work.columns:
-        work["leads"] = work[cpl_col]
-    elif attr_col in work.columns:
-        work["leads"] = work[attr_col]
-    else:
-        work["leads"] = work.get("leads", 0.0)
+    sheet_leads_max = pd.Timestamp(SHEET_LEADS_UNTIL).to_period("M").to_timestamp()
+    leads_monthly = pd.DataFrame(columns=["month", "leads"])
 
-    leads = (
-        work.groupby("month", as_index=False)["leads"]
-        .sum()
-        .sort_values("month")
-        .reset_index(drop=True)
-    )
-    out = spend.merge(leads, on="month", how="outer").fillna(0.0)
+    if not df.empty and (use_hear_about or use_tracker):
+        work = df.copy()
+        cpl_col = _cpl_source_leads_column(
+            use_hear_about=use_hear_about, use_tracker=use_tracker
+        )
+        attr_col = _attribution_leads_column(
+            use_hear_about=use_hear_about, use_tracker=use_tracker
+        )
+        if cpl_col in work.columns:
+            work["leads"] = work[cpl_col]
+        elif attr_col in work.columns:
+            work["leads"] = work[attr_col]
+        else:
+            work["leads"] = work.get("leads", 0.0)
+
+        leads_monthly = (
+            work.groupby("month", as_index=False)["leads"]
+            .sum()
+            .sort_values("month")
+            .reset_index(drop=True)
+        )
+
+    if not cpl_channel_month_leads.empty and (use_hear_about or use_tracker):
+        leads_monthly = overlay_monthly_leads_for_trends(
+            leads_monthly,
+            cpl_channel_month_leads,
+            selected_channels=selected_channels,
+            use_hear_about=use_hear_about,
+            use_tracker=use_tracker,
+        )
+
+    if include_organic and unallocated_leads_by_attr and (use_hear_about or use_tracker):
+        organic_key = _unallocated_leads_attr_key(
+            use_hear_about=use_hear_about, use_tracker=use_tracker
+        )
+        organic_by_month = unallocated_leads_by_attr.get(organic_key, {})
+        if organic_by_month:
+            if leads_monthly.empty:
+                leads_monthly = pd.DataFrame(
+                    {
+                        "month": [
+                            pd.Timestamp(m).to_period("M").to_timestamp()
+                            for m in organic_by_month
+                        ],
+                        "leads": 0.0,
+                    }
+                )
+            leads_monthly = leads_monthly.copy()
+            leads_monthly["month"] = (
+                pd.to_datetime(leads_monthly["month"]).dt.to_period("M").dt.to_timestamp()
+            )
+            by_month = leads_monthly.set_index("month")
+            for month, organic_n in organic_by_month.items():
+                month_ts = pd.Timestamp(month).to_period("M").to_timestamp()
+                if month_ts <= sheet_leads_max:
+                    continue
+                organic_n = float(organic_n)
+                if organic_n <= 0:
+                    continue
+                if month_ts in by_month.index:
+                    by_month.at[month_ts, "leads"] = (
+                        float(by_month.at[month_ts, "leads"]) + organic_n
+                    )
+                else:
+                    by_month.loc[month_ts, "leads"] = organic_n
+            leads_monthly = (
+                by_month.reset_index().sort_values("month").reset_index(drop=True)
+            )
+
+    out = spend.merge(leads_monthly, on="month", how="outer").fillna(0.0)
     return _smooth_ghl_crm_dump_month_cpl(out[["month", "spend", "leads"]])
+
+
+def build_signups_trend_monthly(
+    *,
+    since: str,
+    until: str,
+    sheet_signup_totals: dict[pd.Timestamp, float],
+    ghl_signups_by_month: dict[pd.Timestamp, float],
+) -> pd.DataFrame:
+    """
+    Org-wide monthly signups for the Signups Over Time chart.
+
+    Through Aug 2025: Digital Cross-Channel Tracker **GRAND TOTAL New Members** row.
+    From Sep 2025: GHL committed contacts by **Sign Up Date** (all members, not
+    campaign- or attribution-filtered).
+    """
+    since_month = pd.Timestamp(since).to_period("M").to_timestamp()
+    until_month = pd.Timestamp(until).to_period("M").to_timestamp()
+    sheet_cutoff = pd.Timestamp(SHEETS_SIGNUPS_UNTIL).to_period("M").to_timestamp()
+    ghl_since_month = pd.Timestamp(GHL_SIGNUPS_SINCE).to_period("M").to_timestamp()
+
+    rows: list[dict[str, Any]] = []
+    for period in pd.period_range(since_month, until_month, freq="M"):
+        month = period.to_timestamp()
+        if month <= sheet_cutoff:
+            conversions = float(sheet_signup_totals.get(month, 0.0))
+        elif month >= ghl_since_month:
+            conversions = float(ghl_signups_by_month.get(month, 0.0))
+        else:
+            conversions = 0.0
+        rows.append({"month": month, "conversions": conversions})
+
+    if not rows:
+        return pd.DataFrame(columns=["month", "conversions"])
+    return pd.DataFrame(rows).sort_values("month").reset_index(drop=True)
+
+
+def build_dcs_trend_monthly(
+    *,
+    since: str,
+    until: str,
+    sheet_dcs_totals: dict[pd.Timestamp, float],
+    ghl_dcs_by_month: dict[pd.Timestamp, float],
+) -> pd.DataFrame:
+    """
+    Org-wide monthly discovery calls for the DCs Over Time chart.
+
+    Through Aug 2025: Digital Cross-Channel Tracker **Calls completed** row.
+    From Sep 2025: GHL calendar **meetings** (``startTime``) on configured
+    discovery-call calendar IDs (all meetings, not campaign-filtered).
+    """
+    since_month = pd.Timestamp(since).to_period("M").to_timestamp()
+    until_month = pd.Timestamp(until).to_period("M").to_timestamp()
+    sheet_cutoff = pd.Timestamp(SHEETS_DCS_UNTIL).to_period("M").to_timestamp()
+    ghl_since_month = pd.Timestamp(GHL_DCS_SINCE).to_period("M").to_timestamp()
+
+    rows: list[dict[str, Any]] = []
+    for period in pd.period_range(since_month, until_month, freq="M"):
+        month = period.to_timestamp()
+        if month <= sheet_cutoff:
+            dcs = float(sheet_dcs_totals.get(month, 0.0))
+        elif month >= ghl_since_month:
+            dcs = float(ghl_dcs_by_month.get(month, 0.0))
+        else:
+            dcs = 0.0
+        rows.append({"month": month, "dcs": dcs})
+
+    if not rows:
+        return pd.DataFrame(columns=["month", "dcs"])
+    return pd.DataFrame(rows).sort_values("month").reset_index(drop=True)
 
 
 def _smooth_ghl_crm_dump_month_cpl(cpl_monthly: pd.DataFrame) -> pd.DataFrame:
@@ -1861,27 +2066,48 @@ class TrendChartMonthlies:
 def build_trend_chart_monthlies(
     df: pd.DataFrame,
     channel_month_leads: pd.DataFrame,
+    cpl_channel_month_leads: pd.DataFrame,
+    unallocated_leads_by_attr: dict[str, dict[pd.Timestamp, float]] | None,
     *,
+    since: str,
+    until: str,
+    sheet_signup_totals: dict[pd.Timestamp, float],
+    ghl_signups_by_month: dict[pd.Timestamp, float],
+    sheet_dcs_totals: dict[pd.Timestamp, float],
+    ghl_dcs_by_month: dict[pd.Timestamp, float],
     selected_channels: list[str],
     use_hear_about: bool,
     use_tracker: bool,
+    include_organic: bool = False,
 ) -> TrendChartMonthlies:
     """
     Build separate monthly series for spend, CPL, DCs, and signups trend charts.
 
     Lead overlay applies only to the CPL series so DC and signup trends are not
-    affected by lead reconciliation. Spend is aggregated independently.
+    affected by lead reconciliation. Signups and DCs use org-wide tracker + GHL totals.
     """
     spend = build_spend_trend_monthly(df)
     cpl = build_cpl_trend_monthly(
-        df, use_hear_about=use_hear_about, use_tracker=use_tracker
+        df,
+        cpl_channel_month_leads,
+        selected_channels=selected_channels,
+        use_hear_about=use_hear_about,
+        use_tracker=use_tracker,
+        include_organic=include_organic,
+        unallocated_leads_by_attr=unallocated_leads_by_attr,
     )
-    base = monthly_campaign_summary(df)
-    if base.empty:
-        return TrendChartMonthlies(spend, cpl, base, base)
-
-    dcs = base[["month", "dcs"]].copy()
-    signups = base[["month", "conversions"]].copy()
+    signups = build_signups_trend_monthly(
+        since=since,
+        until=until,
+        sheet_signup_totals=sheet_signup_totals,
+        ghl_signups_by_month=ghl_signups_by_month,
+    )
+    dcs = build_dcs_trend_monthly(
+        since=since,
+        until=until,
+        sheet_dcs_totals=sheet_dcs_totals,
+        ghl_dcs_by_month=ghl_dcs_by_month,
+    )
 
     return TrendChartMonthlies(spend=spend, cpl=cpl, dcs=dcs, signups=signups)
 
@@ -2081,6 +2307,12 @@ def load_live_campaign_data(
     pd.DataFrame,
     set[pd.Timestamp],
     pd.DataFrame,
+    pd.DataFrame,
+    dict[str, dict[pd.Timestamp, float]],
+    dict[pd.Timestamp, float],
+    dict[pd.Timestamp, float],
+    dict[pd.Timestamp, float],
+    dict[pd.Timestamp, float],
 ]:
     """
     Fetch and normalize paid-media rows for the Digital Channel Dashboard.
@@ -2089,7 +2321,8 @@ def load_live_campaign_data(
         (dataframe, notes, GHL lead summary, hear conv_by_level, hear unallocated,
          wom_conv, tracker conv_by_level, tracker unallocated,
          combined conv_by_level, combined unallocated, sheet_signup_months,
-         channel_month_leads)
+         channel_month_leads, cpl_channel_month_leads, unallocated_leads_by_attr,
+         sheet_signup_totals, ghl_signups_by_month, sheet_dcs_totals, ghl_dcs_by_month)
     """
     today = date.today()
     until_eff = until or (today - timedelta(days=1)).isoformat()
@@ -2144,6 +2377,8 @@ def load_live_campaign_data(
         combined_unallocated_conv_df,
         unallocated_dcs_by_month,
         unallocated_leads_by_attr,
+        ghl_signups_by_month,
+        ghl_dcs_by_month,
     ) = fetch_ghl_channel_monthly(since_eff, until_eff)
     notes.extend(ghl_notes)
     notes.append(
@@ -2166,6 +2401,16 @@ def load_live_campaign_data(
             f"({int(sum(sheet_totals.values())):,} total)."
         )
 
+    sheet_dcs_totals, sheet_dcs_months, sheet_dcs_notes = _fetch_tracker_calls_completed(
+        since_eff, until_eff
+    )
+    notes.extend(sheet_dcs_notes)
+    if sheet_dcs_totals:
+        notes.append(
+            f"Tracker sheet DCs loaded for {len(sheet_dcs_totals)} month(s) "
+            f"({int(sum(sheet_dcs_totals.values())):,} Calls completed total)."
+        )
+
     if monthly_ads.empty:
         return (
             pd.DataFrame(columns=DATA_COLUMNS),
@@ -2180,6 +2425,12 @@ def load_live_campaign_data(
             combined_unallocated_conv_df,
             sheet_months,
             pd.DataFrame(columns=["month", "channel", "leads", "leads_hear_about", "leads_combined"]),
+            pd.DataFrame(columns=["month", "channel", "leads", "leads_hear_about", "leads_combined"]),
+            unallocated_leads_by_attr,
+            sheet_totals,
+            ghl_signups_by_month,
+            sheet_dcs_totals,
+            ghl_dcs_by_month,
         )
 
     if sheet_months and not ghl_monthly.empty:
@@ -2263,6 +2514,12 @@ def load_live_campaign_data(
         sheet_leads_max,
         unallocated_leads_by_attr,
     )
+    cpl_channel_month_leads = _build_source_channel_month_leads(
+        ghl_monthly,
+        sheet_leads_monthly,
+        sheet_leads_max,
+        None,
+    )
 
     for col in DATA_COLUMNS:
         if col not in merged.columns:
@@ -2290,6 +2547,12 @@ def load_live_campaign_data(
         combined_unallocated_conv_df,
         sheet_months,
         channel_month_leads,
+        cpl_channel_month_leads,
+        unallocated_leads_by_attr,
+        sheet_totals,
+        ghl_signups_by_month,
+        sheet_dcs_totals,
+        ghl_dcs_by_month,
     )
 
 
@@ -2297,6 +2560,8 @@ __all__ = [
     "MEMBERSHIP_LEVELS",
     "GHL_SIGNUPS_SINCE",
     "SHEETS_SIGNUPS_UNTIL",
+    "GHL_DCS_SINCE",
+    "SHEETS_DCS_UNTIL",
     "SHEET_LEADS_UNTIL",
     "GHL_ATTRIBUTION_HEAR_ABOUT",
     "GHL_ATTRIBUTION_TRACKER",
@@ -2308,6 +2573,8 @@ __all__ = [
     "load_live_campaign_data",
     "TrendChartMonthlies",
     "build_cpl_trend_monthly",
+    "build_dcs_trend_monthly",
+    "build_signups_trend_monthly",
     "build_spend_trend_monthly",
     "build_trend_chart_monthlies",
     "monthly_campaign_summary",

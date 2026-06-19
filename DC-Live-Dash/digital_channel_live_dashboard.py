@@ -29,7 +29,7 @@ if str(_DC_LIVE_DIR) not in sys.path:
 
 import digital_channel_live_data as _live_data_mod
 
-_EXPECTED_LIVE_DATA_REVISION = "2026-06-19-cpl-jul-2025-smooth-v1"
+_EXPECTED_LIVE_DATA_REVISION = "2026-06-19-signups-tracker-q2-v1"
 if (
     getattr(_live_data_mod, "LIVE_DATA_REVISION", None)
     != _EXPECTED_LIVE_DATA_REVISION
@@ -42,8 +42,12 @@ from digital_channel_live_data import (
     GHL_ATTRIBUTION_HEAR_ABOUT,
     GHL_ATTRIBUTION_OPTIONS,
     GHL_ATTRIBUTION_TRACKER,
+    GHL_SIGNUPS_SINCE,
+    GHL_DCS_SINCE,
     LIVE_DATA_REVISION,
     MEMBERSHIP_LEVELS,
+    SHEETS_SIGNUPS_UNTIL,
+    SHEETS_DCS_UNTIL,
     apply_dashboard_ghl_attribution,
     build_spend_trend_monthly,
     build_trend_chart_monthlies,
@@ -657,6 +661,11 @@ def _load_data(
     pd.DataFrame,
     frozenset[pd.Timestamp],
     pd.DataFrame,
+    pd.DataFrame,
+    dict[str, dict[pd.Timestamp, float]],
+    dict[pd.Timestamp, float],
+    dict[pd.Timestamp, float],
+    dict[pd.Timestamp, float],
 ]:
     (
         df,
@@ -671,6 +680,12 @@ def _load_data(
         combined_unallocated,
         sheet_months,
         channel_month_leads,
+        cpl_channel_month_leads,
+        unallocated_leads_by_attr,
+        sheet_signup_totals,
+        ghl_signups_by_month,
+        sheet_dcs_totals,
+        ghl_dcs_by_month,
     ) = load_live_campaign_data(since=since, until=until)
     return (
         df,
@@ -685,6 +700,12 @@ def _load_data(
         combined_unallocated,
         frozenset(sheet_months),
         channel_month_leads,
+        cpl_channel_month_leads,
+        unallocated_leads_by_attr,
+        sheet_signup_totals,
+        ghl_signups_by_month,
+        sheet_dcs_totals,
+        ghl_dcs_by_month,
     )
 
 
@@ -767,7 +788,7 @@ def main() -> None:
     load_since = min(since, prior_since)
     with st.spinner(load_label):
         try:
-            raw_df, notes, lead_summary, conv_by_level_df, unallocated_conv_df, wom_conv_df, tracker_conv_by_level_df, tracker_unallocated_conv_df, combined_conv_by_level_df, combined_unallocated_conv_df, sheet_months, channel_month_leads = _load_data(
+            raw_df, notes, lead_summary, conv_by_level_df, unallocated_conv_df, wom_conv_df, tracker_conv_by_level_df, tracker_unallocated_conv_df, combined_conv_by_level_df, combined_unallocated_conv_df, sheet_months, channel_month_leads, cpl_channel_month_leads, unallocated_leads_by_attr, sheet_signup_totals, ghl_signups_by_month, sheet_dcs_totals, ghl_dcs_by_month = _load_data(
                 load_since.isoformat(), until.isoformat()
             )
             funnel_df, funnel_notes = _load_funnel_over_time(
@@ -860,6 +881,18 @@ def main() -> None:
                 "Select at least one attribution source for GHL leads and signups."
             )
 
+        include_organic_leads = st.checkbox(
+            "Include Organic leads",
+            value=False,
+            help=(
+                "Leads only (not signups). Adds GHL new contacts without Google/Meta "
+                "attribution for the active source(s): blank hear-about, Word of "
+                "Mouth, other non-paid values, or hear-about/tracker conflicts. "
+                "Off by default. Not channel-filtered — included when checked even "
+                "if only Google Ads or FB/IG is selected."
+            ),
+        )
+
         include_wom_signups = False
         if use_hear_about:
             include_wom_signups = st.checkbox(
@@ -939,9 +972,18 @@ def main() -> None:
     trend_monthlies = build_trend_chart_monthlies(
         df,
         channel_month_leads,
+        cpl_channel_month_leads,
+        unallocated_leads_by_attr,
+        since=since.isoformat(),
+        until=until.isoformat(),
+        sheet_signup_totals=sheet_signup_totals,
+        ghl_signups_by_month=ghl_signups_by_month,
+        sheet_dcs_totals=sheet_dcs_totals,
+        ghl_dcs_by_month=ghl_dcs_by_month,
         selected_channels=selected_channels,
         use_hear_about=use_hear_about,
         use_tracker=use_tracker,
+        include_organic=include_organic_leads,
     )
     spend_period_df, use_quarterly = _time_period_summary(
         trend_monthlies.spend, since, until
@@ -1033,12 +1075,25 @@ def main() -> None:
                 st.caption(
                     "Jul 2025 uses the average of Jun and Aug 2025 (legacy CRM import into GHL)."
                 )
+            if include_organic_leads:
+                st.caption(
+                    "CPL includes **Organic** leads (non–paid-attributed contacts) in the "
+                    "denominator; spend still follows channel and campaign filters."
+                )
         else:
             st.info("CPL over time unavailable (no leads in the selected range).")
     with c3:
         st.plotly_chart(
             _line_chart(dcs_period_df, ["dcs"], "DCs Over Time", "DCs"),
             use_container_width=True,
+        )
+        st.caption(
+            "Org-wide discovery calls — **Digital Cross-Channel Tracker** Calls completed "
+            f"through {pd.Timestamp(SHEETS_DCS_UNTIL).strftime('%b %Y')}; "
+            f"**GoHighLevel** calendar meetings (startTime) on "
+            f"{len(discovery_call_calendar_ids())} discovery-call calendar(s) from "
+            f"{pd.Timestamp(GHL_DCS_SINCE).strftime('%b %Y')} onward. "
+            "Not affected by campaign or attribution filters."
         )
     with c4:
         st.plotly_chart(
@@ -1050,6 +1105,13 @@ def main() -> None:
             ),
             use_container_width=True,
         )
+        st.caption(
+            "Org-wide signups — **Digital Cross-Channel Tracker** GRAND TOTAL New Members "
+            f"through {pd.Timestamp(SHEETS_SIGNUPS_UNTIL).strftime('%b %Y')}; "
+            f"**GoHighLevel** committed members by Sign Up Date from "
+            f"{pd.Timestamp(GHL_SIGNUPS_SINCE).strftime('%b %Y')} onward. "
+            "Not affected by campaign or attribution filters."
+        )
 
     funnel_chart = _funnel_over_time_chart(funnel_df)
     if funnel_chart:
@@ -1057,10 +1119,12 @@ def main() -> None:
     else:
         st.info("No funnel data for the selected date range.")
     st.caption(
-        f"Org-wide monthly totals — **Digital Channel Dashboard 2024-25** Data tab before "
-        f"{pd.Timestamp(GHL_FUNNEL_SINCE).strftime('%b %Y')}, **GoHighLevel** from that month "
-        f"(new contacts by date added, {len(discovery_call_calendar_ids())} discovery-call "
-        "calendars by meeting date, committed signups by sign-up date). "
+        "Org-wide monthly totals through Aug 30, 2025 — **HubSpot** leads, **Digital "
+        "Cross-Channel Tracker** Calls completed and GRAND TOTAL signups (signups match "
+        "Signups Over Time). **GoHighLevel** from "
+        f"{pd.Timestamp(GHL_SIGNUPS_SINCE).strftime('%b %Y')} onward (new contacts by "
+        f"date added, {len(discovery_call_calendar_ids())} discovery-call calendars by "
+        "meeting date, committed signups by sign-up date). "
         "Not affected by campaign or attribution filters above."
     )
     with st.expander("Funnel chart — data sources"):
