@@ -29,7 +29,7 @@ if str(_DC_LIVE_DIR) not in sys.path:
 
 import digital_channel_live_data as _live_data_mod
 
-_EXPECTED_LIVE_DATA_REVISION = "2026-06-19-sheet-leads-unallocated-v1"
+_EXPECTED_LIVE_DATA_REVISION = "2026-06-19-cpl-jul-2025-smooth-v1"
 if (
     getattr(_live_data_mod, "LIVE_DATA_REVISION", None)
     != _EXPECTED_LIVE_DATA_REVISION
@@ -45,11 +45,11 @@ from digital_channel_live_data import (
     LIVE_DATA_REVISION,
     MEMBERSHIP_LEVELS,
     apply_dashboard_ghl_attribution,
+    build_spend_trend_monthly,
+    build_trend_chart_monthlies,
     channel_month_leads_total,
     clear_ghl_leads_day_cache,
     load_live_campaign_data,
-    monthly_campaign_summary,
-    overlay_monthly_leads_for_trends,
     scorecard_metrics,
 )
 
@@ -85,6 +85,10 @@ def _time_period_summary(
     if monthly.empty:
         return monthly, False
 
+    value_cols = [
+        c for c in monthly.columns if c not in {"month", "period_label", "quarter"}
+    ]
+
     if not _use_quarterly_grouping(since, until):
         out = monthly.copy()
         out["period_label"] = out["month"].dt.strftime("%b %Y")
@@ -92,17 +96,7 @@ def _time_period_summary(
 
     df = monthly.copy()
     df["quarter"] = df["month"].dt.to_period("Q")
-    out = (
-        df.groupby("quarter", as_index=False)
-        .agg(
-            spend=("spend", "sum"),
-            clicks=("clicks", "sum"),
-            leads=("leads", "sum"),
-            dcs=("dcs", "sum"),
-            conversions=("conversions", "sum"),
-        )
-        .sort_values("quarter")
-    )
+    out = df.groupby("quarter", as_index=False)[value_cols].sum().sort_values("quarter")
     out["month"] = out["quarter"].dt.to_timestamp()
     out["period_label"] = out["quarter"].apply(lambda p: f"Q{p.quarter} {p.year}")
     return out, True
@@ -168,18 +162,18 @@ def _prior_year_date(d: date) -> date:
 
 
 def _spend_over_time_chart(
-    period_df: pd.DataFrame,
-    prior_monthly: pd.DataFrame,
+    spend_period_df: pd.DataFrame,
+    prior_spend_monthly: pd.DataFrame,
     *,
     prior_since: date,
     prior_until: date,
 ) -> go.Figure:
     """Spend for the selected range with prior-year same-period spend overlaid."""
-    x_order = period_df["period_label"].tolist()
-    current_y = period_df["spend"].tolist()
+    x_order = spend_period_df["period_label"].tolist()
+    current_y = spend_period_df["spend"].tolist()
 
     prior_period_df, _ = _time_period_summary(
-        prior_monthly, prior_since, prior_until
+        prior_spend_monthly, prior_since, prior_until
     )
     prior_by_month = (
         prior_period_df.set_index("month")["spend"].to_dict()
@@ -188,7 +182,7 @@ def _spend_over_time_chart(
     )
 
     prior_y: list[float | None] = []
-    for _, row in period_df.iterrows():
+    for _, row in spend_period_df.iterrows():
         prior_key = row["month"] - pd.DateOffset(years=1)
         val = prior_by_month.get(prior_key)
         prior_y.append(float(val) if val is not None and not pd.isna(val) else None)
@@ -449,7 +443,7 @@ def _cpl_over_time_chart(monthly: pd.DataFrame) -> go.Figure | None:
         xaxis_title="",
         yaxis_title="CPL ($)",
     )
-    fig.update_yaxes(tickformat="$,.0f")
+    fig.update_yaxes(tickformat="$,.2f")
     fig.update_traces(
         line=dict(width=2.5, color=COLORS["2024"]),
         marker=dict(size=7),
@@ -940,17 +934,21 @@ def main() -> None:
             prior_df["fb_ig_type"].isin(selected_meta_types)
         )
         prior_df = prior_df.loc[prior_meta_mask].copy()
-    prior_monthly = monthly_campaign_summary(prior_df)
+    prior_spend_monthly = build_spend_trend_monthly(prior_df)
 
-    monthly = monthly_campaign_summary(df)
-    monthly = overlay_monthly_leads_for_trends(
-        monthly,
+    trend_monthlies = build_trend_chart_monthlies(
+        df,
         channel_month_leads,
         selected_channels=selected_channels,
         use_hear_about=use_hear_about,
         use_tracker=use_tracker,
     )
-    period_df, use_quarterly = _time_period_summary(monthly, since, until)
+    spend_period_df, use_quarterly = _time_period_summary(
+        trend_monthlies.spend, since, until
+    )
+    cpl_period_df, _ = _time_period_summary(trend_monthlies.cpl, since, until)
+    dcs_period_df, _ = _time_period_summary(trend_monthlies.dcs, since, until)
+    signups_period_df, _ = _time_period_summary(trend_monthlies.signups, since, until)
     scores = _weighted_scorecard_metrics(
         df,
         selected_channels=selected_channels,
@@ -1014,28 +1012,38 @@ def main() -> None:
     with c1:
         st.plotly_chart(
             _spend_over_time_chart(
-                period_df,
-                prior_monthly,
+                spend_period_df,
+                prior_spend_monthly,
                 prior_since=prior_since,
                 prior_until=prior_until,
             ),
             use_container_width=True,
         )
     with c2:
-        cpl_chart = _cpl_over_time_chart(period_df)
+        cpl_chart = _cpl_over_time_chart(cpl_period_df)
         if cpl_chart:
             st.plotly_chart(cpl_chart, use_container_width=True)
+            july = pd.Timestamp("2025-07-01")
+            if not cpl_period_df.empty and (
+                july in set(pd.to_datetime(cpl_period_df["month"]).dt.to_period("M").dt.to_timestamp())
+                or (
+                    cpl_period_df["period_label"].astype(str).str.contains("Q3 2025", na=False).any()
+                )
+            ):
+                st.caption(
+                    "Jul 2025 uses the average of Jun and Aug 2025 (legacy CRM import into GHL)."
+                )
         else:
             st.info("CPL over time unavailable (no leads in the selected range).")
     with c3:
         st.plotly_chart(
-            _line_chart(period_df, ["dcs"], "DCs Over Time", "DCs"),
+            _line_chart(dcs_period_df, ["dcs"], "DCs Over Time", "DCs"),
             use_container_width=True,
         )
     with c4:
         st.plotly_chart(
             _line_chart(
-                period_df,
+                signups_period_df,
                 ["conversions"],
                 "Signups Over Time",
                 "Signups",

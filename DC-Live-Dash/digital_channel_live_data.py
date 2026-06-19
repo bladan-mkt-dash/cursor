@@ -33,7 +33,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 # Bump when loader logic or ghl_client signup/DC helpers change — Streamlit keeps
 # imported modules across reruns; reload ghl_client when its revision differs.
-LIVE_DATA_REVISION = "2026-06-19-sheet-leads-unallocated-v1"
+LIVE_DATA_REVISION = "2026-06-19-cpl-jul-2025-smooth-v1"
 GHL_ATTRIBUTION_HEAR_ABOUT = "hear_about"
 GHL_ATTRIBUTION_TRACKER = "tracker"
 GHL_ATTRIBUTION_OPTIONS: tuple[tuple[str, str], ...] = (
@@ -100,6 +100,8 @@ DEFAULT_SINCE = "2023-01-01"
 GHL_SIGNUPS_SINCE = "2025-09-01"
 SHEETS_SIGNUPS_UNTIL = "2025-08-31"
 SHEET_LEADS_UNTIL = "2025-06-30"
+# Jul 2025 GHL bulk import from legacy CRM — CPL trend uses Jun/Aug average.
+GHL_CRM_DUMP_MONTH = pd.Timestamp("2025-07-01")
 _GHL_LEADS_CACHE_DIR = _PROJECT_ROOT / ".cache" / "ghl_daily_leads"
 _GHL_LEADS_FETCH_WORKERS = 8
 
@@ -295,10 +297,14 @@ def _apply_sheet_lead_baseline(
                 continue
             if total_spend > 0:
                 weights = chunk["spend"] / total_spend
-                out.loc[mask, col] = weights * sheet_leads
+                values = weights * sheet_leads
             else:
                 share = sheet_leads / len(chunk)
-                out.loc[mask, col] = share
+                values = share
+            out.loc[mask, col] = values
+            cpl_col = f"{col}_cpl"
+            if cpl_col in out.columns and force_sheet:
+                out.loc[mask, cpl_col] = values
 
     return out
 
@@ -1474,6 +1480,15 @@ def _allocate_ghl_metrics(
     return out
 
 
+def _snapshot_cpl_lead_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Copy attributed lead columns before unallocated spread (used for CPL trends)."""
+    out = df.copy()
+    for col in ("leads", "leads_hear_about", "leads_combined"):
+        if col in out.columns:
+            out[f"{col}_cpl"] = out[col]
+    return out
+
+
 def _allocate_ghl_column(
     df: pd.DataFrame,
     ghl_monthly: pd.DataFrame,
@@ -1743,6 +1758,132 @@ def _attribution_leads_column(*, use_hear_about: bool, use_tracker: bool) -> str
     if use_hear_about:
         return "leads_hear_about"
     return "leads"
+
+
+def build_spend_trend_monthly(df: pd.DataFrame) -> pd.DataFrame:
+    """Monthly spend totals only — independent of leads, DCs, and signups aggregation."""
+    if df.empty:
+        return pd.DataFrame(columns=["month", "spend"])
+    return (
+        df.groupby("month", as_index=False)["spend"]
+        .sum()
+        .sort_values("month")
+        .reset_index(drop=True)
+    )
+
+
+def _cpl_source_leads_column(*, use_hear_about: bool, use_tracker: bool) -> str:
+    return f"{_attribution_leads_column(use_hear_about=use_hear_about, use_tracker=use_tracker)}_cpl"
+
+
+def build_cpl_trend_monthly(
+    df: pd.DataFrame,
+    *,
+    use_hear_about: bool,
+    use_tracker: bool,
+) -> pd.DataFrame:
+    """
+    Monthly spend and attributed leads for CPL trend charts.
+
+    Excludes unallocated GHL contacts spread by spend share — CPL is spend divided
+    by paid-attributed leads only (sheet baseline through Jun 2025; GHL hear-about
+    or tracker from Jul 2025 onward).
+    """
+    spend = build_spend_trend_monthly(df)
+    if df.empty:
+        return pd.DataFrame(columns=["month", "spend", "leads"])
+
+    work = df.copy()
+    cpl_col = _cpl_source_leads_column(
+        use_hear_about=use_hear_about, use_tracker=use_tracker
+    )
+    attr_col = _attribution_leads_column(
+        use_hear_about=use_hear_about, use_tracker=use_tracker
+    )
+    if cpl_col in work.columns:
+        work["leads"] = work[cpl_col]
+    elif attr_col in work.columns:
+        work["leads"] = work[attr_col]
+    else:
+        work["leads"] = work.get("leads", 0.0)
+
+    leads = (
+        work.groupby("month", as_index=False)["leads"]
+        .sum()
+        .sort_values("month")
+        .reset_index(drop=True)
+    )
+    out = spend.merge(leads, on="month", how="outer").fillna(0.0)
+    return _smooth_ghl_crm_dump_month_cpl(out[["month", "spend", "leads"]])
+
+
+def _smooth_ghl_crm_dump_month_cpl(cpl_monthly: pd.DataFrame) -> pd.DataFrame:
+    """Replace Jul 2025 spend/leads with the mean of Jun and Aug (legacy CRM import)."""
+    if cpl_monthly.empty:
+        return cpl_monthly
+
+    july = GHL_CRM_DUMP_MONTH
+    june = july - pd.DateOffset(months=1)
+    august = july + pd.DateOffset(months=1)
+    months = {pd.Timestamp(m).to_period("M").to_timestamp() for m in cpl_monthly["month"]}
+    if july not in months or june not in months or august not in months:
+        return cpl_monthly
+
+    out = cpl_monthly.copy()
+    out["month"] = pd.to_datetime(out["month"]).dt.to_period("M").dt.to_timestamp()
+    by_month = out.set_index("month")
+    for col in ("spend", "leads"):
+        if col not in out.columns:
+            continue
+        smoothed = (float(by_month.at[june, col]) + float(by_month.at[august, col])) / 2.0
+        out.loc[out["month"] == july, col] = smoothed
+    return out.sort_values("month").reset_index(drop=True)
+
+
+class TrendChartMonthlies:
+    """Monthly aggregates sliced for isolated trend charts (no shared mutable frame)."""
+
+    __slots__ = ("spend", "cpl", "dcs", "signups")
+
+    def __init__(
+        self,
+        spend: pd.DataFrame,
+        cpl: pd.DataFrame,
+        dcs: pd.DataFrame,
+        signups: pd.DataFrame,
+    ) -> None:
+        self.spend = spend
+        self.cpl = cpl
+        self.dcs = dcs
+        self.signups = signups
+
+
+def build_trend_chart_monthlies(
+    df: pd.DataFrame,
+    channel_month_leads: pd.DataFrame,
+    *,
+    selected_channels: list[str],
+    use_hear_about: bool,
+    use_tracker: bool,
+) -> TrendChartMonthlies:
+    """
+    Build separate monthly series for spend, CPL, DCs, and signups trend charts.
+
+    Lead overlay applies only to the CPL series so DC and signup trends are not
+    affected by lead reconciliation. Spend is aggregated independently.
+    """
+    spend = build_spend_trend_monthly(df)
+    cpl = build_cpl_trend_monthly(
+        df, use_hear_about=use_hear_about, use_tracker=use_tracker
+    )
+    base = monthly_campaign_summary(df)
+    if base.empty:
+        return TrendChartMonthlies(spend, cpl, base, base)
+
+    dcs = base[["month", "dcs"]].copy()
+    signups = base[["month", "conversions"]].copy()
+
+    return TrendChartMonthlies(spend=spend, cpl=cpl, dcs=dcs, signups=signups)
 
 
 def overlay_monthly_leads_for_trends(
@@ -2080,6 +2221,7 @@ def load_live_campaign_data(
         ghl_column="leads_combined",
         out_column="leads_combined",
     )
+    merged = _snapshot_cpl_lead_columns(merged)
     merged = _allocate_unallocated_monthly_metric(
         merged, unallocated_dcs_by_month, column="dcs"
     )
@@ -2131,6 +2273,9 @@ def load_live_campaign_data(
         result["leads_hear_about"] = merged["leads_hear_about"].values
     if "leads_combined" in merged.columns:
         result["leads_combined"] = merged["leads_combined"].values
+    for col in ("leads_cpl", "leads_hear_about_cpl", "leads_combined_cpl"):
+        if col in merged.columns:
+            result[col] = merged[col].values
     result["month"] = result["date"].dt.to_period("M").dt.to_timestamp()
     return (
         result,
@@ -2161,6 +2306,10 @@ __all__ = [
     "channel_month_leads_total",
     "clear_ghl_leads_day_cache",
     "load_live_campaign_data",
+    "TrendChartMonthlies",
+    "build_cpl_trend_monthly",
+    "build_spend_trend_monthly",
+    "build_trend_chart_monthlies",
     "monthly_campaign_summary",
     "overlay_monthly_leads_for_trends",
     "scorecard_metrics",
