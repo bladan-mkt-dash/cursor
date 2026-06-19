@@ -4,8 +4,10 @@ Build Digital Channel Dashboard rows from live Google Ads, Meta, and GoHighLevel
 Replaces the Google Sheet **Data** tab as the source of truth. Metrics mapping:
 
 - **Spend / clicks / impressions** — Google Ads & Meta campaign insights (daily → month-end rows).
-- **Leads** — GHL new contacts (``dateAdded``) from Sep 2025 onward where available; earlier
-  months use **Digital Channel Dashboard 2024-25** Data tab totals (allocated by spend share).
+- **Leads** — Through Jun 2025: **Digital Channel Dashboard 2024-25** Data tab totals
+  (always preferred over partial GHL attribution). From Jul 2025: GHL new contacts
+  (``dateAdded``), attributed by hear-about and/or tracker, with unallocated contacts
+  spread by spend share (same approach as DCs).
 - **DCs** — GHL calendar **meetings** (``startTime``) on configured discovery-call
   calendars; Google/Meta split via hear-about on the linked contact; remainder
   allocated by spend share. Sheet Data tab fills months where live counts are zero.
@@ -31,7 +33,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 # Bump when loader logic or ghl_client signup/DC helpers change — Streamlit keeps
 # imported modules across reruns; reload ghl_client when its revision differs.
-LIVE_DATA_REVISION = "2026-06-18-cpl-monthly-leads-v1"
+LIVE_DATA_REVISION = "2026-06-19-sheet-leads-unallocated-v1"
 GHL_ATTRIBUTION_HEAR_ABOUT = "hear_about"
 GHL_ATTRIBUTION_TRACKER = "tracker"
 GHL_ATTRIBUTION_OPTIONS: tuple[tuple[str, str], ...] = (
@@ -97,6 +99,7 @@ def norm_membership_level(raw: str) -> str:
 DEFAULT_SINCE = "2023-01-01"
 GHL_SIGNUPS_SINCE = "2025-09-01"
 SHEETS_SIGNUPS_UNTIL = "2025-08-31"
+SHEET_LEADS_UNTIL = "2025-06-30"
 _GHL_LEADS_CACHE_DIR = _PROJECT_ROOT / ".cache" / "ghl_daily_leads"
 _GHL_LEADS_FETCH_WORKERS = 8
 
@@ -260,9 +263,9 @@ def _apply_sheet_lead_baseline(
     sheet_max_month: pd.Timestamp | None,
 ) -> pd.DataFrame:
     """
-    Fill channel-month lead counts from the sheet when live GHL allocation is zero.
+    Apply channel-month lead totals from the sheet through ``sheet_max_month``.
 
-    Live GHL leads take precedence when present for a channel-month.
+    Sheet months always win over partial GHL attribution (e.g. June 2025).
     """
     if df.empty or sheet_monthly.empty:
         return df
@@ -283,11 +286,12 @@ def _apply_sheet_lead_baseline(
         if chunk.empty:
             continue
 
+        force_sheet = sheet_max_month is not None and month <= sheet_max_month
         total_spend = chunk["spend"].sum()
         for col in ("leads", "leads_hear_about", "leads_combined"):
             if col not in out.columns:
                 continue
-            if float(out.loc[mask, col].sum()) > 0:
+            if not force_sheet and float(out.loc[mask, col].sum()) > 0:
                 continue
             if total_spend > 0:
                 weights = chunk["spend"] / total_spend
@@ -740,6 +744,7 @@ def _classify_day_contacts(
     total = len(contacts)
     meta_tag = google_tag = meta_hear = google_hear = 0
     meta_combined = google_combined = 0
+    unallocated_hear = unallocated_tracker = unallocated_combined = 0
     for contact in contacts:
         if _is_meta_lead_contact(contact):
             meta_tag += 1
@@ -754,12 +759,22 @@ def _classify_day_contacts(
                     meta_hear += 1
                 elif hear_ch == CHANNEL_GOOGLE:
                     google_hear += 1
+                else:
+                    unallocated_hear += 1
+            else:
+                unallocated_hear += 1
+        else:
+            unallocated_hear += 1
         track_ch = _ghl_channel_for_tracker(contact)
+        if track_ch is None:
+            unallocated_tracker += 1
         combined_ch = _combined_paid_channel_from_parts(hear_ch, track_ch)
         if combined_ch == CHANNEL_META:
             meta_combined += 1
         elif combined_ch == CHANNEL_GOOGLE:
             google_combined += 1
+        else:
+            unallocated_combined += 1
     return {
         "total": total,
         "meta": meta_tag,
@@ -768,6 +783,9 @@ def _classify_day_contacts(
         "google_hear": google_hear,
         "meta_combined": meta_combined,
         "google_combined": google_combined,
+        "unallocated_hear": unallocated_hear,
+        "unallocated_tracker": unallocated_tracker,
+        "unallocated_combined": unallocated_combined,
     }
 
 
@@ -777,7 +795,8 @@ def _fetch_day_lead_counts(day: str, hear_id: str = "") -> dict[str, Any]:
     if cache_path.is_file() and _ghl_day_cache_is_fresh(day):
         payload = json.loads(cache_path.read_text(encoding="utf-8"))
         if "meta_hear" in payload and "google_hear" in payload and "meta_combined" in payload:
-            return payload
+            if "unallocated_hear" in payload:
+                return payload
 
     contacts, truncated = load_contacts_for_calendar_day(day)
     counts = _classify_day_contacts(contacts, hear_id)
@@ -790,6 +809,9 @@ def _fetch_day_lead_counts(day: str, hear_id: str = "") -> dict[str, Any]:
         "google_hear": counts["google_hear"],
         "meta_combined": counts["meta_combined"],
         "google_combined": counts["google_combined"],
+        "unallocated_hear": counts["unallocated_hear"],
+        "unallocated_tracker": counts["unallocated_tracker"],
+        "unallocated_combined": counts["unallocated_combined"],
         "truncated": truncated,
     }
     _GHL_LEADS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -825,9 +847,10 @@ def _fetch_ghl_leads_by_date_added(since: str, until: str) -> dict[str, Any]:
         if day not in pending:
             cached = json.loads(_ghl_day_cache_path(day).read_text(encoding="utf-8"))
             if "meta_hear" in cached and "google_hear" in cached and "meta_combined" in cached:
-                day_rows.append(cached)
-            else:
-                pending.append(day)
+                if "unallocated_hear" in cached:
+                    day_rows.append(cached)
+                else:
+                    pending.append(day)
 
     pending = sorted(set(pending))
     if pending:
@@ -845,6 +868,9 @@ def _fetch_ghl_leads_by_date_added(since: str, until: str) -> dict[str, Any]:
     google_hear_by_month: dict[str, int] = {}
     meta_combined_by_month: dict[str, int] = {}
     google_combined_by_month: dict[str, int] = {}
+    unallocated_hear_by_month: dict[str, int] = {}
+    unallocated_tracker_by_month: dict[str, int] = {}
+    unallocated_combined_by_month: dict[str, int] = {}
     total_by_month: dict[str, int] = {}
     meta_total = google_total = meta_hear_total = google_hear_total = 0
     meta_combined_total = google_combined_total = total_new = 0
@@ -859,6 +885,9 @@ def _fetch_ghl_leads_by_date_added(since: str, until: str) -> dict[str, Any]:
         google_hear = int(row.get("google_hear") or 0)
         meta_combined = int(row.get("meta_combined") or 0)
         google_combined = int(row.get("google_combined") or 0)
+        unalloc_hear = int(row.get("unallocated_hear") or 0)
+        unalloc_tracker = int(row.get("unallocated_tracker") or 0)
+        unalloc_combined = int(row.get("unallocated_combined") or 0)
         truncated = truncated or bool(row.get("truncated"))
 
         total_by_month[month_key] = total_by_month.get(month_key, 0) + total
@@ -873,6 +902,15 @@ def _fetch_ghl_leads_by_date_added(since: str, until: str) -> dict[str, Any]:
         )
         google_combined_by_month[month_key] = (
             google_combined_by_month.get(month_key, 0) + google_combined
+        )
+        unallocated_hear_by_month[month_key] = (
+            unallocated_hear_by_month.get(month_key, 0) + unalloc_hear
+        )
+        unallocated_tracker_by_month[month_key] = (
+            unallocated_tracker_by_month.get(month_key, 0) + unalloc_tracker
+        )
+        unallocated_combined_by_month[month_key] = (
+            unallocated_combined_by_month.get(month_key, 0) + unalloc_combined
         )
         total_new += total
         meta_total += meta
@@ -902,6 +940,15 @@ def _fetch_ghl_leads_by_date_added(since: str, until: str) -> dict[str, Any]:
                 "meta_leads_combined": int(meta_combined_by_month.get(month_start, 0)),
                 "google_leads_combined": int(
                     google_combined_by_month.get(month_start, 0)
+                ),
+                "unallocated_leads_hear_about": int(
+                    unallocated_hear_by_month.get(month_start, 0)
+                ),
+                "unallocated_leads_tracker": int(
+                    unallocated_tracker_by_month.get(month_start, 0)
+                ),
+                "unallocated_leads_combined": int(
+                    unallocated_combined_by_month.get(month_start, 0)
                 ),
             }
         )
@@ -946,6 +993,7 @@ def fetch_ghl_channel_monthly(
     pd.DataFrame,
     pd.DataFrame,
     dict[pd.Timestamp, float],
+    dict[str, dict[pd.Timestamp, float]],
 ]:
     """
     Channel-month GHL funnel metrics not available at campaign level in ads APIs.
@@ -967,6 +1015,11 @@ def fetch_ghl_channel_monthly(
     leads_by_month_channel: dict[tuple[pd.Timestamp, str], float] = {}
     leads_hear_by_month_channel: dict[tuple[pd.Timestamp, str], float] = {}
     leads_combined_by_month_channel: dict[tuple[pd.Timestamp, str], float] = {}
+    unallocated_leads_by_attr: dict[str, dict[pd.Timestamp, float]] = {
+        "leads": {},
+        "leads_hear_about": {},
+        "leads_combined": {},
+    }
     try:
         ghl_leads = _fetch_ghl_leads_by_date_added(since, until)
         lead_summary = {
@@ -1023,6 +1076,15 @@ def fetch_ghl_channel_monthly(
                 leads_combined_by_month_channel[(month, CHANNEL_GOOGLE)] = (
                     google_combined_n
                 )
+            unalloc_hear = float(row.get("unallocated_leads_hear_about") or 0)
+            unalloc_tracker = float(row.get("unallocated_leads_tracker") or 0)
+            unalloc_combined = float(row.get("unallocated_leads_combined") or 0)
+            if unalloc_hear:
+                unallocated_leads_by_attr["leads_hear_about"][month] = unalloc_hear
+            if unalloc_tracker:
+                unallocated_leads_by_attr["leads"][month] = unalloc_tracker
+            if unalloc_combined:
+                unallocated_leads_by_attr["leads_combined"][month] = unalloc_combined
     except Exception as exc:
         notes.append(f"GHL lead counts skipped: {exc}")
 
@@ -1313,6 +1375,15 @@ def fetch_ghl_channel_monthly(
             '"word of mouth" — excluded from paid attribution unless the WOM filter is on.'
         )
 
+    unalloc_lead_total = sum(
+        float(v) for bucket in unallocated_leads_by_attr.values() for v in bucket.values()
+    )
+    if unalloc_lead_total:
+        notes.append(
+            "GHL leads (unallocated): contacts without paid attribution for the "
+            "selected source are spread by spend share (same approach as DCs)."
+        )
+
     return (
         pd.DataFrame(records),
         lead_summary,
@@ -1325,6 +1396,7 @@ def fetch_ghl_channel_monthly(
         combined_conv_by_level_df,
         combined_unallocated_conv_df,
         unallocated_dcs_by_month,
+        unallocated_leads_by_attr,
     )
 
 
@@ -1572,10 +1644,44 @@ def apply_membership_conversion_filter(
     return _update_conversion_derived_columns(out)
 
 
+def _split_month_unallocated_across_channels(
+    out: pd.DataFrame,
+    month: pd.Timestamp,
+    unallocated: float,
+    col: str,
+) -> None:
+    """Add month-level unallocated leads to channel-month totals by attributed share."""
+    if unallocated <= 0 or col not in out.columns:
+        return
+    month_mask = out["month"] == month
+    if not month_mask.any():
+        return
+    google_val = float(
+        out.loc[month_mask & (out["channel"] == CHANNEL_GOOGLE), col].sum()
+    )
+    meta_val = float(
+        out.loc[month_mask & (out["channel"] == CHANNEL_META), col].sum()
+    )
+    attr_total = google_val + meta_val
+    if attr_total > 0:
+        shares = {
+            CHANNEL_GOOGLE: google_val / attr_total,
+            CHANNEL_META: meta_val / attr_total,
+        }
+    else:
+        shares = {CHANNEL_GOOGLE: 0.5, CHANNEL_META: 0.5}
+    for channel, share in shares.items():
+        key_mask = month_mask & (out["channel"] == channel)
+        out.loc[key_mask, col] = out.loc[key_mask, col].astype(float) + (
+            unallocated * share
+        )
+
+
 def _build_source_channel_month_leads(
     ghl_monthly: pd.DataFrame,
     sheet_leads_monthly: pd.DataFrame,
     sheet_leads_max: pd.Timestamp | None,
+    unallocated_leads_by_attr: dict[str, dict[pd.Timestamp, float]] | None = None,
 ) -> pd.DataFrame:
     """
     Channel-month lead totals from GHL plus sheet baseline (before campaign split).
@@ -1592,34 +1698,43 @@ def _build_source_channel_month_leads(
         sheet_n = sheet_leads_monthly["leads"].astype(float)
         for col in lead_cols:
             out[col] = sheet_n
-        return out
-
-    out = ghl_monthly[["month", "channel"]].copy()
-    for col in lead_cols:
-        out[col] = (
-            ghl_monthly[col].astype(float)
-            if col in ghl_monthly.columns
-            else 0.0
-        )
-
-    if sheet_leads_monthly.empty:
-        return out
-
-    out = out.set_index(["month", "channel"])
-    for row in sheet_leads_monthly.itertuples(index=False):
-        month, channel, sheet_leads = row.month, row.channel, float(row.leads)
-        if sheet_leads <= 0:
-            continue
-        if sheet_leads_max is not None and month > sheet_leads_max:
-            continue
-        key = (month, channel)
-        if key not in out.index:
-            out.loc[key, list(lead_cols)] = sheet_leads
-            continue
+    else:
+        out = ghl_monthly[["month", "channel"]].copy()
         for col in lead_cols:
-            if float(out.at[key, col]) <= 0:
-                out.at[key, col] = sheet_leads
-    return out.reset_index()
+            out[col] = (
+                ghl_monthly[col].astype(float)
+                if col in ghl_monthly.columns
+                else 0.0
+            )
+
+        if not sheet_leads_monthly.empty:
+            out = out.set_index(["month", "channel"])
+            for row in sheet_leads_monthly.itertuples(index=False):
+                month, channel, sheet_leads = row.month, row.channel, float(row.leads)
+                if sheet_leads <= 0:
+                    continue
+                if sheet_leads_max is not None and month > sheet_leads_max:
+                    continue
+                key = (month, channel)
+                force_sheet = sheet_leads_max is not None and month <= sheet_leads_max
+                if key not in out.index:
+                    out.loc[key, list(lead_cols)] = sheet_leads
+                    continue
+                for col in lead_cols:
+                    if force_sheet or float(out.at[key, col]) <= 0:
+                        out.at[key, col] = sheet_leads
+            out = out.reset_index()
+
+    if unallocated_leads_by_attr:
+        sheet_cutoff = sheet_leads_max
+        for col, by_month in unallocated_leads_by_attr.items():
+            if col not in out.columns:
+                continue
+            for month, unallocated in by_month.items():
+                if sheet_cutoff is not None and month <= sheet_cutoff:
+                    continue
+                _split_month_unallocated_across_channels(out, month, unallocated, col)
+    return out
 
 
 def _attribution_leads_column(*, use_hear_about: bool, use_tracker: bool) -> str:
@@ -1638,7 +1753,7 @@ def overlay_monthly_leads_for_trends(
     use_hear_about: bool,
     use_tracker: bool,
 ) -> pd.DataFrame:
-    """Fill zero-lead months in trend summaries from channel-month lead totals."""
+    """Prefer channel-month lead totals when row sums under-count (filters or attribution)."""
     if monthly.empty or channel_month_leads.empty or (not use_hear_about and not use_tracker):
         return monthly
 
@@ -1663,7 +1778,8 @@ def overlay_monthly_leads_for_trends(
         source_leads = float(source.get(month) or 0)
         if source_leads <= 0:
             continue
-        if float(row["leads"] or 0) > 0:
+        row_leads = float(row["leads"] or 0)
+        if source_leads <= row_leads:
             continue
         out.at[idx, "leads"] = source_leads
     return out
@@ -1886,6 +2002,7 @@ def load_live_campaign_data(
         combined_conv_by_level_df,
         combined_unallocated_conv_df,
         unallocated_dcs_by_month,
+        unallocated_leads_by_attr,
     ) = fetch_ghl_channel_monthly(since_eff, until_eff)
     notes.extend(ghl_notes)
     notes.append(
@@ -1928,6 +2045,28 @@ def load_live_campaign_data(
         ghl_monthly = ghl_monthly.copy()
         ghl_monthly.loc[ghl_monthly["month"].isin(sheet_months), "conversions"] = 0.0
 
+    sheet_leads_monthly, sheet_leads_max, sheet_lead_notes = (
+        _sheet_leads_by_month_channel(since_eff, until_eff)
+    )
+    notes.extend(sheet_lead_notes)
+
+    if sheet_leads_max is not None and not ghl_monthly.empty:
+        ghl_monthly = ghl_monthly.copy()
+        sheet_lead_months = {
+            month
+            for month in ghl_monthly["month"].dropna().unique()
+            if month <= sheet_leads_max
+        }
+        if sheet_lead_months:
+            ghl_monthly.loc[
+                ghl_monthly["month"].isin(sheet_lead_months),
+                ["leads", "leads_hear_about", "leads_combined"],
+            ] = 0.0
+            notes.append(
+                f"GHL lead attribution suppressed for {len(sheet_lead_months)} sheet month(s) "
+                f"through {sheet_leads_max.date()}."
+            )
+
     merged = _allocate_ghl_metrics(monthly_ads, ghl_monthly)
     merged = _allocate_ghl_column(
         merged,
@@ -1944,20 +2083,22 @@ def load_live_campaign_data(
     merged = _allocate_unallocated_monthly_metric(
         merged, unallocated_dcs_by_month, column="dcs"
     )
+    if unallocated_leads_by_attr:
+        for col, by_month in unallocated_leads_by_attr.items():
+            if col in merged.columns and by_month:
+                merged = _allocate_unallocated_monthly_metric(
+                    merged, by_month, column=col
+                )
     merged = _allocate_monthly_signup_totals(merged, sheet_totals)
 
-    sheet_leads_monthly, sheet_leads_max, sheet_lead_notes = (
-        _sheet_leads_by_month_channel(since_eff, until_eff)
-    )
-    notes.extend(sheet_lead_notes)
     if not sheet_leads_monthly.empty:
         merged = _apply_sheet_lead_baseline(
             merged, sheet_leads_monthly, sheet_leads_max
         )
         filled_months = sheet_leads_monthly["month"].nunique()
         notes.append(
-            f"Sheet lead baseline applied to {filled_months} month(s) where live GHL "
-            "lead counts were zero."
+            f"Sheet lead baseline applied through {sheet_leads_max.date() if sheet_leads_max is not None else 'sheet end'} "
+            f"({filled_months} month(s))."
         )
 
     sheet_dcs_monthly, sheet_dcs_max, sheet_dc_notes = _sheet_dcs_by_month_channel(
@@ -1975,7 +2116,10 @@ def load_live_campaign_data(
     merged = _add_derived_columns(merged)
 
     channel_month_leads = _build_source_channel_month_leads(
-        ghl_monthly, sheet_leads_monthly, sheet_leads_max
+        ghl_monthly,
+        sheet_leads_monthly,
+        sheet_leads_max,
+        unallocated_leads_by_attr,
     )
 
     for col in DATA_COLUMNS:
@@ -2008,6 +2152,7 @@ __all__ = [
     "MEMBERSHIP_LEVELS",
     "GHL_SIGNUPS_SINCE",
     "SHEETS_SIGNUPS_UNTIL",
+    "SHEET_LEADS_UNTIL",
     "GHL_ATTRIBUTION_HEAR_ABOUT",
     "GHL_ATTRIBUTION_TRACKER",
     "GHL_ATTRIBUTION_OPTIONS",

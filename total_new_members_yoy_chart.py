@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from google.oauth2.credentials import Credentials
@@ -221,6 +220,8 @@ def _load_year_series(
 
 
 def _plot(df: pd.DataFrame, out_path: Path) -> None:
+    import matplotlib.pyplot as plt
+
     months = df.index.tolist()
     x = np.arange(len(months))
     n_years = len(CHART_YEARS)

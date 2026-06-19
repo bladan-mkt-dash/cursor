@@ -21,19 +21,22 @@ import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
 
+from ghl_client import discovery_call_calendar_ids
+
 _DC_LIVE_DIR = Path(__file__).resolve().parent
 if str(_DC_LIVE_DIR) not in sys.path:
     sys.path.insert(0, str(_DC_LIVE_DIR))
 
 import digital_channel_live_data as _live_data_mod
 
-_EXPECTED_LIVE_DATA_REVISION = "2026-06-18-cpl-monthly-leads-v1"
+_EXPECTED_LIVE_DATA_REVISION = "2026-06-19-sheet-leads-unallocated-v1"
 if (
     getattr(_live_data_mod, "LIVE_DATA_REVISION", None)
     != _EXPECTED_LIVE_DATA_REVISION
 ):
     _live_data_mod = importlib.reload(_live_data_mod)
 
+from funnel_over_time_data import FUNNEL_OVER_TIME_REVISION, GHL_FUNNEL_SINCE, load_funnel_over_time
 from digital_channel_live_data import (
     DEFAULT_SINCE,
     GHL_ATTRIBUTION_HEAR_ABOUT,
@@ -325,6 +328,96 @@ def _line_chart(
     return fig
 
 
+def _funnel_over_time_chart(funnel_df: pd.DataFrame) -> go.Figure | None:
+    """Org-wide monthly Leads, Discovery Calls, and Signups — independent of campaign filters."""
+    if funnel_df.empty:
+        return None
+
+    plot_df = funnel_df.sort_values("month").copy()
+    plot_df["period_label"] = plot_df["month"].dt.strftime("%b %Y")
+    x_order = plot_df["period_label"].tolist()
+
+    series = (
+        ("leads", "Leads", COLORS["accent"]),
+        ("dcs", "Discovery Calls", COLORS["2023"]),
+        ("signups", "Signups", COLORS["2024"]),
+    )
+
+    fig = go.Figure()
+    for col, label, color in series:
+        fig.add_trace(
+            go.Scatter(
+                x=plot_df["period_label"],
+                y=plot_df[col],
+                mode="lines+markers",
+                name=label,
+                line=dict(color=color, width=2.5),
+                marker=dict(size=8, color=color),
+                hovertemplate=f"{label}: %{{y:,0f}}<extra></extra>",
+            )
+        )
+
+    cutover = pd.Timestamp(GHL_FUNNEL_SINCE).to_period("M").to_timestamp()
+    cutover_label = cutover.strftime("%b %Y")
+    if (
+        cutover_label in x_order
+        and plot_df["month"].min() < cutover <= plot_df["month"].max()
+    ):
+        fig.add_shape(
+            type="line",
+            x0=cutover_label,
+            x1=cutover_label,
+            y0=0,
+            y1=1,
+            yref="paper",
+            line=dict(dash="dot", color=COLORS["muted"], width=1),
+        )
+        fig.add_annotation(
+            x=cutover_label,
+            y=1,
+            yref="paper",
+            text="GHL from here",
+            showarrow=False,
+            yanchor="bottom",
+            font=dict(size=11, color=COLORS["muted"]),
+        )
+
+    n_months = len(x_order)
+    fig.update_layout(
+        height=440,
+        title="Leads, Discovery Calls & Signups Over Time",
+        margin=dict(l=48, r=24, t=56, b=80 if n_months > 12 else 56),
+        hovermode="x unified",
+        showlegend=True,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            x=0,
+            xanchor="left",
+            title_text="",
+        ),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Roboto, sans-serif", color=COLORS["accent_dark"], size=13),
+        xaxis=dict(
+            title="",
+            categoryorder="array",
+            categoryarray=x_order,
+            tickangle=-45 if n_months > 8 else 0,
+        ),
+        yaxis=dict(
+            title="Count",
+            tickformat=",",
+            rangemode="tozero",
+            showgrid=True,
+            gridcolor="rgba(107,124,147,0.18)",
+            griddash="dot",
+        ),
+    )
+    return fig
+
+
 def _cpl_over_time_chart(monthly: pd.DataFrame) -> go.Figure | None:
     """Monthly CPL (spend / leads) for the current filter selection."""
     if monthly.empty:
@@ -601,6 +694,16 @@ def _load_data(
     )
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def _load_funnel_over_time(
+    since: str,
+    until: str,
+    _revision: str = FUNNEL_OVER_TIME_REVISION,
+) -> tuple[pd.DataFrame, tuple[str, ...]]:
+    df, notes = load_funnel_over_time(since, until)
+    return df, tuple(notes)
+
+
 def main() -> None:
     st.set_page_config(
         page_title="Digital Channel Dashboard (Live)",
@@ -613,7 +716,8 @@ def main() -> None:
     st.caption(
         "Live data from **Google Ads**, **Meta**, and **GoHighLevel**. "
         "Leads through Jun 2025 use **Digital Channel Dashboard 2024-25** Data tab; "
-        "later months use GHL (meta lead tag / pixel; Google tag). "
+        "later months use GHL new contacts (attributed + unallocated spread by spend, "
+        "same approach as DCs). "
         "**First load** for a wide date range can take a few minutes while GHL "
         "lead data is pulled day-by-day; **repeat loads use cache** and are much faster. "
         "**Signups** through Aug 2025: **GRAND TOTAL New Members** from Digital Cross-Channel "
@@ -671,6 +775,9 @@ def main() -> None:
         try:
             raw_df, notes, lead_summary, conv_by_level_df, unallocated_conv_df, wom_conv_df, tracker_conv_by_level_df, tracker_unallocated_conv_df, combined_conv_by_level_df, combined_unallocated_conv_df, sheet_months, channel_month_leads = _load_data(
                 load_since.isoformat(), until.isoformat()
+            )
+            funnel_df, funnel_notes = _load_funnel_over_time(
+                since.isoformat(), until.isoformat()
             )
         except Exception as exc:
             st.error(f"Could not load live data.\n\n{exc}")
@@ -936,17 +1043,21 @@ def main() -> None:
             use_container_width=True,
         )
 
-    st.plotly_chart(
-        _line_chart(
-            period_df,
-            ["leads", "dcs", "conversions"],
-            "Leads, DCs & Signups Over Time",
-            "Count",
-            y_count_ticks=True,
-            height=380,
-        ),
-        use_container_width=True,
+    funnel_chart = _funnel_over_time_chart(funnel_df)
+    if funnel_chart:
+        st.plotly_chart(funnel_chart, use_container_width=True)
+    else:
+        st.info("No funnel data for the selected date range.")
+    st.caption(
+        f"Org-wide monthly totals — **Digital Channel Dashboard 2024-25** Data tab before "
+        f"{pd.Timestamp(GHL_FUNNEL_SINCE).strftime('%b %Y')}, **GoHighLevel** from that month "
+        f"(new contacts by date added, {len(discovery_call_calendar_ids())} discovery-call "
+        "calendars by meeting date, committed signups by sign-up date). "
+        "Not affected by campaign or attribution filters above."
     )
+    with st.expander("Funnel chart — data sources"):
+        for note in funnel_notes:
+            st.markdown(f"- {note}")
 
     st.markdown("---")
     st.subheader("Campaign breakdown")
