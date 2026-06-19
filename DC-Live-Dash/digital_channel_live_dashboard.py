@@ -36,7 +36,18 @@ if (
 ):
     _live_data_mod = importlib.reload(_live_data_mod)
 
-from funnel_over_time_data import FUNNEL_OVER_TIME_REVISION, GHL_FUNNEL_SINCE, load_funnel_over_time
+import funnel_over_time_data as _funnel_mod
+
+_EXPECTED_FUNNEL_REVISION = "2026-06-19-funnel-aug-ghl-leads-v1"
+if (
+    getattr(_funnel_mod, "FUNNEL_OVER_TIME_REVISION", None)
+    != _EXPECTED_FUNNEL_REVISION
+):
+    _funnel_mod = importlib.reload(_funnel_mod)
+
+FUNNEL_OVER_TIME_REVISION = _funnel_mod.FUNNEL_OVER_TIME_REVISION
+GHL_FUNNEL_SINCE = _funnel_mod.GHL_FUNNEL_SINCE
+load_funnel_over_time = _funnel_mod.load_funnel_over_time
 from digital_channel_live_data import (
     DEFAULT_SINCE,
     GHL_ATTRIBUTION_HEAR_ABOUT,
@@ -769,6 +780,7 @@ def main() -> None:
 
         if st.button("Refresh data", help="Reload ads + GHL. Keeps cached GHL daily lead files."):
             _load_data.clear()
+            _load_funnel_over_time.clear()
             st.rerun()
 
         if st.button(
@@ -777,6 +789,7 @@ def main() -> None:
         ):
             clear_ghl_leads_day_cache()
             _load_data.clear()
+            _load_funnel_over_time.clear()
             st.rerun()
 
     load_label = (
@@ -792,7 +805,9 @@ def main() -> None:
                 load_since.isoformat(), until.isoformat()
             )
             funnel_df, funnel_notes = _load_funnel_over_time(
-                since.isoformat(), until.isoformat()
+                since.isoformat(),
+                until.isoformat(),
+                _revision=FUNNEL_OVER_TIME_REVISION,
             )
         except Exception as exc:
             st.error(f"Could not load live data.\n\n{exc}")
@@ -1119,15 +1134,17 @@ def main() -> None:
     else:
         st.info("No funnel data for the selected date range.")
     st.caption(
-        "Org-wide monthly totals through Aug 30, 2025 — **HubSpot** leads, **Digital "
-        "Cross-Channel Tracker** Calls completed and GRAND TOTAL signups (signups match "
-        "Signups Over Time). **GoHighLevel** from "
+        "Org-wide monthly totals through Aug 30, 2025 — **HubSpot** leads (Jul and "
+        "earlier), **GHL** new contacts for Aug 2025 leads, **Digital Cross-Channel "
+        "Tracker** Calls completed and GRAND TOTAL signups (signups match Signups Over "
+        "Time). **GoHighLevel** for all metrics from "
         f"{pd.Timestamp(GHL_SIGNUPS_SINCE).strftime('%b %Y')} onward (new contacts by "
         f"date added, {len(discovery_call_calendar_ids())} discovery-call calendars by "
         "meeting date, committed signups by sign-up date). "
         "Not affected by campaign or attribution filters above."
     )
     with st.expander("Funnel chart — data sources"):
+        st.caption(f"Loader revision: `{FUNNEL_OVER_TIME_REVISION}`")
         for note in funnel_notes:
             st.markdown(f"- {note}")
 
