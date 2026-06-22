@@ -33,7 +33,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 # Bump when loader logic or ghl_client signup/DC helpers change — Streamlit keeps
 # imported modules across reruns; reload ghl_client when its revision differs.
-LIVE_DATA_REVISION = "2026-06-19-signups-tracker-q2-v1"
+LIVE_DATA_REVISION = "2026-06-22-perf-cache-unified-v1"
 GHL_ATTRIBUTION_HEAR_ABOUT = "hear_about"
 GHL_ATTRIBUTION_TRACKER = "tracker"
 GHL_ATTRIBUTION_OPTIONS: tuple[tuple[str, str], ...] = (
@@ -75,6 +75,12 @@ from google_ads_ghl_paid_cohort import (
 )
 from meta_client import _init_api, _parse_float
 
+from dashboard_disk_cache import (
+    clear_dashboard_disk_cache,
+    read_json_range_cache,
+    read_parquet_range_cache,
+)
+
 CHANNEL_GOOGLE = "Google Ads"
 CHANNEL_META = "FB/IG"
 
@@ -97,12 +103,26 @@ def norm_membership_level(raw: str) -> str:
     return "n/a"
 
 DEFAULT_SINCE = "2023-01-01"
+DEFAULT_DASHBOARD_MONTHS = 12
 GHL_SIGNUPS_SINCE = "2025-09-01"
 SHEETS_SIGNUPS_UNTIL = "2025-08-31"
 # DCs trend chart uses the same sheet / GHL cutover as signups.
 SHEETS_DCS_UNTIL = SHEETS_SIGNUPS_UNTIL
 GHL_DCS_SINCE = GHL_SIGNUPS_SINCE
 SHEET_LEADS_UNTIL = "2025-06-30"
+GHL_LEADS_SINCE = (
+    pd.Timestamp(SHEET_LEADS_UNTIL) + pd.Timedelta(days=1)
+).strftime("%Y-%m-%d")
+
+
+def default_dashboard_since(
+    *,
+    until: date | None = None,
+    months: int = DEFAULT_DASHBOARD_MONTHS,
+) -> date:
+    """Rolling default start date for the live dashboard (last N full months)."""
+    until_eff = until or (date.today() - timedelta(days=1))
+    return (pd.Timestamp(until_eff) - pd.DateOffset(months=months)).date()
 # Jul 2025 GHL bulk import from legacy CRM — CPL trend uses Jun/Aug average.
 GHL_CRM_DUMP_MONTH = pd.Timestamp("2025-07-01")
 _GHL_LEADS_CACHE_DIR = _PROJECT_ROOT / ".cache" / "ghl_daily_leads"
@@ -682,6 +702,44 @@ def fetch_meta_campaign_daily(since: str, until: str) -> pd.DataFrame:
     return out
 
 
+def fetch_google_ads_campaign_daily_cached(since: str, until: str) -> pd.DataFrame:
+    """Google Ads daily rows with disk cache for completed date ranges."""
+    return read_parquet_range_cache(
+        "google_ads_daily",
+        since,
+        until,
+        lambda: fetch_google_ads_campaign_daily(since, until),
+    )
+
+
+def fetch_meta_campaign_daily_cached(since: str, until: str) -> pd.DataFrame:
+    """Meta daily rows with disk cache for completed date ranges."""
+    return read_parquet_range_cache(
+        "meta_daily",
+        since,
+        until,
+        lambda: fetch_meta_campaign_daily(since, until),
+    )
+
+
+def _fetch_discovery_call_meetings_cached(since: str, until: str) -> dict[str, Any]:
+    return read_json_range_cache(
+        "ghl_dc_meetings",
+        since,
+        until,
+        lambda: fetch_discovery_call_meetings_monthly_by_channel(since, until),
+    )
+
+
+def _fetch_signup_contacts_cached(since: str, until: str) -> dict[str, Any]:
+    return read_json_range_cache(
+        "ghl_signups",
+        since,
+        until,
+        lambda: fetch_signup_date_range_committed_yes_contacts(since, until),
+    )
+
+
 def _ghl_channel_for_hear_about(raw: str) -> str | None:
     text = (raw or "").strip()
     if not text:
@@ -1059,6 +1117,7 @@ def fetch_ghl_channel_monthly(
     dict[str, dict[pd.Timestamp, float]],
     dict[pd.Timestamp, float],
     dict[pd.Timestamp, float],
+    dict[pd.Timestamp, float],
 ]:
     """
     Channel-month GHL funnel metrics not available at campaign level in ads APIs.
@@ -1085,8 +1144,70 @@ def fetch_ghl_channel_monthly(
         "leads_hear_about": {},
         "leads_combined": {},
     }
-    try:
-        ghl_leads = _fetch_ghl_leads_by_date_added(since, until)
+    ghl_leads_org_by_month: dict[pd.Timestamp, float] = {}
+    leads_since = max(since, GHL_LEADS_SINCE)
+    dc_since = max(since, GHL_DCS_SINCE)
+    ghl_conv_since = max(since, GHL_SIGNUPS_SINCE)
+    since_month = pd.Timestamp(since).to_period("M").to_timestamp()
+    until_month = pd.Timestamp(until).to_period("M").to_timestamp()
+
+    ghl_leads: dict[str, Any] | None = None
+    dc_meetings: dict[str, Any] | None = None
+    signup: dict[str, Any] | None = None
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures: dict[str, Any] = {}
+        if pd.Timestamp(until) >= pd.Timestamp(leads_since):
+            futures["leads"] = pool.submit(
+                _fetch_ghl_leads_by_date_added, leads_since, until
+            )
+        else:
+            notes.append(
+                f"GHL leads not queried (range ends before {GHL_LEADS_SINCE}; "
+                f"sheet baseline through {SHEET_LEADS_UNTIL})."
+            )
+        if pd.Timestamp(until) >= pd.Timestamp(dc_since):
+            futures["dcs"] = pool.submit(
+                _fetch_discovery_call_meetings_cached, dc_since, until
+            )
+        else:
+            notes.append(
+                f"GHL DCs not queried (range ends before {GHL_DCS_SINCE}; "
+                f"sheet baseline through {SHEETS_DCS_UNTIL})."
+            )
+        if pd.Timestamp(until) >= pd.Timestamp(ghl_conv_since):
+            futures["signups"] = pool.submit(
+                _fetch_signup_contacts_cached, ghl_conv_since, until
+            )
+        else:
+            notes.append(
+                f"GHL signups not queried (range ends before {GHL_SIGNUPS_SINCE})."
+            )
+
+        for name, future in futures.items():
+            try:
+                result = future.result()
+            except Exception as exc:
+                if name == "leads":
+                    notes.append(f"GHL lead counts skipped: {exc}")
+                elif name == "dcs":
+                    notes.append(f"GHL discovery-call meetings skipped: {exc}")
+                else:
+                    notes.append(f"GHL new-patient counts skipped: {exc}")
+                continue
+            if name == "leads":
+                ghl_leads = result
+            elif name == "dcs":
+                dc_meetings = result
+            else:
+                signup = result
+
+    if ghl_leads is not None:
+        if leads_since > since:
+            notes.append(
+                f"GHL leads API scoped to {leads_since} → {until} "
+                f"(sheet baseline through {SHEET_LEADS_UNTIL})."
+            )
         lead_summary = {
             "total_new_contacts": int(ghl_leads.get("total_new_contacts") or 0),
             "meta_leads": int(ghl_leads.get("meta_leads") or 0),
@@ -1121,6 +1242,9 @@ def fetch_ghl_channel_monthly(
             if not ms:
                 continue
             month = pd.Timestamp(ms).to_period("M").to_timestamp()
+            total_n = float(row.get("total_new_contacts") or 0)
+            if total_n:
+                ghl_leads_org_by_month[month] = total_n
             meta_n = float(row.get("meta_leads") or 0)
             google_n = float(row.get("google_leads") or 0)
             meta_hear_n = float(row.get("meta_leads_hear_about") or 0)
@@ -1150,16 +1274,18 @@ def fetch_ghl_channel_monthly(
                 unallocated_leads_by_attr["leads"][month] = unalloc_tracker
             if unalloc_combined:
                 unallocated_leads_by_attr["leads_combined"][month] = unalloc_combined
-    except Exception as exc:
-        notes.append(f"GHL lead counts skipped: {exc}")
 
     # Discovery calls: calendar meetings on configured GHL calendars
     meta_dcs_by_month: dict[pd.Timestamp, float] = {}
     google_dcs_by_month: dict[pd.Timestamp, float] = {}
     unallocated_dcs_by_month: dict[pd.Timestamp, float] = {}
     ghl_dcs_by_month: dict[pd.Timestamp, float] = {}
-    try:
-        dc_meetings = fetch_discovery_call_meetings_monthly_by_channel(since, until)
+    if dc_meetings is not None:
+        if dc_since > since:
+            notes.append(
+                f"GHL DCs API scoped to {dc_since} → {until} "
+                f"(sheet baseline through {SHEETS_DCS_UNTIL})."
+            )
         if dc_meetings.get("calendar_api_errors"):
             notes.append(
                 "GHL discovery-call calendar API returned errors for at least one "
@@ -1190,8 +1316,6 @@ def fetch_ghl_channel_monthly(
                 + float(row.get("meta") or 0)
                 + unallocated
             )
-    except Exception as exc:
-        notes.append(f"GHL discovery-call meetings skipped: {exc}")
 
     # New patients: committed + sign-up date + hear-about channel + membership level
     # (GHL only from GHL_SIGNUPS_SINCE; earlier months come from tracker sheets.)
@@ -1204,15 +1328,9 @@ def fetch_ghl_channel_monthly(
     combined_unallocated_by_month_level: dict[tuple[pd.Timestamp, str], float] = {}
     wom_by_month_level: dict[tuple[pd.Timestamp, str], float] = {}
     ghl_signups_by_month: dict[pd.Timestamp, float] = {}
-    ghl_conv_since = max(since, GHL_SIGNUPS_SINCE)
-    since_month = pd.Timestamp(since).to_period("M").to_timestamp()
-    until_month = pd.Timestamp(until).to_period("M").to_timestamp()
-    try:
-        if pd.Timestamp(until) >= pd.Timestamp(ghl_conv_since):
+    if signup is not None:
+        try:
             hear_id = resolve_hear_about_us_custom_field_id()
-            signup = fetch_signup_date_range_committed_yes_contacts(
-                ghl_conv_since, until
-            )
             if signup.get("truncated_pages"):
                 notes.append(
                     "GHL sign-up date search hit pagination cap or skipped day(s) "
@@ -1287,12 +1405,8 @@ def fetch_ghl_channel_monthly(
                         combined_conv_by_month_channel_level.get(key_clevel, 0.0)
                         + 1.0
                     )
-        else:
-            notes.append(
-                f"GHL signups not queried (range ends before {GHL_SIGNUPS_SINCE})."
-            )
-    except Exception as exc:
-        notes.append(f"GHL new-patient counts skipped: {exc}")
+        except Exception as exc:
+            notes.append(f"GHL new-patient counts skipped: {exc}")
 
     records: list[dict[str, Any]] = []
     months = pd.period_range(
@@ -1472,6 +1586,7 @@ def fetch_ghl_channel_monthly(
         unallocated_leads_by_attr,
         ghl_signups_by_month,
         ghl_dcs_by_month,
+        ghl_leads_org_by_month,
     )
 
 
@@ -2322,7 +2437,8 @@ def load_live_campaign_data(
          wom_conv, tracker conv_by_level, tracker unallocated,
          combined conv_by_level, combined unallocated, sheet_signup_months,
          channel_month_leads, cpl_channel_month_leads, unallocated_leads_by_attr,
-         sheet_signup_totals, ghl_signups_by_month, sheet_dcs_totals, ghl_dcs_by_month)
+         sheet_signup_totals, ghl_signups_by_month, sheet_dcs_totals, ghl_dcs_by_month,
+         ghl_leads_org_by_month)
     """
     today = date.today()
     until_eff = until or (today - timedelta(days=1)).isoformat()
@@ -2342,44 +2458,54 @@ def load_live_campaign_data(
         "Campaign-level signups are allocated by spend share within channel-month.",
     ]
 
-    gads_daily = fetch_google_ads_campaign_daily(since_eff, until_eff)
-    try:
-        meta_daily = fetch_meta_campaign_daily(since_eff, until_eff)
-        partial_meta_errors = meta_daily.attrs.get("meta_partial_errors") or []
-        if partial_meta_errors:
-            notes.append(
-                "Meta insights partially loaded (some date chunks failed); "
-                "FB/IG spend may be incomplete."
-            )
-            for err in partial_meta_errors[:3]:
-                notes.append(f"Meta chunk error: {err}")
-            if len(partial_meta_errors) > 3:
+    meta_daily = pd.DataFrame(columns=_META_EMPTY_DAILY_COLUMNS)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        gads_future = pool.submit(
+            fetch_google_ads_campaign_daily_cached, since_eff, until_eff
+        )
+        meta_future = pool.submit(
+            fetch_meta_campaign_daily_cached, since_eff, until_eff
+        )
+        ghl_future = pool.submit(fetch_ghl_channel_monthly, since_eff, until_eff)
+        gads_daily = gads_future.result()
+        try:
+            meta_daily = meta_future.result()
+            partial_meta_errors = meta_daily.attrs.get("meta_partial_errors") or []
+            if partial_meta_errors:
                 notes.append(
-                    f"… and {len(partial_meta_errors) - 3} more Meta chunk errors."
+                    "Meta insights partially loaded (some date chunks failed); "
+                    "FB/IG spend may be incomplete."
                 )
-    except Exception as exc:
-        notes.append(f"Meta campaign insights skipped: {exc}")
-        meta_daily = pd.DataFrame(columns=_META_EMPTY_DAILY_COLUMNS)
+                for err in partial_meta_errors[:3]:
+                    notes.append(f"Meta chunk error: {err}")
+                if len(partial_meta_errors) > 3:
+                    notes.append(
+                        f"… and {len(partial_meta_errors) - 3} more Meta chunk errors."
+                    )
+        except Exception as exc:
+            notes.append(f"Meta campaign insights skipped: {exc}")
+            meta_daily = pd.DataFrame(columns=_META_EMPTY_DAILY_COLUMNS)
+        (
+            ghl_monthly,
+            lead_summary,
+            ghl_notes,
+            conv_by_level_df,
+            unallocated_conv_df,
+            wom_conv_df,
+            tracker_conv_by_level_df,
+            tracker_unallocated_conv_df,
+            combined_conv_by_level_df,
+            combined_unallocated_conv_df,
+            unallocated_dcs_by_month,
+            unallocated_leads_by_attr,
+            ghl_signups_by_month,
+            ghl_dcs_by_month,
+            ghl_leads_org_by_month,
+        ) = ghl_future.result()
 
     daily = pd.concat([gads_daily, meta_daily], ignore_index=True)
 
     monthly_ads = _aggregate_to_month_end(daily)
-    (
-        ghl_monthly,
-        lead_summary,
-        ghl_notes,
-        conv_by_level_df,
-        unallocated_conv_df,
-        wom_conv_df,
-        tracker_conv_by_level_df,
-        tracker_unallocated_conv_df,
-        combined_conv_by_level_df,
-        combined_unallocated_conv_df,
-        unallocated_dcs_by_month,
-        unallocated_leads_by_attr,
-        ghl_signups_by_month,
-        ghl_dcs_by_month,
-    ) = fetch_ghl_channel_monthly(since_eff, until_eff)
     notes.extend(ghl_notes)
     notes.append(
         "GHL new contacts in range: "
@@ -2431,9 +2557,8 @@ def load_live_campaign_data(
             ghl_signups_by_month,
             sheet_dcs_totals,
             ghl_dcs_by_month,
+            ghl_leads_org_by_month,
         )
-
-    if sheet_months and not ghl_monthly.empty:
         ghl_monthly = ghl_monthly.copy()
         ghl_monthly.loc[ghl_monthly["month"].isin(sheet_months), "conversions"] = 0.0
 
@@ -2553,12 +2678,100 @@ def load_live_campaign_data(
         ghl_signups_by_month,
         sheet_dcs_totals,
         ghl_dcs_by_month,
+        ghl_leads_org_by_month,
+    )
+
+
+def load_dashboard_bundle(
+    campaign_since: str,
+    until: str,
+    *,
+    funnel_since: str | None = None,
+    funnel_until: str | None = None,
+) -> tuple[
+    pd.DataFrame,
+    list[str],
+    dict[str, int],
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    set[pd.Timestamp],
+    pd.DataFrame,
+    pd.DataFrame,
+    dict[str, dict[pd.Timestamp, float]],
+    dict[pd.Timestamp, float],
+    dict[pd.Timestamp, float],
+    dict[pd.Timestamp, float],
+    dict[pd.Timestamp, float],
+    dict[pd.Timestamp, float],
+    pd.DataFrame,
+    list[str],
+]:
+    """Load campaign metrics and funnel-over-time chart from one shared fetch pass."""
+    from funnel_over_time_data import load_funnel_over_time
+
+    (
+        df,
+        notes,
+        lead_summary,
+        conv_by_level_df,
+        unallocated_conv_df,
+        wom_conv_df,
+        tracker_conv_by_level_df,
+        tracker_unallocated_conv_df,
+        combined_conv_by_level_df,
+        combined_unallocated_conv_df,
+        sheet_months,
+        channel_month_leads,
+        cpl_channel_month_leads,
+        unallocated_leads_by_attr,
+        sheet_signup_totals,
+        ghl_signups_by_month,
+        sheet_dcs_totals,
+        ghl_dcs_by_month,
+        ghl_leads_org_by_month,
+    ) = load_live_campaign_data(campaign_since, until)
+
+    funnel_df, funnel_notes = load_funnel_over_time(
+        funnel_since or campaign_since,
+        funnel_until or until,
+        ghl_leads_by_month=ghl_leads_org_by_month,
+        ghl_dcs_by_month=ghl_dcs_by_month,
+        ghl_signups_by_month=ghl_signups_by_month,
+    )
+    return (
+        df,
+        notes,
+        lead_summary,
+        conv_by_level_df,
+        unallocated_conv_df,
+        wom_conv_df,
+        tracker_conv_by_level_df,
+        tracker_unallocated_conv_df,
+        combined_conv_by_level_df,
+        combined_unallocated_conv_df,
+        sheet_months,
+        channel_month_leads,
+        cpl_channel_month_leads,
+        unallocated_leads_by_attr,
+        sheet_signup_totals,
+        ghl_signups_by_month,
+        sheet_dcs_totals,
+        ghl_dcs_by_month,
+        ghl_leads_org_by_month,
+        funnel_df,
+        funnel_notes,
     )
 
 
 __all__ = [
     "MEMBERSHIP_LEVELS",
     "GHL_SIGNUPS_SINCE",
+    "GHL_LEADS_SINCE",
     "SHEETS_SIGNUPS_UNTIL",
     "GHL_DCS_SINCE",
     "SHEETS_DCS_UNTIL",
@@ -2569,7 +2782,10 @@ __all__ = [
     "apply_dashboard_ghl_attribution",
     "apply_membership_conversion_filter",
     "channel_month_leads_total",
+    "clear_dashboard_disk_cache",
     "clear_ghl_leads_day_cache",
+    "default_dashboard_since",
+    "load_dashboard_bundle",
     "load_live_campaign_data",
     "TrendChartMonthlies",
     "build_cpl_trend_monthly",
@@ -2581,5 +2797,6 @@ __all__ = [
     "overlay_monthly_leads_for_trends",
     "scorecard_metrics",
     "DEFAULT_SINCE",
+    "DEFAULT_DASHBOARD_MONTHS",
     "LIVE_DATA_REVISION",
 ]

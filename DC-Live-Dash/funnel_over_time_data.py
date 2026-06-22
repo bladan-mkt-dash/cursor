@@ -37,7 +37,7 @@ from ghl_client import (
 )
 
 # Bump when loader logic changes (Streamlit cache key).
-FUNNEL_OVER_TIME_REVISION = "2026-06-19-funnel-aug-ghl-leads-v1"
+FUNNEL_OVER_TIME_REVISION = "2026-06-22-perf-shared-ghl-v1"
 
 _FUNNEL_COLUMNS = ("month", "leads", "dcs", "signups", "source")
 
@@ -57,7 +57,12 @@ def _empty_funnel() -> pd.DataFrame:
     return pd.DataFrame(columns=list(_FUNNEL_COLUMNS))
 
 
-def load_sheet_funnel_monthly(since: str, until: str) -> tuple[pd.DataFrame, list[str]]:
+def load_sheet_funnel_monthly(
+    since: str,
+    until: str,
+    *,
+    ghl_leads_by_month: dict[pd.Timestamp, float] | None = None,
+) -> tuple[pd.DataFrame, list[str]]:
     """
     Pre-GHL org-wide funnel through Aug 30, 2025.
 
@@ -104,14 +109,28 @@ def load_sheet_funnel_monthly(since: str, until: str) -> tuple[pd.DataFrame, lis
     hubspot_until = pd.Timestamp(HUBSPOT_DATA_UNTIL).to_period("M").to_timestamp()
     if sheet_until > hubspot_until:
         bridge_since = (hubspot_until + pd.offsets.MonthBegin(1)).strftime("%Y-%m-%d")
-        ghl_leads_raw, ghl_lead_notes = _ghl_leads_monthly(bridge_since, range_until)
-        ghl_leads_aug = {pd.Timestamp(m): float(v) for m, v in ghl_leads_raw.items()}
-        if ghl_leads_aug:
-            notes.extend(ghl_lead_notes)
-            notes.append(
-                "Funnel Aug 2025 leads: GHL new contacts by dateAdded (HubSpot export "
-                f"ends {hubspot_until.strftime('%b %Y')})."
-            )
+        if ghl_leads_by_month is not None:
+            bridge_start = pd.Timestamp(bridge_since).to_period("M").to_timestamp()
+            bridge_end = pd.Timestamp(range_until).to_period("M").to_timestamp()
+            ghl_leads_aug = {
+                month: float(total)
+                for month, total in ghl_leads_by_month.items()
+                if bridge_start <= month <= bridge_end
+            }
+            if ghl_leads_aug:
+                notes.append(
+                    "Funnel Aug 2025 leads: reused GHL new contacts by dateAdded "
+                    f"(HubSpot export ends {hubspot_until.strftime('%b %Y')})."
+                )
+        else:
+            ghl_leads_raw, ghl_lead_notes = _ghl_leads_monthly(bridge_since, range_until)
+            ghl_leads_aug = {pd.Timestamp(m): float(v) for m, v in ghl_leads_raw.items()}
+            if ghl_leads_aug:
+                notes.extend(ghl_lead_notes)
+                notes.append(
+                    "Funnel Aug 2025 leads: GHL new contacts by dateAdded (HubSpot export "
+                    f"ends {hubspot_until.strftime('%b %Y')})."
+                )
 
     sheet_signup_cutoff = pd.Timestamp(SHEETS_SIGNUPS_UNTIL).to_period("M").to_timestamp()
     sheet_dcs_cutoff = pd.Timestamp(SHEETS_DCS_UNTIL).to_period("M").to_timestamp()
@@ -256,7 +275,14 @@ def _ghl_signups_monthly(since: str, until: str) -> tuple[dict[pd.Timestamp, int
     return by_month, notes
 
 
-def load_ghl_funnel_monthly(since: str, until: str) -> tuple[pd.DataFrame, list[str]]:
+def load_ghl_funnel_monthly(
+    since: str,
+    until: str,
+    *,
+    ghl_leads_by_month: dict[pd.Timestamp, float] | None = None,
+    ghl_dcs_by_month: dict[pd.Timestamp, float] | None = None,
+    ghl_signups_by_month: dict[pd.Timestamp, float] | None = None,
+) -> tuple[pd.DataFrame, list[str]]:
     """Monthly funnel from GHL (from Sep 1, 2025 — after Aug 30)."""
     from digital_channel_live_data import GHL_SIGNUPS_SINCE
 
@@ -264,13 +290,54 @@ def load_ghl_funnel_monthly(since: str, until: str) -> tuple[pd.DataFrame, list[
     if pd.Timestamp(until) < pd.Timestamp(ghl_since):
         return _empty_funnel(), []
 
+    ghl_since_month = pd.Timestamp(ghl_since).to_period("M").to_timestamp()
+    until_month = pd.Timestamp(until).to_period("M").to_timestamp()
+
     notes: list[str] = []
-    leads_by_month, lead_notes = _ghl_leads_monthly(ghl_since, until)
-    notes.extend(lead_notes)
-    dcs_by_month, dc_notes = _ghl_dcs_monthly(ghl_since, until)
-    notes.extend(dc_notes)
-    signups_by_month, signup_notes = _ghl_signups_monthly(ghl_since, until)
-    notes.extend(signup_notes)
+    if ghl_leads_by_month is not None:
+        leads_by_month = {
+            month: int(total)
+            for month, total in ghl_leads_by_month.items()
+            if ghl_since_month <= month <= until_month
+        }
+        if leads_by_month:
+            notes.append(
+                f"GHL leads: {sum(leads_by_month.values()):,} new contacts "
+                f"({ghl_since} → {until}), by dateAdded (shared loader)."
+            )
+    else:
+        leads_by_month, lead_notes = _ghl_leads_monthly(ghl_since, until)
+        notes.extend(lead_notes)
+
+    if ghl_dcs_by_month is not None:
+        dcs_by_month = {
+            month: int(total)
+            for month, total in ghl_dcs_by_month.items()
+            if ghl_since_month <= month <= until_month
+        }
+        if dcs_by_month:
+            notes.append(
+                f"GHL DCs: {sum(dcs_by_month.values()):,} discovery-call meeting(s) "
+                f"({ghl_since} → {until}, shared loader)."
+            )
+    else:
+        dcs_by_month, dc_notes = _ghl_dcs_monthly(ghl_since, until)
+        notes.extend(dc_notes)
+
+    if ghl_signups_by_month is not None:
+        signups_by_month = {
+            month: int(total)
+            for month, total in ghl_signups_by_month.items()
+            if ghl_since_month <= month <= until_month
+        }
+        if signups_by_month:
+            notes.append(
+                f"GHL signups: {sum(signups_by_month.values()):,} committed "
+                f"(Sign Up Date {ghl_since} → {until}, shared loader)."
+            )
+    else:
+        signups_by_month, signup_notes = _ghl_signups_monthly(ghl_since, until)
+        notes.extend(signup_notes)
 
     rows: list[dict[str, Any]] = []
     for month in _month_range(ghl_since, until):
@@ -286,17 +353,37 @@ def load_ghl_funnel_monthly(since: str, until: str) -> tuple[pd.DataFrame, list[
     return pd.DataFrame(rows), notes
 
 
-def load_funnel_over_time(since: str, until: str) -> tuple[pd.DataFrame, list[str]]:
+def load_funnel_over_time(
+    since: str,
+    until: str,
+    *,
+    ghl_leads_by_month: dict[pd.Timestamp, float] | None = None,
+    ghl_dcs_by_month: dict[pd.Timestamp, float] | None = None,
+    ghl_signups_by_month: dict[pd.Timestamp, float] | None = None,
+) -> tuple[pd.DataFrame, list[str]]:
     """
     Stitch pre-GHL months (through Aug 30, 2025) with GHL months (Sep 2025 onward).
 
     Returns one row per calendar month in range with columns:
     month, leads, dcs, signups, source ('hubspot+tracker' | 'ghl').
+
+    When ``ghl_*_by_month`` dicts are supplied (from :func:`load_live_campaign_data`),
+    GHL API calls are skipped for the funnel chart.
     """
     notes: list[str] = []
-    sheet_df, sheet_notes = load_sheet_funnel_monthly(since, until)
+    sheet_df, sheet_notes = load_sheet_funnel_monthly(
+        since,
+        until,
+        ghl_leads_by_month=ghl_leads_by_month,
+    )
     notes.extend(sheet_notes)
-    ghl_df, ghl_notes = load_ghl_funnel_monthly(since, until)
+    ghl_df, ghl_notes = load_ghl_funnel_monthly(
+        since,
+        until,
+        ghl_leads_by_month=ghl_leads_by_month,
+        ghl_dcs_by_month=ghl_dcs_by_month,
+        ghl_signups_by_month=ghl_signups_by_month,
+    )
     notes.extend(ghl_notes)
 
     if sheet_df.empty and ghl_df.empty:
@@ -304,6 +391,7 @@ def load_funnel_over_time(since: str, until: str) -> tuple[pd.DataFrame, list[st
 
     combined = pd.concat([sheet_df, ghl_df], ignore_index=True)
     combined = combined.sort_values("month").drop_duplicates(subset=["month"], keep="last")
+    combined["month"] = pd.to_datetime(combined["month"])
 
     since_month = pd.Timestamp(since).to_period("M").to_timestamp()
     until_month = pd.Timestamp(until).to_period("M").to_timestamp()

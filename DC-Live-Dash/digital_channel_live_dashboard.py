@@ -21,15 +21,18 @@ import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
 
-from ghl_client import discovery_call_calendar_ids
-
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _DC_LIVE_DIR = Path(__file__).resolve().parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 if str(_DC_LIVE_DIR) not in sys.path:
     sys.path.insert(0, str(_DC_LIVE_DIR))
 
+from ghl_client import discovery_call_calendar_ids
+
 import digital_channel_live_data as _live_data_mod
 
-_EXPECTED_LIVE_DATA_REVISION = "2026-06-19-signups-tracker-q2-v1"
+_EXPECTED_LIVE_DATA_REVISION = "2026-06-22-perf-cache-unified-v1"
 if (
     getattr(_live_data_mod, "LIVE_DATA_REVISION", None)
     != _EXPECTED_LIVE_DATA_REVISION
@@ -38,7 +41,7 @@ if (
 
 import funnel_over_time_data as _funnel_mod
 
-_EXPECTED_FUNNEL_REVISION = "2026-06-19-funnel-aug-ghl-leads-v1"
+_EXPECTED_FUNNEL_REVISION = "2026-06-22-perf-shared-ghl-v1"
 if (
     getattr(_funnel_mod, "FUNNEL_OVER_TIME_REVISION", None)
     != _EXPECTED_FUNNEL_REVISION
@@ -47,9 +50,8 @@ if (
 
 FUNNEL_OVER_TIME_REVISION = _funnel_mod.FUNNEL_OVER_TIME_REVISION
 GHL_FUNNEL_SINCE = _funnel_mod.GHL_FUNNEL_SINCE
-load_funnel_over_time = _funnel_mod.load_funnel_over_time
 from digital_channel_live_data import (
-    DEFAULT_SINCE,
+    DEFAULT_DASHBOARD_MONTHS,
     GHL_ATTRIBUTION_HEAR_ABOUT,
     GHL_ATTRIBUTION_OPTIONS,
     GHL_ATTRIBUTION_TRACKER,
@@ -59,14 +61,18 @@ from digital_channel_live_data import (
     MEMBERSHIP_LEVELS,
     SHEETS_SIGNUPS_UNTIL,
     SHEETS_DCS_UNTIL,
+    SHEET_LEADS_UNTIL,
     apply_dashboard_ghl_attribution,
-    build_spend_trend_monthly,
     build_trend_chart_monthlies,
     channel_month_leads_total,
+    clear_dashboard_disk_cache,
     clear_ghl_leads_day_cache,
-    load_live_campaign_data,
+    default_dashboard_since,
+    load_dashboard_bundle,
     scorecard_metrics,
 )
+
+DASHBOARD_BUNDLE_REVISION = f"{LIVE_DATA_REVISION}|{FUNNEL_OVER_TIME_REVISION}"
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
@@ -168,82 +174,28 @@ def _metric_row(items: list[tuple[str, str]]) -> None:
         col.metric(label, value)
 
 
-def _prior_year_date(d: date) -> date:
-    """Same calendar day one year earlier (Feb 29 → Feb 28)."""
-    try:
-        return d.replace(year=d.year - 1)
-    except ValueError:
-        return d.replace(year=d.year - 1, day=28)
-
-
-def _spend_over_time_chart(
-    spend_period_df: pd.DataFrame,
-    prior_spend_monthly: pd.DataFrame,
-    *,
-    prior_since: date,
-    prior_until: date,
-) -> go.Figure:
-    """Spend for the selected range with prior-year same-period spend overlaid."""
+def _spend_over_time_chart(spend_period_df: pd.DataFrame) -> go.Figure:
+    """Spend for the selected date range."""
     x_order = spend_period_df["period_label"].tolist()
     current_y = spend_period_df["spend"].tolist()
 
-    prior_period_df, _ = _time_period_summary(
-        prior_spend_monthly, prior_since, prior_until
-    )
-    prior_by_month = (
-        prior_period_df.set_index("month")["spend"].to_dict()
-        if not prior_period_df.empty
-        else {}
-    )
-
-    prior_y: list[float | None] = []
-    for _, row in spend_period_df.iterrows():
-        prior_key = row["month"] - pd.DateOffset(years=1)
-        val = prior_by_month.get(prior_key)
-        prior_y.append(float(val) if val is not None and not pd.isna(val) else None)
-
-    has_prior = any(v is not None for v in prior_y)
-    prior_label = (
-        f"{prior_since.strftime('%b %Y')}–{prior_until.strftime('%b %Y')}"
-    )
-
     fig = go.Figure()
-    if has_prior:
-        fig.add_trace(
-            go.Scatter(
-                x=x_order,
-                y=prior_y,
-                mode="lines+markers",
-                name=f"Spend ({prior_label})",
-                line=dict(color=COLORS["muted"], width=2, dash="dash"),
-                marker=dict(size=6, color=COLORS["muted"]),
-            )
-        )
     fig.add_trace(
         go.Scatter(
             x=x_order,
             y=current_y,
             mode="lines+markers",
-            name="Spend (selected range)",
+            name="Spend",
             line=dict(color=COLORS["accent"], width=2.5),
             marker=dict(size=7, color=COLORS["accent"]),
         )
     )
 
-    bottom_margin = 70 if has_prior else 20
     fig.update_layout(
         height=320,
         title="Spend Over Time",
-        margin=dict(l=20, r=20, t=56, b=bottom_margin),
-        showlegend=has_prior,
-        legend=dict(
-            orientation="h",
-            yanchor="top",
-            y=-0.28,
-            x=0.5,
-            xanchor="center",
-            title_text="",
-        ),
+        margin=dict(l=20, r=20, t=56, b=20),
+        showlegend=False,
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
         font=dict(family="Roboto, sans-serif", color=COLORS["accent_dark"]),
@@ -343,6 +295,7 @@ def _funnel_over_time_chart(funnel_df: pd.DataFrame) -> go.Figure | None:
         return None
 
     plot_df = funnel_df.sort_values("month").copy()
+    plot_df["month"] = pd.to_datetime(plot_df["month"])
     plot_df["period_label"] = plot_df["month"].dt.strftime("%b %Y")
     x_order = plot_df["period_label"].tolist()
 
@@ -616,6 +569,7 @@ def _weighted_scorecard_metrics(
     until_month: pd.Timestamp,
     use_hear_about: bool,
     use_tracker: bool,
+    cpl_monthly: pd.DataFrame | None = None,
 ) -> dict[str, float | None]:
     """Scorecard totals with properly weighted averages for rate metrics."""
     if df.empty:
@@ -623,19 +577,26 @@ def _weighted_scorecard_metrics(
 
     spend = df["spend"].sum()
     clicks = df["clicks"].sum()
-    leads = _scorecard_leads_total(
-        df,
-        selected_channels=selected_channels,
-        all_channels=all_channels,
-        selected_campaigns=selected_campaigns,
-        campaign_pool=campaign_pool,
-        lead_summary=lead_summary,
-        channel_month_leads=channel_month_leads,
-        since_month=since_month,
-        until_month=until_month,
-        use_hear_about=use_hear_about,
-        use_tracker=use_tracker,
-    )
+    if (
+        cpl_monthly is not None
+        and not cpl_monthly.empty
+        and "leads" in cpl_monthly.columns
+    ):
+        leads = float(cpl_monthly["leads"].sum())
+    else:
+        leads = _scorecard_leads_total(
+            df,
+            selected_channels=selected_channels,
+            all_channels=all_channels,
+            selected_campaigns=selected_campaigns,
+            campaign_pool=campaign_pool,
+            lead_summary=lead_summary,
+            channel_month_leads=channel_month_leads,
+            since_month=since_month,
+            until_month=until_month,
+            use_hear_about=use_hear_about,
+            use_tracker=use_tracker,
+        )
     dcs = df["dcs"].sum()
     conversions = df["conversions"].sum()
 
@@ -654,15 +615,16 @@ def _weighted_scorecard_metrics(
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def _load_data(
-    since: str,
+def _load_dashboard(
+    campaign_since: str,
     until: str,
-    _revision: str = LIVE_DATA_REVISION,
+    funnel_since: str,
+    funnel_until: str,
+    _revision: str = DASHBOARD_BUNDLE_REVISION,
 ) -> tuple[
     pd.DataFrame,
     tuple[str, ...],
     dict[str, int],
-    pd.DataFrame,
     pd.DataFrame,
     pd.DataFrame,
     pd.DataFrame,
@@ -677,6 +639,9 @@ def _load_data(
     dict[pd.Timestamp, float],
     dict[pd.Timestamp, float],
     dict[pd.Timestamp, float],
+    dict[pd.Timestamp, float],
+    pd.DataFrame,
+    tuple[str, ...],
 ]:
     (
         df,
@@ -697,7 +662,18 @@ def _load_data(
         ghl_signups_by_month,
         sheet_dcs_totals,
         ghl_dcs_by_month,
-    ) = load_live_campaign_data(since=since, until=until)
+        _ghl_leads_org_by_month,
+        funnel_df,
+        funnel_notes,
+    ) = load_dashboard_bundle(
+        campaign_since,
+        until,
+        funnel_since=funnel_since,
+        funnel_until=funnel_until,
+    )
+    if not funnel_df.empty:
+        funnel_df = funnel_df.copy()
+        funnel_df["month"] = pd.to_datetime(funnel_df["month"])
     return (
         df,
         tuple(notes),
@@ -717,17 +693,9 @@ def _load_data(
         ghl_signups_by_month,
         sheet_dcs_totals,
         ghl_dcs_by_month,
+        funnel_df,
+        tuple(funnel_notes),
     )
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def _load_funnel_over_time(
-    since: str,
-    until: str,
-    _revision: str = FUNNEL_OVER_TIME_REVISION,
-) -> tuple[pd.DataFrame, tuple[str, ...]]:
-    df, notes = load_funnel_over_time(since, until)
-    return df, tuple(notes)
 
 
 def main() -> None:
@@ -744,8 +712,10 @@ def main() -> None:
         "Leads through Jun 2025 use **Digital Channel Dashboard 2024-25** Data tab; "
         "later months use GHL new contacts (attributed + unallocated spread by spend, "
         "same approach as DCs). "
-        "**First load** for a wide date range can take a few minutes while GHL "
-        "lead data is pulled day-by-day; **repeat loads use cache** and are much faster. "
+        "**First load** for a wide date range can take a minute while GHL lead data "
+        "is pulled day-by-day (Jul 2025 onward only); **repeat loads use disk cache** "
+        "and are much faster. Default view is the last "
+        f"**{DEFAULT_DASHBOARD_MONTHS} months** — widen dates in the sidebar for full history. "
         "**Signups** through Aug 2025: **GRAND TOTAL New Members** from Digital Cross-Channel "
         "Tracker sheets; from Sep 2025: GHL **Committed?** = Yes + **Sign Up Date**, with "
         "**Membership Level** slicer (sheet months ignore membership filter)."
@@ -753,7 +723,7 @@ def main() -> None:
 
     today = date.today()
     default_until = today - timedelta(days=1)
-    default_since = pd.Timestamp(DEFAULT_SINCE).date()
+    default_since = default_dashboard_since(until=default_until)
 
     with st.sidebar:
         st.header("Filters")
@@ -779,8 +749,8 @@ def main() -> None:
             st.rerun()
 
         if st.button("Refresh data", help="Reload ads + GHL. Keeps cached GHL daily lead files."):
-            _load_data.clear()
-            _load_funnel_over_time.clear()
+            clear_dashboard_disk_cache()
+            _load_dashboard.clear()
             st.rerun()
 
         if st.button(
@@ -788,26 +758,21 @@ def main() -> None:
             help="Clear cached GHL daily lead files and reload (use if lead counts look wrong).",
         ):
             clear_ghl_leads_day_cache()
-            _load_data.clear()
-            _load_funnel_over_time.clear()
+            clear_dashboard_disk_cache()
+            _load_dashboard.clear()
             st.rerun()
 
     load_label = (
         "Loading Google Ads, Meta, and GoHighLevel… "
-        "(GHL leads may take several minutes on first load for a wide range)"
+        "(first load may take a minute; cached ranges are much faster)"
     )
-    prior_since = _prior_year_date(since)
-    prior_until = _prior_year_date(until)
-    load_since = min(since, prior_since)
     with st.spinner(load_label):
         try:
-            raw_df, notes, lead_summary, conv_by_level_df, unallocated_conv_df, wom_conv_df, tracker_conv_by_level_df, tracker_unallocated_conv_df, combined_conv_by_level_df, combined_unallocated_conv_df, sheet_months, channel_month_leads, cpl_channel_month_leads, unallocated_leads_by_attr, sheet_signup_totals, ghl_signups_by_month, sheet_dcs_totals, ghl_dcs_by_month = _load_data(
-                load_since.isoformat(), until.isoformat()
-            )
-            funnel_df, funnel_notes = _load_funnel_over_time(
+            raw_df, notes, lead_summary, conv_by_level_df, unallocated_conv_df, wom_conv_df, tracker_conv_by_level_df, tracker_unallocated_conv_df, combined_conv_by_level_df, combined_unallocated_conv_df, sheet_months, channel_month_leads, cpl_channel_month_leads, unallocated_leads_by_attr, sheet_signup_totals, ghl_signups_by_month, sheet_dcs_totals, ghl_dcs_by_month, funnel_df, funnel_notes = _load_dashboard(
                 since.isoformat(),
                 until.isoformat(),
-                _revision=FUNNEL_OVER_TIME_REVISION,
+                since.isoformat(),
+                until.isoformat(),
             )
         except Exception as exc:
             st.error(f"Could not load live data.\n\n{exc}")
@@ -939,8 +904,6 @@ def main() -> None:
 
     since_month = pd.Timestamp(since).to_period("M").to_timestamp()
     until_month = pd.Timestamp(until).to_period("M").to_timestamp()
-    prior_since_month = pd.Timestamp(prior_since).to_period("M").to_timestamp()
-    prior_until_month = pd.Timestamp(prior_until).to_period("M").to_timestamp()
 
     raw_selected = raw_df[
         (raw_df["month"] >= since_month) & (raw_df["month"] <= until_month)
@@ -967,22 +930,6 @@ def main() -> None:
     df = filtered.loc[mask].copy()
     if "month" not in df.columns:
         df["month"] = df["date"].dt.to_period("M").dt.to_timestamp()
-
-    prior_df = raw_df.loc[
-        (raw_df["month"] >= prior_since_month)
-        & (raw_df["month"] <= prior_until_month)
-    ].copy()
-    prior_df = prior_df.loc[
-        prior_df["channel"].isin(selected_channels)
-        & (prior_df["campaign"].isin(selected_campaigns))
-        & (prior_df["creative_type"].isin(selected_creatives))
-    ].copy()
-    if meta_types:
-        prior_meta_mask = (prior_df["channel"] != "FB/IG") | (
-            prior_df["fb_ig_type"].isin(selected_meta_types)
-        )
-        prior_df = prior_df.loc[prior_meta_mask].copy()
-    prior_spend_monthly = build_spend_trend_monthly(prior_df)
 
     trend_monthlies = build_trend_chart_monthlies(
         df,
@@ -1018,6 +965,7 @@ def main() -> None:
         until_month=until_month,
         use_hear_about=use_hear_about,
         use_tracker=use_tracker,
+        cpl_monthly=trend_monthlies.cpl,
     )
 
     _metric_row(
@@ -1034,6 +982,23 @@ def main() -> None:
             ("Signup to DC %", _fmt_pct(scores["lead_to_patient_pct"])),
         ],
     )
+    scorecard_lead_notes: list[str] = []
+    if include_organic_leads:
+        scorecard_lead_notes.append(
+            "Leads and CPL include **Organic** (non–paid-attributed) contacts."
+        )
+    if until_month <= pd.Timestamp(SHEET_LEADS_UNTIL).to_period("M").to_timestamp():
+        scorecard_lead_notes.append(
+            "Selected range uses **sheet lead totals** (through Jun 2025) — "
+            "attribution toggles do not change lead counts."
+        )
+    elif since_month <= pd.Timestamp(SHEET_LEADS_UNTIL).to_period("M").to_timestamp():
+        scorecard_lead_notes.append(
+            "Lead counts through **Jun 2025** come from the sheet (same total for all "
+            "attribution modes); **Jul 2025+** follows the GHL attribution checkboxes."
+        )
+    if scorecard_lead_notes:
+        st.caption(" ".join(scorecard_lead_notes))
 
     if use_hear_about and use_tracker:
 
@@ -1068,12 +1033,7 @@ def main() -> None:
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.plotly_chart(
-            _spend_over_time_chart(
-                spend_period_df,
-                prior_spend_monthly,
-                prior_since=prior_since,
-                prior_until=prior_until,
-            ),
+            _spend_over_time_chart(spend_period_df),
             use_container_width=True,
         )
     with c2:
