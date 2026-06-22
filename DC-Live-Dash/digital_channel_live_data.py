@@ -33,7 +33,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 # Bump when loader logic or ghl_client signup/DC helpers change — Streamlit keeps
 # imported modules across reruns; reload ghl_client when its revision differs.
-LIVE_DATA_REVISION = "2026-06-22-perf-cache-unified-v1"
+LIVE_DATA_REVISION = "2026-06-22-sheets-tracker-cache-v1"
 GHL_ATTRIBUTION_HEAR_ABOUT = "hear_about"
 GHL_ATTRIBUTION_TRACKER = "tracker"
 GHL_ATTRIBUTION_OPTIONS: tuple[tuple[str, str], ...] = (
@@ -86,6 +86,7 @@ CHANNEL_META = "FB/IG"
 
 MEMBERSHIP_LEVELS = ("Standard", "Silver", "Gold", "Platinum")
 CONV_BY_LEVEL_COLUMNS = ["month", "channel", "membership_level", "conversions"]
+SIGNUP_BY_LEVEL_COLUMNS = ["month", "membership_level", "signups"]
 
 
 def norm_membership_level(raw: str) -> str:
@@ -101,6 +102,57 @@ def norm_membership_level(raw: str) -> str:
         if level.lower() in cf:
             return level
     return "n/a"
+
+
+def build_ghl_signups_by_level_monthly(
+    signup: dict[str, Any] | None,
+    since: str,
+    until: str,
+) -> pd.DataFrame:
+    """
+    Org-wide committed signups by Sign Up Date month and membership tier.
+
+    Counts each contact once (independent of hear-about / tracker attribution).
+    Only tiers in ``MEMBERSHIP_LEVELS`` are included.
+    """
+    if not signup:
+        return pd.DataFrame(columns=SIGNUP_BY_LEVEL_COLUMNS)
+
+    since_month = pd.Timestamp(since).to_period("M").to_timestamp()
+    until_month = pd.Timestamp(until).to_period("M").to_timestamp()
+    sid = signup.get("sign_up_date_field_id") or ""
+    mid = signup.get("membership_level_field_id") or ""
+    if not sid:
+        return pd.DataFrame(columns=SIGNUP_BY_LEVEL_COLUMNS)
+
+    counts: dict[tuple[pd.Timestamp, str], float] = {}
+    for contact in signup.get("contacts") or []:
+        raw_signup = contact_custom_field_value(contact, sid).strip()
+        if not raw_signup:
+            continue
+        try:
+            signup_day = pd.to_datetime(raw_signup[:10])
+        except (ValueError, TypeError):
+            continue
+        month = signup_day.to_period("M").to_timestamp()
+        if month < since_month or month > until_month:
+            continue
+        level = norm_membership_level(
+            contact_custom_field_value(contact, mid) if mid else ""
+        )
+        if level not in MEMBERSHIP_LEVELS:
+            continue
+        key = (month, level)
+        counts[key] = counts.get(key, 0.0) + 1.0
+
+    if not counts:
+        return pd.DataFrame(columns=SIGNUP_BY_LEVEL_COLUMNS)
+    records = [
+        {"month": month, "membership_level": level, "signups": count}
+        for (month, level), count in counts.items()
+    ]
+    return pd.DataFrame(records, columns=SIGNUP_BY_LEVEL_COLUMNS)
+
 
 DEFAULT_SINCE = "2023-01-01"
 DEFAULT_DASHBOARD_MONTHS = 12
@@ -1118,6 +1170,7 @@ def fetch_ghl_channel_monthly(
     dict[pd.Timestamp, float],
     dict[pd.Timestamp, float],
     dict[pd.Timestamp, float],
+    pd.DataFrame,
 ]:
     """
     Channel-month GHL funnel metrics not available at campaign level in ads APIs.
@@ -1328,6 +1381,7 @@ def fetch_ghl_channel_monthly(
     combined_unallocated_by_month_level: dict[tuple[pd.Timestamp, str], float] = {}
     wom_by_month_level: dict[tuple[pd.Timestamp, str], float] = {}
     ghl_signups_by_month: dict[pd.Timestamp, float] = {}
+    ghl_signups_by_level_df = pd.DataFrame(columns=SIGNUP_BY_LEVEL_COLUMNS)
     if signup is not None:
         try:
             hear_id = resolve_hear_about_us_custom_field_id()
@@ -1407,6 +1461,9 @@ def fetch_ghl_channel_monthly(
                     )
         except Exception as exc:
             notes.append(f"GHL new-patient counts skipped: {exc}")
+        ghl_signups_by_level_df = build_ghl_signups_by_level_monthly(
+            signup, since, until
+        )
 
     records: list[dict[str, Any]] = []
     months = pd.period_range(
@@ -1587,6 +1644,7 @@ def fetch_ghl_channel_monthly(
         ghl_signups_by_month,
         ghl_dcs_by_month,
         ghl_leads_org_by_month,
+        ghl_signups_by_level_df,
     )
 
 
@@ -2428,6 +2486,7 @@ def load_live_campaign_data(
     dict[pd.Timestamp, float],
     dict[pd.Timestamp, float],
     dict[pd.Timestamp, float],
+    pd.DataFrame,
 ]:
     """
     Fetch and normalize paid-media rows for the Digital Channel Dashboard.
@@ -2438,7 +2497,7 @@ def load_live_campaign_data(
          combined conv_by_level, combined unallocated, sheet_signup_months,
          channel_month_leads, cpl_channel_month_leads, unallocated_leads_by_attr,
          sheet_signup_totals, ghl_signups_by_month, sheet_dcs_totals, ghl_dcs_by_month,
-         ghl_leads_org_by_month)
+         ghl_leads_org_by_month, ghl_signups_by_level_df)
     """
     today = date.today()
     until_eff = until or (today - timedelta(days=1)).isoformat()
@@ -2501,6 +2560,7 @@ def load_live_campaign_data(
             ghl_signups_by_month,
             ghl_dcs_by_month,
             ghl_leads_org_by_month,
+            ghl_signups_by_level_df,
         ) = ghl_future.result()
 
     daily = pd.concat([gads_daily, meta_daily], ignore_index=True)
@@ -2558,6 +2618,7 @@ def load_live_campaign_data(
             sheet_dcs_totals,
             ghl_dcs_by_month,
             ghl_leads_org_by_month,
+            ghl_signups_by_level_df,
         )
         ghl_monthly = ghl_monthly.copy()
         ghl_monthly.loc[ghl_monthly["month"].isin(sheet_months), "conversions"] = 0.0
@@ -2679,6 +2740,7 @@ def load_live_campaign_data(
         sheet_dcs_totals,
         ghl_dcs_by_month,
         ghl_leads_org_by_month,
+        ghl_signups_by_level_df,
     )
 
 
@@ -2707,7 +2769,7 @@ def load_dashboard_bundle(
     dict[pd.Timestamp, float],
     dict[pd.Timestamp, float],
     dict[pd.Timestamp, float],
-    dict[pd.Timestamp, float],
+    pd.DataFrame,
     pd.DataFrame,
     list[str],
 ]:
@@ -2734,6 +2796,7 @@ def load_dashboard_bundle(
         sheet_dcs_totals,
         ghl_dcs_by_month,
         ghl_leads_org_by_month,
+        ghl_signups_by_level_df,
     ) = load_live_campaign_data(campaign_since, until)
 
     funnel_df, funnel_notes = load_funnel_over_time(
@@ -2763,6 +2826,7 @@ def load_dashboard_bundle(
         sheet_dcs_totals,
         ghl_dcs_by_month,
         ghl_leads_org_by_month,
+        ghl_signups_by_level_df,
         funnel_df,
         funnel_notes,
     )
@@ -2790,6 +2854,7 @@ __all__ = [
     "TrendChartMonthlies",
     "build_cpl_trend_monthly",
     "build_dcs_trend_monthly",
+    "build_ghl_signups_by_level_monthly",
     "build_signups_trend_monthly",
     "build_spend_trend_monthly",
     "build_trend_chart_monthlies",

@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
+import time
+from datetime import date
 from pathlib import Path
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 TOKEN_PATH = Path.home() / ".config" / "mcp-google-sheets" / "token.json"
 OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
@@ -31,6 +35,11 @@ TRACKERS = {
 OUT_CSV = OUTPUT_DIR / "total_new_members_mom_2023_2024_2025.csv"
 OUT_PNG = OUTPUT_DIR / "total_new_members_mom_2023_2024_2025.png"
 OUT_HTML = OUTPUT_DIR / "total_new_members_report.html"
+
+_TRACKER_GRID_RANGE = "A1:BZ250"
+_TRACKER_CACHE_DIR = Path(__file__).resolve().parent / ".cache" / "tracker_sheets"
+_MEMORY_GRIDS: dict[tuple[str, str], list[list[str]]] = {}
+_SHEET_NAME_CACHE: dict[str, str] = {}
 
 
 def _credentials() -> Credentials:
@@ -106,58 +115,147 @@ def _find_spreadsheet(drive, name: str) -> dict:
     return files[0]
 
 
+def _execute_with_retry(execute_fn: Callable[[], Any], *, max_attempts: int = 6) -> Any:
+    """Retry Google API calls on HTTP 429 (Sheets read quota)."""
+    delay = 2.0
+    last_exc: HttpError | None = None
+    for attempt in range(max_attempts):
+        try:
+            return execute_fn()
+        except HttpError as exc:
+            last_exc = exc
+            if exc.resp.status == 429 and attempt < max_attempts - 1:
+                time.sleep(min(60.0, delay))
+                delay *= 2.0
+                continue
+            raise
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Sheets API retry exhausted")
+
+
+def _tracker_workbook_year(spreadsheet_id: str) -> int | None:
+    for meta in TRACKERS.values():
+        if meta.get("id") == spreadsheet_id:
+            return int(meta["year"])
+    return None
+
+
+def _tracker_disk_cache_path(spreadsheet_id: str, sheet_name: str) -> Path:
+    slug = "".join(ch if ch.isalnum() else "_" for ch in sheet_name)
+    return _TRACKER_CACHE_DIR / f"{spreadsheet_id}_{slug}.json"
+
+
+def _tracker_disk_cache_fresh(path: Path, *, spreadsheet_id: str) -> bool:
+    if not path.is_file():
+        return False
+    age_hours = (time.time() - path.stat().st_mtime) / 3600.0
+    workbook_year = _tracker_workbook_year(spreadsheet_id)
+    if workbook_year is not None and workbook_year < date.today().year:
+        return age_hours < 24 * 7
+    return age_hours < 6
+
+
+def clear_tracker_sheet_cache() -> None:
+    """Drop in-memory and on-disk Monthly Tracker grid caches."""
+    _MEMORY_GRIDS.clear()
+    _SHEET_NAME_CACHE.clear()
+    if _TRACKER_CACHE_DIR.is_dir():
+        for path in _TRACKER_CACHE_DIR.rglob("*"):
+            if path.is_file():
+                path.unlink(missing_ok=True)
+
+
+def _get_tracker_grid(
+    sheets, spreadsheet_id: str, sheet_name: str
+) -> list[list[str]]:
+    """One cached read per workbook instead of dozens of cell-range requests."""
+    key = (spreadsheet_id, sheet_name)
+    if key in _MEMORY_GRIDS:
+        return _MEMORY_GRIDS[key]
+
+    cache_path = _tracker_disk_cache_path(spreadsheet_id, sheet_name)
+    if _tracker_disk_cache_fresh(cache_path, spreadsheet_id=spreadsheet_id):
+        try:
+            grid = json.loads(cache_path.read_text(encoding="utf-8"))
+            _MEMORY_GRIDS[key] = grid
+            return grid
+        except Exception:
+            pass
+
+    result = _execute_with_retry(
+        lambda: sheets.spreadsheets()
+        .values()
+        .get(
+            spreadsheetId=spreadsheet_id,
+            range=f"'{sheet_name}'!{_TRACKER_GRID_RANGE}",
+        )
+        .execute()
+    )
+    grid = result.get("values", [])
+    _TRACKER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(grid), encoding="utf-8")
+    _MEMORY_GRIDS[key] = grid
+    return grid
+
+
+def _grid_row(grid: list[list[str]], row: int) -> list[str]:
+    if row < 1 or row > len(grid):
+        return []
+    return grid[row - 1]
+
+
+def _grid_col_c_label(grid: list[list[str]], row: int) -> str:
+    row_vals = _grid_row(grid, row)
+    if len(row_vals) < 3:
+        return ""
+    return str(row_vals[2]).strip()
+
+
 def _resolve_sheet_name(sheets, spreadsheet_id: str, preferred: str) -> str:
-    meta = sheets.spreadsheets().get(spreadsheetId=spreadsheet_id, fields="sheets.properties.title").execute()
+    if spreadsheet_id in _SHEET_NAME_CACHE:
+        return _SHEET_NAME_CACHE[spreadsheet_id]
+
+    meta = _execute_with_retry(
+        lambda: sheets.spreadsheets()
+        .get(spreadsheetId=spreadsheet_id, fields="sheets.properties.title")
+        .execute()
+    )
     titles = [s["properties"]["title"] for s in meta.get("sheets", [])]
     if preferred in titles:
-        return preferred
-    for title in titles:
-        if "monthly" in title.lower() and "tracker" in title.lower():
-            return title
-    raise SystemExit(f"No monthly tracker sheet found in {spreadsheet_id}. Tabs: {titles}")
+        resolved = preferred
+    else:
+        resolved = None
+        for title in titles:
+            if "monthly" in title.lower() and "tracker" in title.lower():
+                resolved = title
+                break
+        if resolved is None:
+            raise SystemExit(
+                f"No monthly tracker sheet found in {spreadsheet_id}. Tabs: {titles}"
+            )
+
+    _SHEET_NAME_CACHE[spreadsheet_id] = resolved
+    return resolved
 
 
 def _row_values(sheets, spreadsheet_id: str, sheet_name: str, row: int) -> list[str]:
-    result = (
-        sheets.spreadsheets()
-        .values()
-        .get(
-            spreadsheetId=spreadsheet_id,
-            range=f"'{sheet_name}'!A{row}:BZ{row}",
-        )
-        .execute()
-    )
-    rows = result.get("values", [])
-    return rows[0] if rows else []
+    grid = _get_tracker_grid(sheets, spreadsheet_id, sheet_name)
+    return _grid_row(grid, row)
 
 
 def _header_row(sheets, spreadsheet_id: str, sheet_name: str) -> list[str]:
-    result = (
-        sheets.spreadsheets()
-        .values()
-        .get(
-            spreadsheetId=spreadsheet_id,
-            range=f"'{sheet_name}'!A{MONTH_HEADER_ROW}:BZ{MONTH_HEADER_ROW}",
-        )
-        .execute()
-    )
-    rows = result.get("values", [])
-    return rows[0] if rows else []
+    grid = _get_tracker_grid(sheets, spreadsheet_id, sheet_name)
+    return _grid_row(grid, MONTH_HEADER_ROW)
 
 
 def _find_total_new_members_row(sheets, spreadsheet_id: str, sheet_name: str) -> int:
-    col_c = (
-        sheets.spreadsheets()
-        .values()
-        .get(spreadsheetId=spreadsheet_id, range=f"'{sheet_name}'!C1:C250")
-        .execute()
-        .get("values", [])
-    )
+    grid = _get_tracker_grid(sheets, spreadsheet_id, sheet_name)
     total_row: int | None = None
     grand_total_row: int | None = None
     candidates: list[tuple[int, str]] = []
-    for i, row in enumerate(col_c, start=1):
-        label = str(row[0]).strip() if row else ""
+    for i in range(1, min(len(grid), 250) + 1):
+        label = _grid_col_c_label(grid, i)
         if not label:
             continue
         norm = label.lower()
@@ -179,16 +277,9 @@ def _find_total_new_members_row(sheets, spreadsheet_id: str, sheet_name: str) ->
 
 
 def _find_calls_completed_row(sheets, spreadsheet_id: str, sheet_name: str) -> int:
-    col_c = (
-        sheets.spreadsheets()
-        .values()
-        .get(spreadsheetId=spreadsheet_id, range=f"'{sheet_name}'!C1:C250")
-        .execute()
-        .get("values", [])
-    )
-    for i, row in enumerate(col_c, start=1):
-        label = str(row[0]).strip() if row else ""
-        if label == "Calls completed":
+    grid = _get_tracker_grid(sheets, spreadsheet_id, sheet_name)
+    for i in range(1, min(len(grid), 250) + 1):
+        if _grid_col_c_label(grid, i) == "Calls completed":
             return i
     raise SystemExit(f"Could not find Calls completed row in {spreadsheet_id}")
 

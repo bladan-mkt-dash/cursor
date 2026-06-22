@@ -80,9 +80,17 @@ def read_json_range_cache(
 
 
 def clear_dashboard_disk_cache() -> None:
-    """Remove cached Google Ads, Meta, and GHL bulk fetch files."""
+    """Remove cached Google Ads, Meta, GHL bulk fetch, and tracker sheet files."""
     if not _CACHE_DIR.is_dir():
-        return
-    for path in _CACHE_DIR.rglob("*"):
-        if path.is_file():
-            path.unlink(missing_ok=True)
+        pass
+    else:
+        for path in _CACHE_DIR.rglob("*"):
+            if path.is_file():
+                path.unlink(missing_ok=True)
+
+    try:
+        from total_new_members_yoy_chart import clear_tracker_sheet_cache
+
+        clear_tracker_sheet_cache()
+    except Exception:
+        pass

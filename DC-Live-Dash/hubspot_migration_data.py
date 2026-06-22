@@ -33,14 +33,15 @@ def _load_tab(tab: str) -> pd.DataFrame:
     if tab in _tab_cache:
         return _tab_cache[tab]
 
+    from total_new_members_yoy_chart import _credentials, _execute_with_retry
+
     sheets = build("sheets", "v4", credentials=_credentials())
-    rows = (
-        sheets.spreadsheets()
+    rows = _execute_with_retry(
+        lambda: sheets.spreadsheets()
         .values()
         .get(spreadsheetId=HUBSPOT_ALL_CONTACTS_ID, range=f"'{tab}'!A1:ZZ")
         .execute()
-        .get("values", [])
-    )
+    ).get("values", [])
     if not rows:
         df = pd.DataFrame()
     else:

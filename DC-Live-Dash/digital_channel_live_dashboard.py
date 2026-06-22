@@ -14,6 +14,7 @@ import importlib
 import sys
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import plotly.express as px
@@ -32,7 +33,7 @@ from ghl_client import discovery_call_calendar_ids
 
 import digital_channel_live_data as _live_data_mod
 
-_EXPECTED_LIVE_DATA_REVISION = "2026-06-22-perf-cache-unified-v1"
+_EXPECTED_LIVE_DATA_REVISION = "2026-06-22-sheets-tracker-cache-v1"
 if (
     getattr(_live_data_mod, "LIVE_DATA_REVISION", None)
     != _EXPECTED_LIVE_DATA_REVISION
@@ -40,6 +41,7 @@ if (
     _live_data_mod = importlib.reload(_live_data_mod)
 
 import funnel_over_time_data as _funnel_mod
+import signup_comparison_data as _signup_cmp_mod
 
 _EXPECTED_FUNNEL_REVISION = "2026-06-22-perf-shared-ghl-v1"
 if (
@@ -48,8 +50,19 @@ if (
 ):
     _funnel_mod = importlib.reload(_funnel_mod)
 
+_EXPECTED_SIGNUP_CMP_REVISION = "2026-06-22-ghl-signups-by-tier-v1"
+if (
+    getattr(_signup_cmp_mod, "SIGNUP_COMPARISON_REVISION", None)
+    != _EXPECTED_SIGNUP_CMP_REVISION
+):
+    _signup_cmp_mod = importlib.reload(_signup_cmp_mod)
+
 FUNNEL_OVER_TIME_REVISION = _funnel_mod.FUNNEL_OVER_TIME_REVISION
 GHL_FUNNEL_SINCE = _funnel_mod.GHL_FUNNEL_SINCE
+SIGNUP_COMPARISON_REVISION = _signup_cmp_mod.SIGNUP_COMPARISON_REVISION
+aggregate_signups_qoq = _signup_cmp_mod.aggregate_signups_qoq
+aggregate_signups_yoy = _signup_cmp_mod.aggregate_signups_yoy
+load_signups_by_level_monthly = _signup_cmp_mod.load_signups_by_level_monthly
 from digital_channel_live_data import (
     DEFAULT_DASHBOARD_MONTHS,
     GHL_ATTRIBUTION_HEAR_ABOUT,
@@ -72,7 +85,9 @@ from digital_channel_live_data import (
     scorecard_metrics,
 )
 
-DASHBOARD_BUNDLE_REVISION = f"{LIVE_DATA_REVISION}|{FUNNEL_OVER_TIME_REVISION}"
+DASHBOARD_BUNDLE_REVISION = (
+    f"{LIVE_DATA_REVISION}|{FUNNEL_OVER_TIME_REVISION}|{SIGNUP_COMPARISON_REVISION}"
+)
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
@@ -81,7 +96,16 @@ COLORS = {
     "accent_dark": "#264540",
     "2023": "#4C78A8",
     "2024": "#F58518",
+    "2025": "#54A24B",
+    "2026": "#B279A2",
     "muted": "#6B7C93",
+}
+
+YEAR_BAR_COLORS = {
+    "2023": COLORS["2023"],
+    "2024": COLORS["2024"],
+    "2025": COLORS["2025"],
+    "2026": COLORS["2026"],
 }
 
 MONTH_ORDER = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -90,6 +114,163 @@ CHANNEL_GOOGLE = "Google Ads"
 CHANNEL_META = "FB/IG"
 
 _QUARTERLY_RANGE_MONTHS = 9
+_TITLE_LEGEND_GAP_PX = 20
+_TITLE_BLOCK_PX = 22
+_LEGEND_BLOCK_PX = 22
+_BASE_CHART_PADDING_PX = 12
+_TIER_TITLE_HEIGHT_PX = 18
+_TIER_LEGEND_HEIGHT_PX = 20
+_TIER_SECTION_GAP_PX = 20
+_TIER_CHART_LEFT = 48
+_TIER_CHART_BOTTOM = 52
+_TIER_CHART_RIGHT = 20
+
+
+def _signups_tier_top_margin_px() -> int:
+    """Title + 20px + legend + 20px above the plot."""
+    return (
+        _TIER_TITLE_HEIGHT_PX
+        + _TIER_SECTION_GAP_PX
+        + _TIER_LEGEND_HEIGHT_PX
+        + _TIER_SECTION_GAP_PX
+    )
+
+
+def _signups_tier_plot_height_px(tier_height: int) -> float:
+    return float(
+        tier_height - _signups_tier_top_margin_px() - _TIER_CHART_BOTTOM
+    )
+
+
+def _signups_tier_paper_above_plot(tier_height: int, px_above_plot_top: float) -> float:
+    """Paper y at ``px_above_plot_top`` pixels above the inner plot top (y=1)."""
+    plot_h = _signups_tier_plot_height_px(tier_height)
+    if plot_h <= 0:
+        return 1.0
+    return 1.0 + px_above_plot_top / plot_h
+
+
+def _signups_tier_chart_height(quarter_count: int) -> int:
+    """Shared figure height for YoY and QoQ signup tier charts."""
+    return max(360, 120 * max(quarter_count, 1))
+
+
+def _signups_tier_pair_margin() -> dict[str, int]:
+    return dict(
+        l=_TIER_CHART_LEFT,
+        r=_TIER_CHART_RIGHT,
+        t=_signups_tier_top_margin_px(),
+        b=_TIER_CHART_BOTTOM,
+    )
+
+
+def _strip_plotly_auto_titles(fig: go.Figure) -> None:
+    """Remove empty layout/legend titles px.bar leaves behind (renders as 'undefined')."""
+    fig.layout.pop("title", None)
+    legend = fig.layout.legend
+    if legend is not None and legend.title is not None:
+        legend.title = None
+
+
+def _apply_signups_tier_pair_layout(
+    fig: go.Figure,
+    *,
+    tier_height: int,
+    title_text: str,
+    quarter_labels: list[str] | None = None,
+) -> None:
+    """
+    Precise vertical stack: title → 20px → legend → 20px → plot.
+
+    Title and legend sit in the top margin using paper y > 1; the plot begins
+    exactly 20px below the reserved legend band.
+    """
+    gap = _TIER_SECTION_GAP_PX
+    legend_h = _TIER_LEGEND_HEIGHT_PX
+    title_h = _TIER_TITLE_HEIGHT_PX
+
+    legend_bottom_px = gap
+    title_top_px = gap + legend_h + gap + title_h
+
+    fig.update_layout(
+        height=tier_height,
+        margin=_signups_tier_pair_margin(),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Roboto, sans-serif", color=COLORS["accent_dark"]),
+        legend=dict(
+            orientation="h",
+            traceorder="normal",
+            x=0.5,
+            xanchor="center",
+            yanchor="bottom",
+            y=_signups_tier_paper_above_plot(tier_height, legend_bottom_px),
+            bgcolor="rgba(0,0,0,0)",
+            title_text="",
+        ),
+    )
+    _strip_plotly_auto_titles(fig)
+    fig.add_annotation(
+        text=title_text,
+        xref="paper",
+        yref="paper",
+        x=0.5,
+        xanchor="center",
+        yanchor="top",
+        y=_signups_tier_paper_above_plot(tier_height, title_top_px),
+        showarrow=False,
+        font=dict(size=14, color=COLORS["accent_dark"], weight=700),
+    )
+    fig.update_xaxes(tickangle=-45, side="bottom")
+    fig.update_yaxes(rangemode="tozero")
+
+    if quarter_labels:
+        for annotation in fig.layout.annotations or []:
+            label = (annotation.text or "").strip()
+            if label in quarter_labels:
+                annotation.update(
+                    y=0.99,
+                    yref="paper",
+                    yanchor="top",
+                    showarrow=False,
+                    font=dict(size=14, color=COLORS["accent_dark"], weight=700),
+                )
+
+
+def _chart_margin(
+    *,
+    has_legend: bool = False,
+    bottom: int = 20,
+    left: int = 20,
+    right: int = 20,
+    extra_top: int = 0,
+    legend_plot_gap_px: int = 0,
+) -> dict[str, int]:
+    """Top margin sized for title, optional legend, and gap between title and legend."""
+    t = _BASE_CHART_PADDING_PX + _TITLE_BLOCK_PX + extra_top
+    if has_legend:
+        t += _TITLE_LEGEND_GAP_PX + _LEGEND_BLOCK_PX + legend_plot_gap_px
+    return dict(l=left, r=right, t=t, b=bottom)
+
+
+def _chart_legend_top(
+    *,
+    chart_height: int = 360,
+    plot_gap_px: int = 0,
+    **overrides: Any,
+) -> dict[str, Any]:
+    """Horizontal legend above the plot; ``plot_gap_px`` adds space below the legend."""
+    y = 1.0 + (plot_gap_px / chart_height if plot_gap_px else 0.0)
+    legend = dict(
+        orientation="h",
+        yanchor="bottom",
+        y=y,
+        x=0,
+        xanchor="left",
+        title_text="",
+    )
+    legend.update(overrides)
+    return legend
 
 
 def _use_quarterly_grouping(since: date, until: date) -> bool:
@@ -194,7 +375,7 @@ def _spend_over_time_chart(spend_period_df: pd.DataFrame) -> go.Figure:
     fig.update_layout(
         height=320,
         title="Spend Over Time",
-        margin=dict(l=20, r=20, t=56, b=20),
+        margin=_chart_margin(has_legend=False),
         showlegend=False,
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
@@ -250,16 +431,9 @@ def _line_chart(
     bottom_margin = 70 if show_legend else 20
     fig.update_layout(
         height=height,
-        margin=dict(l=20, r=20, t=56, b=bottom_margin),
+        margin=_chart_margin(has_legend=show_legend, bottom=bottom_margin),
         showlegend=show_legend,
-        legend=dict(
-            orientation="h",
-            yanchor="top",
-            y=-0.28,
-            x=0.5,
-            xanchor="center",
-            title_text="",
-        ),
+        legend=_chart_legend_top(x=0.5, xanchor="center") if show_legend else {},
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
         font=dict(family="Roboto, sans-serif", color=COLORS["accent_dark"]),
@@ -348,17 +522,15 @@ def _funnel_over_time_chart(funnel_df: pd.DataFrame) -> go.Figure | None:
     fig.update_layout(
         height=440,
         title="Leads, Discovery Calls & Signups Over Time",
-        margin=dict(l=48, r=24, t=56, b=80 if n_months > 12 else 56),
+        margin=_chart_margin(
+            has_legend=True,
+            left=48,
+            right=24,
+            bottom=80 if n_months > 12 else 56,
+        ),
         hovermode="x unified",
         showlegend=True,
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            x=0,
-            xanchor="left",
-            title_text="",
-        ),
+        legend=_chart_legend_top(),
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
         font=dict(family="Roboto, sans-serif", color=COLORS["accent_dark"], size=13),
@@ -378,6 +550,134 @@ def _funnel_over_time_chart(funnel_df: pd.DataFrame) -> go.Figure | None:
         ),
     )
     return fig
+
+
+def _year_color_map(year_labels: list[str]) -> dict[str, str]:
+    colors: dict[str, str] = {}
+    for label in year_labels:
+        base = str(label).replace(" YTD", "")
+        colors[label] = YEAR_BAR_COLORS.get(base, COLORS["muted"])
+    return colors
+
+
+def _signups_yoy_bar_chart(
+    yoy_df: pd.DataFrame,
+    *,
+    levels: tuple[str, ...],
+    chart_height: int | None = None,
+) -> go.Figure | None:
+    if yoy_df.empty:
+        return None
+
+    year_order = list(dict.fromkeys(yoy_df["year_label"].tolist()))
+    level_order = [level for level in levels if level in set(yoy_df["membership_level"])]
+    if not level_order:
+        return None
+
+    fig = px.bar(
+        yoy_df,
+        x="membership_level",
+        y="signups",
+        color="year_label",
+        barmode="group",
+        labels={
+            "membership_level": "Membership level",
+            "signups": "Signups",
+            "year_label": "Year",
+        },
+        category_orders={
+            "membership_level": level_order,
+            "year_label": year_order,
+        },
+        color_discrete_map=_year_color_map(year_order),
+    )
+    tier_height = chart_height or 360
+    _apply_signups_tier_pair_layout(
+        fig,
+        tier_height=tier_height,
+        title_text="Signups by tier — year over year",
+    )
+    fig.update_layout(
+        xaxis_title="",
+        yaxis_title="Signups",
+        bargap=0.15,
+    )
+    fig.update_traces(hovertemplate="%{x}<br>%{fullData.name}: %{y:,0f}<extra></extra>")
+    return fig
+
+
+def _signups_qoq_bar_chart(
+    qoq_df: pd.DataFrame,
+    *,
+    levels: tuple[str, ...],
+    chart_height: int | None = None,
+) -> go.Figure | None:
+    if qoq_df.empty:
+        return None
+
+    quarter_order = sorted(qoq_df["quarter"].unique())
+    quarter_labels = [f"Q{int(q)}" for q in quarter_order]
+    year_order = list(dict.fromkeys(qoq_df["year_label"].tolist()))
+    level_order = [level for level in levels if level in set(qoq_df["membership_level"])]
+    if not level_order:
+        return None
+
+    plot_df = qoq_df.copy()
+    plot_df["quarter_label"] = pd.Categorical(
+        plot_df["quarter_label"],
+        categories=quarter_labels,
+        ordered=True,
+    )
+
+    fig = px.bar(
+        plot_df,
+        x="membership_level",
+        y="signups",
+        color="year_label",
+        facet_col="quarter_label",
+        barmode="group",
+        labels={
+            "membership_level": "Membership level",
+            "signups": "Signups",
+            "year_label": "Year",
+            "quarter_label": "Quarter",
+        },
+        category_orders={
+            "membership_level": level_order,
+            "year_label": year_order,
+            "quarter_label": quarter_labels,
+        },
+        color_discrete_map=_year_color_map(year_order),
+    )
+    tier_height = chart_height or _signups_tier_chart_height(len(quarter_labels))
+    fig.for_each_annotation(lambda a: a.update(text=a.text.split("=")[-1].strip()))
+    _apply_signups_tier_pair_layout(
+        fig,
+        tier_height=tier_height,
+        title_text="Signups by tier — same quarter across years",
+        quarter_labels=quarter_labels,
+    )
+    fig.update_layout(bargap=0.12)
+    for col_idx in range(1, len(quarter_labels) + 1):
+        fig.update_yaxes(title_text="Signups" if col_idx == 1 else "", col=col_idx)
+    fig.update_xaxes(title_text="")
+    fig.update_traces(hovertemplate="%{x}<br>%{fullData.name}: %{y:,0f}<extra></extra>")
+    return fig
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _signups_by_level_monthly(
+    since: str,
+    until: str,
+    ghl_signups_by_level_df: pd.DataFrame,
+    _revision: str = SIGNUP_COMPARISON_REVISION,
+) -> tuple[pd.DataFrame, tuple[str, ...]]:
+    df, notes = load_signups_by_level_monthly(
+        since,
+        until,
+        ghl_signups_by_level_df=ghl_signups_by_level_df,
+    )
+    return df, tuple(notes)
 
 
 def _cpl_over_time_chart(monthly: pd.DataFrame) -> go.Figure | None:
@@ -403,7 +703,7 @@ def _cpl_over_time_chart(monthly: pd.DataFrame) -> go.Figure | None:
     )
     fig.update_layout(
         height=320,
-        margin=dict(l=20, r=20, t=50, b=20),
+        margin=_chart_margin(has_legend=False),
         showlegend=False,
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
@@ -445,15 +745,8 @@ def _spend_click_correlation(df: pd.DataFrame) -> go.Figure | None:
     )
     fig.update_layout(
         height=420,
-        margin=dict(l=20, r=20, t=56, b=120),
-        legend=dict(
-            orientation="h",
-            yanchor="top",
-            y=-0.22,
-            x=0.5,
-            xanchor="center",
-            title_text="",
-        ),
+        margin=_chart_margin(has_legend=True, bottom=100),
+        legend=_chart_legend_top(x=0.5, xanchor="center"),
         xaxis_tickangle=-35,
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
@@ -481,7 +774,7 @@ def _creative_allocation_pie(df: pd.DataFrame) -> go.Figure | None:
     )
     fig.update_layout(
         height=420,
-        margin=dict(l=20, r=20, t=60, b=20),
+        margin=_chart_margin(has_legend=False, extra_top=8),
         font=dict(family="Roboto, sans-serif", color=COLORS["accent_dark"]),
     )
     return fig
@@ -641,6 +934,7 @@ def _load_dashboard(
     dict[pd.Timestamp, float],
     dict[pd.Timestamp, float],
     pd.DataFrame,
+    pd.DataFrame,
     tuple[str, ...],
 ]:
     (
@@ -663,6 +957,7 @@ def _load_dashboard(
         sheet_dcs_totals,
         ghl_dcs_by_month,
         _ghl_leads_org_by_month,
+        ghl_signups_by_level_df,
         funnel_df,
         funnel_notes,
     ) = load_dashboard_bundle(
@@ -693,6 +988,7 @@ def _load_dashboard(
         ghl_signups_by_month,
         sheet_dcs_totals,
         ghl_dcs_by_month,
+        ghl_signups_by_level_df,
         funnel_df,
         tuple(funnel_notes),
     )
@@ -751,6 +1047,7 @@ def main() -> None:
         if st.button("Refresh data", help="Reload ads + GHL. Keeps cached GHL daily lead files."):
             clear_dashboard_disk_cache()
             _load_dashboard.clear()
+            _signups_by_level_monthly.clear()
             st.rerun()
 
         if st.button(
@@ -760,6 +1057,7 @@ def main() -> None:
             clear_ghl_leads_day_cache()
             clear_dashboard_disk_cache()
             _load_dashboard.clear()
+            _signups_by_level_monthly.clear()
             st.rerun()
 
     load_label = (
@@ -768,7 +1066,7 @@ def main() -> None:
     )
     with st.spinner(load_label):
         try:
-            raw_df, notes, lead_summary, conv_by_level_df, unallocated_conv_df, wom_conv_df, tracker_conv_by_level_df, tracker_unallocated_conv_df, combined_conv_by_level_df, combined_unallocated_conv_df, sheet_months, channel_month_leads, cpl_channel_month_leads, unallocated_leads_by_attr, sheet_signup_totals, ghl_signups_by_month, sheet_dcs_totals, ghl_dcs_by_month, funnel_df, funnel_notes = _load_dashboard(
+            raw_df, notes, lead_summary, conv_by_level_df, unallocated_conv_df, wom_conv_df, tracker_conv_by_level_df, tracker_unallocated_conv_df, combined_conv_by_level_df, combined_unallocated_conv_df, sheet_months, channel_month_leads, cpl_channel_month_leads, unallocated_leads_by_attr, sheet_signup_totals, ghl_signups_by_month, sheet_dcs_totals, ghl_dcs_by_month, ghl_signups_by_level_df, funnel_df, funnel_notes = _load_dashboard(
                 since.isoformat(),
                 until.isoformat(),
                 since.isoformat(),
@@ -1107,6 +1405,63 @@ def main() -> None:
         st.caption(f"Loader revision: `{FUNNEL_OVER_TIME_REVISION}`")
         for note in funnel_notes:
             st.markdown(f"- {note}")
+
+    st.subheader("Signups by membership level")
+    signup_levels = tuple(selected_membership_levels)
+    signups_by_level_df, signup_cmp_notes = _signups_by_level_monthly(
+        since.isoformat(),
+        until.isoformat(),
+        ghl_signups_by_level_df,
+    )
+    yoy_df = aggregate_signups_yoy(
+        signups_by_level_df,
+        since=since,
+        until=until,
+        levels=signup_levels,
+    )
+    qoq_df = aggregate_signups_qoq(
+        signups_by_level_df,
+        since=since,
+        until=until,
+        levels=signup_levels,
+    )
+    yoy_col, qoq_col = st.columns(2)
+    tier_quarter_count = (
+        len(set(qoq_df["quarter"].unique())) if not qoq_df.empty else 1
+    )
+    tier_chart_height = _signups_tier_chart_height(tier_quarter_count)
+    with yoy_col:
+        yoy_chart = _signups_yoy_bar_chart(
+            yoy_df,
+            levels=signup_levels,
+            chart_height=tier_chart_height,
+        )
+        if yoy_chart:
+            st.plotly_chart(yoy_chart, use_container_width=True)
+        else:
+            st.info("No signup tier data for YoY comparison in this range.")
+    with qoq_col:
+        qoq_chart = _signups_qoq_bar_chart(
+            qoq_df,
+            levels=signup_levels,
+            chart_height=tier_chart_height,
+        )
+        if qoq_chart:
+            st.plotly_chart(qoq_chart, use_container_width=True)
+        else:
+            st.info("No signup tier data for quarter comparison in this range.")
+    st.caption(
+        "Org-wide committed signups by **Membership Level**. "
+        f"Through {pd.Timestamp(SHEETS_SIGNUPS_UNTIL).strftime('%b %Y')}: **Digital Cross-Channel "
+        "Tracker** Both Locations tier rows. "
+        f"From {pd.Timestamp(GHL_SIGNUPS_SINCE).strftime('%b %Y')}: **GoHighLevel** (Sign Up Date, "
+        "Committed? = Yes). Partial current year shown as **YTD**. Respects the membership level "
+        "filter above; not affected by channel, campaign, or Word of Mouth attribution toggles."
+    )
+    if signup_cmp_notes:
+        with st.expander("Signups comparison — data sources"):
+            for note in signup_cmp_notes:
+                st.markdown(f"- {note}")
 
     st.markdown("---")
     st.subheader("Campaign breakdown")
