@@ -33,7 +33,7 @@ from ghl_client import discovery_call_calendar_ids
 
 import digital_channel_live_data as _live_data_mod
 
-_EXPECTED_LIVE_DATA_REVISION = "2026-06-22-sheets-tracker-cache-v1"
+_EXPECTED_LIVE_DATA_REVISION = "2026-06-23-meta-tracker-ghl-backfill-v1"
 if (
     getattr(_live_data_mod, "LIVE_DATA_REVISION", None)
     != _EXPECTED_LIVE_DATA_REVISION
@@ -50,7 +50,7 @@ if (
 ):
     _funnel_mod = importlib.reload(_funnel_mod)
 
-_EXPECTED_SIGNUP_CMP_REVISION = "2026-06-22-ghl-signups-by-tier-v1"
+_EXPECTED_SIGNUP_CMP_REVISION = "2026-06-23-meta-tracker-ghl-backfill-v1"
 if (
     getattr(_signup_cmp_mod, "SIGNUP_COMPARISON_REVISION", None)
     != _EXPECTED_SIGNUP_CMP_REVISION
@@ -62,7 +62,11 @@ GHL_FUNNEL_SINCE = _funnel_mod.GHL_FUNNEL_SINCE
 SIGNUP_COMPARISON_REVISION = _signup_cmp_mod.SIGNUP_COMPARISON_REVISION
 aggregate_signups_qoq = _signup_cmp_mod.aggregate_signups_qoq
 aggregate_signups_yoy = _signup_cmp_mod.aggregate_signups_yoy
-load_signups_by_level_monthly = _signup_cmp_mod.load_signups_by_level_monthly
+load_tier_signups_by_level_monthly = _signup_cmp_mod.load_tier_signups_by_level_monthly
+qoq_quarter_numbers = _signup_cmp_mod.qoq_quarter_numbers
+tier_quarter_filter_options = _signup_cmp_mod.tier_quarter_filter_options
+tier_signup_until = _signup_cmp_mod.tier_signup_until
+tier_year_filter_options = _signup_cmp_mod.tier_year_filter_options
 from digital_channel_live_data import (
     DEFAULT_DASHBOARD_MONTHS,
     GHL_ATTRIBUTION_HEAR_ABOUT,
@@ -555,7 +559,7 @@ def _funnel_over_time_chart(funnel_df: pd.DataFrame) -> go.Figure | None:
 def _year_color_map(year_labels: list[str]) -> dict[str, str]:
     colors: dict[str, str] = {}
     for label in year_labels:
-        base = str(label).replace(" YTD", "")
+        base = str(label).replace(" YTD", "").replace(" QTD", "")
         colors[label] = YEAR_BAR_COLORS.get(base, COLORS["muted"])
     return colors
 
@@ -565,6 +569,7 @@ def _signups_yoy_bar_chart(
     *,
     levels: tuple[str, ...],
     chart_height: int | None = None,
+    title_text: str = "Signups by tier — year over year",
 ) -> go.Figure | None:
     if yoy_df.empty:
         return None
@@ -595,7 +600,7 @@ def _signups_yoy_bar_chart(
     _apply_signups_tier_pair_layout(
         fig,
         tier_height=tier_height,
-        title_text="Signups by tier — year over year",
+        title_text=title_text,
     )
     fig.update_layout(
         xaxis_title="",
@@ -606,23 +611,91 @@ def _signups_yoy_bar_chart(
     return fig
 
 
+def _yoy_chart_title(yoy_df: pd.DataFrame) -> str:
+    if yoy_df.empty:
+        return "Signups by tier — year over year"
+    years = sorted({int(y) for y in yoy_df["year"].unique()})
+    if len(years) == 1:
+        return f"Signups by tier — {years[0]}"
+    if len(years) <= 4:
+        return f"Signups by tier — {' · '.join(str(y) for y in years)}"
+    return "Signups by tier — year over year"
+
+
+def _qoq_chart_title(qoq_df: pd.DataFrame) -> str:
+    if qoq_df.empty:
+        return "Signups by tier — same quarter across years"
+    quarters = sorted({int(q) for q in qoq_df["quarter"].unique()})
+    labels = [f"Q{q}" for q in quarters]
+    if len(quarters) == 1:
+        return f"Signups by tier — {labels[0]} across years"
+    if len(quarters) <= 4:
+        return f"Signups by tier — {' · '.join(labels)} across years"
+    return "Signups by tier — same quarter across years"
+
+
+def _qoq_plot_years(qoq_df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Normalize QoQ year grouping so partial quarters share a bar group with full years."""
+    plot_df = qoq_df.copy()
+    plot_df["year_color"] = plot_df["year"].astype(int).astype(str)
+    year_order = [str(y) for y in sorted({int(y) for y in plot_df["year"].unique()})]
+    return plot_df, year_order
+
+
 def _signups_qoq_bar_chart(
     qoq_df: pd.DataFrame,
     *,
     levels: tuple[str, ...],
     chart_height: int | None = None,
+    title_text: str | None = None,
 ) -> go.Figure | None:
     if qoq_df.empty:
         return None
 
-    quarter_order = sorted(qoq_df["quarter"].unique())
-    quarter_labels = [f"Q{int(q)}" for q in quarter_order]
-    year_order = list(dict.fromkeys(qoq_df["year_label"].tolist()))
     level_order = [level for level in levels if level in set(qoq_df["membership_level"])]
     if not level_order:
         return None
 
-    plot_df = qoq_df.copy()
+    quarter_order = sorted({int(q) for q in qoq_df["quarter"].unique()})
+    plot_df, year_order = _qoq_plot_years(qoq_df)
+    chart_title = title_text or _qoq_chart_title(plot_df)
+
+    if len(quarter_order) == 1:
+        fig = px.bar(
+            plot_df,
+            x="membership_level",
+            y="signups",
+            color="year_color",
+            barmode="group",
+            custom_data=["year_label"],
+            labels={
+                "membership_level": "Membership level",
+                "signups": "Signups",
+                "year_color": "Year",
+            },
+            category_orders={
+                "membership_level": level_order,
+                "year_color": year_order,
+            },
+            color_discrete_map=_year_color_map(year_order),
+        )
+        tier_height = chart_height or 360
+        _apply_signups_tier_pair_layout(
+            fig,
+            tier_height=tier_height,
+            title_text=chart_title,
+        )
+        fig.update_layout(
+            xaxis_title="",
+            yaxis_title="Signups",
+            bargap=0.15,
+        )
+        fig.update_traces(
+            hovertemplate="%{x}<br>%{customdata[0]}: %{y:,0f}<extra></extra>"
+        )
+        return fig
+
+    quarter_labels = [f"Q{q}" for q in quarter_order]
     plot_df["quarter_label"] = pd.Categorical(
         plot_df["quarter_label"],
         categories=quarter_labels,
@@ -633,18 +706,19 @@ def _signups_qoq_bar_chart(
         plot_df,
         x="membership_level",
         y="signups",
-        color="year_label",
+        color="year_color",
         facet_col="quarter_label",
         barmode="group",
+        custom_data=["year_label"],
         labels={
             "membership_level": "Membership level",
             "signups": "Signups",
-            "year_label": "Year",
+            "year_color": "Year",
             "quarter_label": "Quarter",
         },
         category_orders={
             "membership_level": level_order,
-            "year_label": year_order,
+            "year_color": year_order,
             "quarter_label": quarter_labels,
         },
         color_discrete_map=_year_color_map(year_order),
@@ -654,29 +728,25 @@ def _signups_qoq_bar_chart(
     _apply_signups_tier_pair_layout(
         fig,
         tier_height=tier_height,
-        title_text="Signups by tier — same quarter across years",
+        title_text=chart_title,
         quarter_labels=quarter_labels,
     )
     fig.update_layout(bargap=0.12)
     for col_idx in range(1, len(quarter_labels) + 1):
         fig.update_yaxes(title_text="Signups" if col_idx == 1 else "", col=col_idx)
     fig.update_xaxes(title_text="")
-    fig.update_traces(hovertemplate="%{x}<br>%{fullData.name}: %{y:,0f}<extra></extra>")
+    fig.update_traces(
+        hovertemplate="%{x}<br>%{customdata[0]}: %{y:,0f}<extra></extra>"
+    )
     return fig
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def _signups_by_level_monthly(
-    since: str,
-    until: str,
-    ghl_signups_by_level_df: pd.DataFrame,
+def _tier_signups_by_level_monthly(
     _revision: str = SIGNUP_COMPARISON_REVISION,
+    _data_until: str = "",
 ) -> tuple[pd.DataFrame, tuple[str, ...]]:
-    df, notes = load_signups_by_level_monthly(
-        since,
-        until,
-        ghl_signups_by_level_df=ghl_signups_by_level_df,
-    )
+    df, notes = load_tier_signups_by_level_monthly()
     return df, tuple(notes)
 
 
@@ -1009,11 +1079,11 @@ def main() -> None:
         "later months use GHL new contacts (attributed + unallocated spread by spend, "
         "same approach as DCs). "
         "**First load** for a wide date range can take a minute while GHL lead data "
-        "is pulled day-by-day (Jul 2025 onward only); **repeat loads use disk cache** "
+        "is pulled day-by-day (Jun 2025 onward only); **repeat loads use disk cache** "
         "and are much faster. Default view is the last "
-        f"**{DEFAULT_DASHBOARD_MONTHS} months** — widen dates in the sidebar for full history. "
-        "**Signups** through Aug 2025: **GRAND TOTAL New Members** from Digital Cross-Channel "
-        "Tracker sheets; from Sep 2025: GHL **Committed?** = Yes + **Sign Up Date**, with "
+        f"**{DEFAULT_DASHBOARD_MONTHS} months** — widen the date range below for full history. "
+        "**Signups** through May 2025: **GRAND TOTAL New Members** from Digital Cross-Channel "
+        "Tracker sheets; from Jun 2025: GHL **Committed?** = Yes + **Sign Up Date**, with "
         "**Membership Level** slicer (sheet months ignore membership filter)."
     )
 
@@ -1021,44 +1091,28 @@ def main() -> None:
     default_until = today - timedelta(days=1)
     default_since = default_dashboard_since(until=default_until)
 
-    with st.sidebar:
-        st.header("Filters")
+    st.markdown("**Date range**")
+    date_start_col, date_end_col = st.columns(2)
+    with date_start_col:
         since = st.date_input(
             "Start date",
             value=default_since,
             max_value=default_until,
         )
+    with date_end_col:
         until = st.date_input(
             "End date",
             value=default_until,
             max_value=default_until,
         )
-        if since > until:
-            st.error("Start date must be on or before end date.")
-            st.stop()
-
-        st.markdown("**Refresh**")
-        if st.button(
-            "Design only",
-            help="Reload layout and styles only. Uses cached data — no Google Ads, Meta, or GHL calls.",
-        ):
-            st.rerun()
-
-        if st.button("Refresh data", help="Reload ads + GHL. Keeps cached GHL daily lead files."):
-            clear_dashboard_disk_cache()
-            _load_dashboard.clear()
-            _signups_by_level_monthly.clear()
-            st.rerun()
-
-        if st.button(
-            "Hard refresh GHL leads",
-            help="Clear cached GHL daily lead files and reload (use if lead counts look wrong).",
-        ):
-            clear_ghl_leads_day_cache()
-            clear_dashboard_disk_cache()
-            _load_dashboard.clear()
-            _signups_by_level_monthly.clear()
-            st.rerun()
+    st.caption(
+        "Applies to the scorecard, trends, funnel, and campaign breakdown. "
+        "**Signups by membership level** charts below use full history with their own "
+        "year/quarter filters."
+    )
+    if since > until:
+        st.error("Start date must be on or before end date.")
+        st.stop()
 
     load_label = (
         "Loading Google Ads, Meta, and GoHighLevel… "
@@ -1085,8 +1139,75 @@ def main() -> None:
             st.markdown(f"- {note}")
 
     with st.sidebar:
+        st.header("Filters")
         channels = sorted(raw_df["channel"].dropna().unique())
         selected_channels = st.multiselect("Channel", channels, default=channels)
+
+        st.markdown("**Non-paid inclusion**")
+        st.caption("Optional additions to paid metrics — not ad channels.")
+        include_organic_leads = st.checkbox(
+            "Include Organic leads",
+            value=False,
+            help=(
+                "Leads only (not signups). Adds GHL new contacts without Google/Meta "
+                "attribution for the active source(s): blank hear-about, Word of "
+                "Mouth, other non-paid values, or hear-about/tracker conflicts. "
+                "Off by default. Not channel-filtered — included when checked even "
+                "if only Google Ads or FB/IG is selected."
+            ),
+        )
+
+        st.caption("GHL attribution (Jun 2025+)")
+        attribution_labels = {key: label for key, label in GHL_ATTRIBUTION_OPTIONS}
+        use_hear_about = st.checkbox(
+            attribution_labels[GHL_ATTRIBUTION_HEAR_ABOUT],
+            value=True,
+            help=(
+                "Self-reported **How did you hear about us?** only — Google or FB/IG "
+                "responses mapped to each channel. Signups use strict channel counts "
+                "(Other excluded unless toggled below). Drives CPL, Cost per DC, and "
+                "CPA when tracker is off."
+            ),
+        )
+        use_tracker = st.checkbox(
+            attribution_labels[GHL_ATTRIBUTION_TRACKER],
+            value=False,
+            help=(
+                "All contacts with a Google tag/pixel or Meta lead tag/pixel for the "
+                "channel. Drives CPL, Cost per DC, and CPA when checked (overrides "
+                "hear-about when both are on)."
+            ),
+        )
+        if not use_hear_about and not use_tracker:
+            st.warning(
+                "Select at least one attribution source for GHL leads and signups."
+            )
+
+        include_wom_signups = False
+        if use_hear_about:
+            include_wom_signups = st.checkbox(
+                "Include Word of Mouth signups",
+                value=False,
+                help=(
+                    "Hear-about only. When on, signups whose hear-about contains "
+                    "\"word of mouth\" are spread by spend share (lowers CPA). "
+                    "Off by default. Pre-Jun 2025 tracker sheet months are unchanged."
+                ),
+            )
+
+        include_other_signups = False
+        if use_hear_about or use_tracker:
+            include_other_signups = st.checkbox(
+                "Include Other signups",
+                value=False,
+                help=(
+                    "Signups only. When on, committed signups without Google/Meta "
+                    "attribution (blank hear-about, Other, TikTok, etc., or "
+                    "tracker-unallocated) are spread by spend share — lowers channel "
+                    "CPA. Off by default so Google and FB/IG CPA reflect only strict "
+                    "channel attribution."
+                ),
+            )
 
         channel_mask = raw_df["channel"].isin(selected_channels)
         campaign_pool = sorted(raw_df.loc[channel_mask, "campaign"].dropna().unique())
@@ -1127,61 +1248,36 @@ def main() -> None:
             membership_options,
             default=membership_options,
             help=(
-                "Signups from Sep 2025: GHL Committed? = Yes, Sign Up Date in range, "
-                "filtered by Membership Level. Pre-Sep 2025 uses tracker sheet totals."
+                "Signups from Jun 2025: GHL Committed? = Yes, Sign Up Date in range, "
+                "filtered by Membership Level. Pre-Jun 2025 uses tracker sheet totals."
             ),
         )
         if not selected_membership_levels:
             selected_membership_levels = membership_options
 
-        st.markdown("**GHL leads & signup attribution** (Sep 2025+)")
-        attribution_labels = {key: label for key, label in GHL_ATTRIBUTION_OPTIONS}
-        use_hear_about = st.checkbox(
-            attribution_labels[GHL_ATTRIBUTION_HEAR_ABOUT],
-            value=True,
-            help=(
-                "Self-reported **How did you hear about us?** field. Available for "
-                "full history; recommended for conservative CPA/CPL."
-            ),
-        )
-        use_tracker = st.checkbox(
-            attribution_labels[GHL_ATTRIBUTION_TRACKER],
-            value=False,
-            help=(
-                "Google: **dc thru g-ad** tag or gaClientId. Meta: meta lead tag or "
-                "pixel (sparse for older months — Google tracking was added to GHL "
-                "more recently). With both boxes on, each contact counts once if "
-                "either source matches (conflicts are unallocated)."
-            ),
-        )
-        if not use_hear_about and not use_tracker:
-            st.warning(
-                "Select at least one attribution source for GHL leads and signups."
-            )
+        st.markdown("---")
+        st.header("Refresh")
+        if st.button(
+            "Design only",
+            help="Reload layout and styles only. Uses cached data — no Google Ads, Meta, or GHL calls.",
+        ):
+            st.rerun()
 
-        include_organic_leads = st.checkbox(
-            "Include Organic leads",
-            value=False,
-            help=(
-                "Leads only (not signups). Adds GHL new contacts without Google/Meta "
-                "attribution for the active source(s): blank hear-about, Word of "
-                "Mouth, other non-paid values, or hear-about/tracker conflicts. "
-                "Off by default. Not channel-filtered — included when checked even "
-                "if only Google Ads or FB/IG is selected."
-            ),
-        )
+        if st.button("Refresh data", help="Reload ads + GHL. Keeps cached GHL daily lead files."):
+            clear_dashboard_disk_cache()
+            _load_dashboard.clear()
+            _tier_signups_by_level_monthly.clear()
+            st.rerun()
 
-        include_wom_signups = False
-        if use_hear_about:
-            include_wom_signups = st.checkbox(
-                "Include Word of Mouth signups",
-                value=True,
-                help=(
-                    "Hear-about only. When on, signups whose hear-about contains "
-                    "\"word of mouth\" are spread by spend share (lowers CPA). "
-                    "Pre-Sep 2025 tracker sheet months are unchanged."
-                ),
-            )
+        if st.button(
+            "Hard refresh GHL leads",
+            help="Clear cached GHL daily lead files and reload (use if lead counts look wrong).",
+        ):
+            clear_ghl_leads_day_cache()
+            clear_dashboard_disk_cache()
+            _load_dashboard.clear()
+            _tier_signups_by_level_monthly.clear()
+            st.rerun()
 
     attr_kwargs = dict(
         conv_by_level_df=conv_by_level_df,
@@ -1193,6 +1289,7 @@ def main() -> None:
         combined_unallocated_conv_df=combined_unallocated_conv_df,
         wom_conv_df=wom_conv_df,
         include_wom_signups=include_wom_signups,
+        include_other_signups=include_other_signups,
         sheet_signup_months=set(sheet_months),
     )
 
@@ -1297,26 +1394,66 @@ def main() -> None:
         )
     if scorecard_lead_notes:
         st.caption(" ".join(scorecard_lead_notes))
+    if (use_hear_about or use_tracker) and not include_other_signups:
+        strict_signup_note = (
+            "Signups use **strict** Google / FB/IG attribution (Other excluded). "
+        )
+        if use_hear_about and include_wom_signups:
+            strict_signup_note += "Word of mouth signups are still spread when that toggle is on. "
+        if since_month <= pd.Timestamp(SHEETS_SIGNUPS_UNTIL).to_period("M").to_timestamp():
+            strict_signup_note += (
+                "Pre-Jun 2025 sheet months still use org-wide tracker totals split by spend."
+            )
+        st.caption(strict_signup_note)
 
-    if use_hear_about and use_tracker:
+    if use_hear_about or use_tracker:
+        active_label = "Tracker" if use_tracker else "Hear-about"
 
-        def _signup_cpa(use_hear: bool, use_track: bool) -> str:
+        def _attrib_snapshot(
+            use_hear: bool,
+            use_track: bool,
+            *,
+            strict_signups: bool = False,
+        ) -> tuple[str, str, str]:
+            snap_kwargs = dict(attr_kwargs)
+            if strict_signups:
+                snap_kwargs["include_wom_signups"] = False
+                snap_kwargs["include_other_signups"] = False
             snap = apply_dashboard_ghl_attribution(
                 raw_selected.copy(),
                 use_hear_about=use_hear,
                 use_tracker=use_track,
-                **attr_kwargs,
+                **snap_kwargs,
             )
             snap = snap.loc[mask]
             spend = float(snap["spend"].sum())
+            leads = float(snap["leads"].sum())
+            dcs = float(snap["dcs"].sum())
             signups = float(snap["conversions"].sum())
-            return _fmt_currency(spend / signups if signups else None)
+            cpl = _fmt_currency(spend / leads if leads else None)
+            cpdc = _fmt_currency(spend / dcs if dcs else None)
+            cpa = _fmt_currency(spend / signups if signups else None)
+            return cpl, cpdc, cpa
 
+        hear_cpl, hear_cpdc, hear_cpa = _attrib_snapshot(
+            True, False, strict_signups=True
+        )
+        track_cpl, track_cpdc, track_cpa = _attrib_snapshot(
+            False, True, strict_signups=True
+        )
+        active_cpl, active_cpdc, active_cpa = _attrib_snapshot(
+            use_hear_about, use_tracker
+        )
+        override_note = (
+            " (tracker overrides hear-about when both are checked)"
+            if use_hear_about and use_tracker
+            else ""
+        )
         st.caption(
-            "Signup CPA with current filters — "
-            f"Hear-about only: {_signup_cpa(True, False)} · "
-            f"Tracker only: {_signup_cpa(False, True)} · "
-            f"Both (deduped OR): {_signup_cpa(True, True)}"
+            f"Active attribution: **{active_label}**{override_note} — "
+            f"CPL {active_cpl} · Cost per DC {active_cpdc} · CPA {active_cpa}. "
+            f"Hear-about only: CPL {hear_cpl} · Cost per DC {hear_cpdc} · CPA {hear_cpa} · "
+            f"Tracker only: CPL {track_cpl} · Cost per DC {track_cpdc} · CPA {track_cpa}."
         )
 
     st.markdown("---")
@@ -1392,10 +1529,9 @@ def main() -> None:
     else:
         st.info("No funnel data for the selected date range.")
     st.caption(
-        "Org-wide monthly totals through Aug 30, 2025 — **HubSpot** leads (Jul and "
-        "earlier), **GHL** new contacts for Aug 2025 leads, **Digital Cross-Channel "
-        "Tracker** Calls completed and GRAND TOTAL signups (signups match Signups Over "
-        "Time). **GoHighLevel** for all metrics from "
+        "Org-wide monthly totals through May 31, 2025 — **HubSpot** leads, **Digital "
+        "Cross-Channel Tracker** Calls completed and GRAND TOTAL signups (signups match "
+        "Signups Over Time). **GoHighLevel** for all metrics from "
         f"{pd.Timestamp(GHL_SIGNUPS_SINCE).strftime('%b %Y')} onward (new contacts by "
         f"date added, {len(discovery_call_calendar_ids())} discovery-call calendars by "
         "meeting date, committed signups by sign-up date). "
@@ -1408,55 +1544,90 @@ def main() -> None:
 
     st.subheader("Signups by membership level")
     signup_levels = tuple(selected_membership_levels)
-    signups_by_level_df, signup_cmp_notes = _signups_by_level_monthly(
-        since.isoformat(),
-        until.isoformat(),
-        ghl_signups_by_level_df,
-    )
-    yoy_df = aggregate_signups_yoy(
-        signups_by_level_df,
-        since=since,
-        until=until,
-        levels=signup_levels,
-    )
-    qoq_df = aggregate_signups_qoq(
-        signups_by_level_df,
-        since=since,
-        until=until,
-        levels=signup_levels,
+    tier_until = tier_signup_until()
+    signups_by_level_df, signup_cmp_notes = _tier_signups_by_level_monthly(
+        _data_until=tier_until.isoformat(),
     )
     yoy_col, qoq_col = st.columns(2)
-    tier_quarter_count = (
-        len(set(qoq_df["quarter"].unique())) if not qoq_df.empty else 1
-    )
-    tier_chart_height = _signups_tier_chart_height(tier_quarter_count)
+    yoy_chart_height = _signups_tier_chart_height(1)
     with yoy_col:
-        yoy_chart = _signups_yoy_bar_chart(
-            yoy_df,
-            levels=signup_levels,
-            chart_height=tier_chart_height,
+        yoy_year_options = list(tier_year_filter_options(signups_by_level_df))
+        selected_yoy_years = st.multiselect(
+            "Years",
+            yoy_year_options,
+            default=yoy_year_options,
+            help=(
+                "Select one or more calendar years to compare. "
+                "Current year shows as YTD when still open."
+            ),
         )
-        if yoy_chart:
-            st.plotly_chart(yoy_chart, use_container_width=True)
+        if not selected_yoy_years:
+            st.info("Select at least one year to show the chart.")
         else:
-            st.info("No signup tier data for YoY comparison in this range.")
+            yoy_plot_df = aggregate_signups_yoy(
+                signups_by_level_df,
+                until=tier_until,
+                levels=signup_levels,
+                selected_years=tuple(int(y) for y in selected_yoy_years),
+            )
+            yoy_chart = _signups_yoy_bar_chart(
+                yoy_plot_df,
+                levels=signup_levels,
+                chart_height=yoy_chart_height,
+                title_text=_yoy_chart_title(yoy_plot_df),
+            )
+            if yoy_chart:
+                st.plotly_chart(yoy_chart, use_container_width=True)
+            else:
+                st.info("No signup tier data for YoY comparison.")
     with qoq_col:
-        qoq_chart = _signups_qoq_bar_chart(
-            qoq_df,
-            levels=signup_levels,
-            chart_height=tier_chart_height,
+        qoq_quarter_options = list(tier_quarter_filter_options())
+        selected_qoq_quarters = st.multiselect(
+            "Quarters",
+            qoq_quarter_options,
+            default=qoq_quarter_options,
+            help=(
+                "Select one or more quarters to compare across years. "
+                "Current quarter shows as QTD when still open."
+            ),
         )
-        if qoq_chart:
-            st.plotly_chart(qoq_chart, use_container_width=True)
+        if not selected_qoq_quarters:
+            st.info("Select at least one quarter to show the chart.")
         else:
-            st.info("No signup tier data for quarter comparison in this range.")
+            qoq_plot_df = aggregate_signups_qoq(
+                signups_by_level_df,
+                until=tier_until,
+                levels=signup_levels,
+                selected_quarters=qoq_quarter_numbers(selected_qoq_quarters),
+            )
+            qoq_quarter_count = (
+                len(set(qoq_plot_df["quarter"].unique())) if not qoq_plot_df.empty else 1
+            )
+            qoq_chart_height = (
+                _signups_tier_chart_height(1)
+                if qoq_quarter_count == 1
+                else _signups_tier_chart_height(qoq_quarter_count)
+            )
+            qoq_chart = _signups_qoq_bar_chart(
+                qoq_plot_df,
+                levels=signup_levels,
+                chart_height=qoq_chart_height,
+                title_text=_qoq_chart_title(qoq_plot_df),
+            )
+            if qoq_chart:
+                st.plotly_chart(qoq_chart, use_container_width=True)
+            else:
+                st.info("No signup tier data for quarter comparison.")
     st.caption(
         "Org-wide committed signups by **Membership Level**. "
         f"Through {pd.Timestamp(SHEETS_SIGNUPS_UNTIL).strftime('%b %Y')}: **Digital Cross-Channel "
         "Tracker** Both Locations tier rows. "
         f"From {pd.Timestamp(GHL_SIGNUPS_SINCE).strftime('%b %Y')}: **GoHighLevel** (Sign Up Date, "
-        "Committed? = Yes). Partial current year shown as **YTD**. Respects the membership level "
-        "filter above; not affected by channel, campaign, or Word of Mouth attribution toggles."
+        "Committed? = Yes). **These two charts ignore the date range above** — they always "
+        f"use full history through **{tier_until:%b %d, %Y}**. Use **Years** / **Quarters** multiselects "
+        "to focus each chart; current year/quarter shown as **YTD** / **QTD** when still open. "
+        "Respects the membership level filter above; not affected by channel, campaign, or "
+        "Word of Mouth attribution toggles."
     )
     if signup_cmp_notes:
         with st.expander("Signups comparison — data sources"):

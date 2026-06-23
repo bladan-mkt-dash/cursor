@@ -2306,6 +2306,20 @@ def paid_media_channel_for_hear_about(raw: str) -> str | None:
     return None
 
 
+def paid_media_channel_for_tracker(contact: dict[str, Any]) -> str | None:
+    """
+    Map GHL tag/pixel signals to ``google`` or ``meta``.
+
+    Meta ``meta lead`` tag (or Meta pixel) takes precedence over Google tag/pixel,
+    mirroring how ``dc thru g-ad`` drives Google acquisition when both signals exist.
+    """
+    if is_meta_lead_contact(contact):
+        return "meta"
+    if is_google_lead_contact(contact):
+        return "google"
+    return None
+
+
 def _discovery_call_meeting_ok(event: dict[str, Any]) -> bool:
     status = (
         event.get("appointmentStatus") or event.get("appoinmentStatus") or ""
@@ -2672,8 +2686,8 @@ def fetch_discovery_call_meetings_monthly_by_channel(
     """
     Discovery-call **meetings** (``startTime`` in range) on configured calendars.
 
-    Returns monthly Google / Meta / unallocated counts using hear-about on the
-    linked contact (same paid-media mapping as the Digital Channel Dashboard).
+    Returns monthly Google / Meta / unallocated counts for hear-about and for
+    tag/pixel tracker on the linked contact (same rules as the live dashboard).
     """
     cal_ids = calendar_ids or discovery_call_calendar_ids()
     hear_id = resolve_hear_about_us_custom_field_id(location_id, field_name=field_name)
@@ -2695,8 +2709,10 @@ def fetch_discovery_call_meetings_monthly_by_channel(
     contact_cache = fetch_contacts_by_ids(contact_ids, location_id=location_id)
 
     per_month: dict[str, dict[str, int]] = {}
+    per_month_tracker: dict[str, dict[str, int]] = {}
     missing_contact_link = 0
     unattributed = 0
+    unattributed_tracker = 0
 
     for event in meeting_events:
         day = _event_start_time_ymd(event)
@@ -2704,16 +2720,21 @@ def fetch_discovery_call_meetings_monthly_by_channel(
             continue
         ym = day[:7]
         bucket = per_month.setdefault(ym, {"google": 0, "meta": 0, "unallocated": 0})
+        tracker_bucket = per_month_tracker.setdefault(
+            ym, {"google": 0, "meta": 0, "unallocated": 0}
+        )
 
         contact_id = event.get("contactId")
         if not contact_id:
             missing_contact_link += 1
             bucket["unallocated"] += 1
+            tracker_bucket["unallocated"] += 1
             continue
 
         contact = contact_cache.get(str(contact_id))
         if not contact:
             bucket["unallocated"] += 1
+            tracker_bucket["unallocated"] += 1
             continue
 
         channel = paid_media_channel_for_hear_about(
@@ -2727,10 +2748,22 @@ def fetch_discovery_call_meetings_monthly_by_channel(
             unattributed += 1
             bucket["unallocated"] += 1
 
+        tracker_channel = paid_media_channel_for_tracker(contact)
+        if tracker_channel == "google":
+            tracker_bucket["google"] += 1
+        elif tracker_channel == "meta":
+            tracker_bucket["meta"] += 1
+        else:
+            unattributed_tracker += 1
+            tracker_bucket["unallocated"] += 1
+
     monthly: list[dict[str, Any]] = []
     for month_start, month_label in _month_periods_inclusive(since, until):
         ym = month_start[:7]
         vals = per_month.get(ym, {"google": 0, "meta": 0, "unallocated": 0})
+        tracker_vals = per_month_tracker.get(
+            ym, {"google": 0, "meta": 0, "unallocated": 0}
+        )
         monthly.append(
             {
                 "month_start": month_start,
@@ -2738,6 +2771,9 @@ def fetch_discovery_call_meetings_monthly_by_channel(
                 "google": int(vals["google"]),
                 "meta": int(vals["meta"]),
                 "unallocated": int(vals["unallocated"]),
+                "google_tracker": int(tracker_vals["google"]),
+                "meta_tracker": int(tracker_vals["meta"]),
+                "unallocated_tracker": int(tracker_vals["unallocated"]),
             }
         )
 
@@ -2753,6 +2789,7 @@ def fetch_discovery_call_meetings_monthly_by_channel(
         "calendar_api_errors": api_errors,
         "missing_contact_link": missing_contact_link,
         "unattributed_hear_about": unattributed,
+        "unattributed_tracker": unattributed_tracker,
     }
 
 

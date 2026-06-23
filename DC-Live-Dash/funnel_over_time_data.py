@@ -2,12 +2,11 @@
 Monthly funnel totals for the Leads / DCs / Signups over-time chart.
 
 Sources (no campaign attribution, no spend weighting):
-- Through Aug 30, 2025:
+- Through May 31, 2025:
   - **Leads** — HubSpot migration export (deduped new contacts by create date).
-    Aug 2025 uses GHL new contacts (dateAdded), same method as Sep 2025 onward.
   - **Discovery calls** — Digital Cross-Channel Tracker **Calls completed** row.
   - **Signups** — Tracker **GRAND TOTAL New Members** (same as Signups Over Time).
-- From Sep 1, 2025 (after Aug 30): GoHighLevel — new contacts (dateAdded),
+- From Jun 1, 2025: GoHighLevel — new contacts (dateAdded),
   discovery-call meetings (calendar startTime), committed signups (Sign Up Date).
 """
 
@@ -37,7 +36,7 @@ from ghl_client import (
 )
 
 # Bump when loader logic changes (Streamlit cache key).
-FUNNEL_OVER_TIME_REVISION = "2026-06-22-perf-shared-ghl-v1"
+FUNNEL_OVER_TIME_REVISION = "2026-06-23-meta-tracker-ghl-backfill-v1"
 
 _FUNNEL_COLUMNS = ("month", "leads", "dcs", "signups", "source")
 
@@ -64,7 +63,7 @@ def load_sheet_funnel_monthly(
     ghl_leads_by_month: dict[pd.Timestamp, float] | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
     """
-    Pre-GHL org-wide funnel through Aug 30, 2025.
+    Pre-GHL org-wide funnel through May 31, 2025.
 
     HubSpot leads, tracker completed calls and signups (signups match Signups Over Time).
     """
@@ -167,9 +166,8 @@ def load_sheet_funnel_monthly(
 
     monthly = pd.DataFrame(rows).sort_values("month").reset_index(drop=True)
     notes.append(
-        "Funnel (through Aug 30, 2025): HubSpot leads (through Jul); GHL dateAdded "
-        "leads for Aug 2025; tracker GRAND TOTAL signups (aligned with Signups Over "
-        "Time) and Calls completed for DCs."
+        "Funnel (through May 31, 2025): HubSpot leads; tracker GRAND TOTAL signups "
+        "(aligned with Signups Over Time) and Calls completed for DCs."
     )
     return monthly, notes
 
@@ -283,7 +281,7 @@ def load_ghl_funnel_monthly(
     ghl_dcs_by_month: dict[pd.Timestamp, float] | None = None,
     ghl_signups_by_month: dict[pd.Timestamp, float] | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
-    """Monthly funnel from GHL (from Sep 1, 2025 — after Aug 30)."""
+    """Monthly funnel from GHL (from Jun 1, 2025)."""
     from digital_channel_live_data import GHL_SIGNUPS_SINCE
 
     ghl_since = max(since, GHL_SIGNUPS_SINCE)
@@ -362,7 +360,7 @@ def load_funnel_over_time(
     ghl_signups_by_month: dict[pd.Timestamp, float] | None = None,
 ) -> tuple[pd.DataFrame, list[str]]:
     """
-    Stitch pre-GHL months (through Aug 30, 2025) with GHL months (Sep 2025 onward).
+    Stitch pre-GHL months (through May 31, 2025) with GHL months (Jun 2025 onward).
 
     Returns one row per calendar month in range with columns:
     month, leads, dcs, signups, source ('hubspot+tracker' | 'ghl').
@@ -420,5 +418,5 @@ def _ghl_funnel_since() -> str:
     return GHL_SIGNUPS_SINCE
 
 
-# Same cutover as Signups Over Time / DCs charts (GHL after Aug 30, 2025).
+# Same cutover as Signups Over Time / DCs charts (GHL from Jun 2025).
 GHL_FUNNEL_SINCE = _ghl_funnel_since()
