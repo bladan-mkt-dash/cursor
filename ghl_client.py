@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 # Bump when hear-about normalization or fetch helpers change (war_room_data reloads).
-GHL_CLIENT_REVISION = "2026-06-18-signup-search-resilient-v1"
+GHL_CLIENT_REVISION = "2026-06-24-deleted-calendar-skip-v1"
 
 import os
 import time
@@ -2320,6 +2320,17 @@ def paid_media_channel_for_tracker(contact: dict[str, Any]) -> str | None:
     return None
 
 
+def combined_paid_media_channel(
+    hear_raw: str, contact: dict[str, Any]
+) -> str | None:
+    """Deduped hear-about ∪ tracker: one channel when sources agree; else unallocated."""
+    hear_ch = paid_media_channel_for_hear_about(hear_raw)
+    track_ch = paid_media_channel_for_tracker(contact)
+    if hear_ch and track_ch and hear_ch != track_ch:
+        return None
+    return hear_ch or track_ch
+
+
 def _discovery_call_meeting_ok(event: dict[str, Any]) -> bool:
     status = (
         event.get("appointmentStatus") or event.get("appoinmentStatus") or ""
@@ -2426,6 +2437,11 @@ def _fetch_calendar_events_deduped(
             timeout=90,
         )
         if not events_response.ok:
+            if (
+                events_response.status_code == 400
+                and "deleted" in events_response.text.casefold()
+            ):
+                continue
             api_errors += 1
             continue
         for event in events_response.json().get("events") or []:
@@ -2710,9 +2726,11 @@ def fetch_discovery_call_meetings_monthly_by_channel(
 
     per_month: dict[str, dict[str, int]] = {}
     per_month_tracker: dict[str, dict[str, int]] = {}
+    per_month_combined: dict[str, dict[str, int]] = {}
     missing_contact_link = 0
     unattributed = 0
     unattributed_tracker = 0
+    unattributed_combined = 0
 
     for event in meeting_events:
         day = _event_start_time_ymd(event)
@@ -2723,23 +2741,27 @@ def fetch_discovery_call_meetings_monthly_by_channel(
         tracker_bucket = per_month_tracker.setdefault(
             ym, {"google": 0, "meta": 0, "unallocated": 0}
         )
+        combined_bucket = per_month_combined.setdefault(
+            ym, {"google": 0, "meta": 0, "unallocated": 0}
+        )
 
         contact_id = event.get("contactId")
         if not contact_id:
             missing_contact_link += 1
             bucket["unallocated"] += 1
             tracker_bucket["unallocated"] += 1
+            combined_bucket["unallocated"] += 1
             continue
 
         contact = contact_cache.get(str(contact_id))
         if not contact:
             bucket["unallocated"] += 1
             tracker_bucket["unallocated"] += 1
+            combined_bucket["unallocated"] += 1
             continue
 
-        channel = paid_media_channel_for_hear_about(
-            contact_custom_field_value(contact, hear_id)
-        )
+        hear_raw = contact_custom_field_value(contact, hear_id)
+        channel = paid_media_channel_for_hear_about(hear_raw)
         if channel == "google":
             bucket["google"] += 1
         elif channel == "meta":
@@ -2757,11 +2779,23 @@ def fetch_discovery_call_meetings_monthly_by_channel(
             unattributed_tracker += 1
             tracker_bucket["unallocated"] += 1
 
+        combined_channel = combined_paid_media_channel(hear_raw, contact)
+        if combined_channel == "google":
+            combined_bucket["google"] += 1
+        elif combined_channel == "meta":
+            combined_bucket["meta"] += 1
+        else:
+            unattributed_combined += 1
+            combined_bucket["unallocated"] += 1
+
     monthly: list[dict[str, Any]] = []
     for month_start, month_label in _month_periods_inclusive(since, until):
         ym = month_start[:7]
         vals = per_month.get(ym, {"google": 0, "meta": 0, "unallocated": 0})
         tracker_vals = per_month_tracker.get(
+            ym, {"google": 0, "meta": 0, "unallocated": 0}
+        )
+        combined_vals = per_month_combined.get(
             ym, {"google": 0, "meta": 0, "unallocated": 0}
         )
         monthly.append(
@@ -2774,6 +2808,9 @@ def fetch_discovery_call_meetings_monthly_by_channel(
                 "google_tracker": int(tracker_vals["google"]),
                 "meta_tracker": int(tracker_vals["meta"]),
                 "unallocated_tracker": int(tracker_vals["unallocated"]),
+                "google_combined": int(combined_vals["google"]),
+                "meta_combined": int(combined_vals["meta"]),
+                "unallocated_combined": int(combined_vals["unallocated"]),
             }
         )
 
@@ -2790,6 +2827,7 @@ def fetch_discovery_call_meetings_monthly_by_channel(
         "missing_contact_link": missing_contact_link,
         "unattributed_hear_about": unattributed,
         "unattributed_tracker": unattributed_tracker,
+        "unattributed_combined": unattributed_combined,
     }
 
 

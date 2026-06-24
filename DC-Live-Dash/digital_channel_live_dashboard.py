@@ -33,7 +33,7 @@ from ghl_client import discovery_call_calendar_ids
 
 import digital_channel_live_data as _live_data_mod
 
-_EXPECTED_LIVE_DATA_REVISION = "2026-06-23-meta-tracker-ghl-backfill-v1"
+_EXPECTED_LIVE_DATA_REVISION = "2026-06-24-dc-calendar-audit-v1"
 if (
     getattr(_live_data_mod, "LIVE_DATA_REVISION", None)
     != _EXPECTED_LIVE_DATA_REVISION
@@ -1079,11 +1079,11 @@ def main() -> None:
         "later months use GHL new contacts (attributed + unallocated spread by spend, "
         "same approach as DCs). "
         "**First load** for a wide date range can take a minute while GHL lead data "
-        "is pulled day-by-day (Jun 2025 onward only); **repeat loads use disk cache** "
+        "is pulled day-by-day (Jul 2025 onward only); **repeat loads use disk cache** "
         "and are much faster. Default view is the last "
         f"**{DEFAULT_DASHBOARD_MONTHS} months** — widen the date range below for full history. "
-        "**Signups** through May 2025: **GRAND TOTAL New Members** from Digital Cross-Channel "
-        "Tracker sheets; from Jun 2025: GHL **Committed?** = Yes + **Sign Up Date**, with "
+        "**Signups** through Aug 2025: **GRAND TOTAL New Members** from Digital Cross-Channel "
+        "Tracker sheets; from Sep 2025: GHL **Committed?** = Yes + **Sign Up Date**, with "
         "**Membership Level** slicer (sheet months ignore membership filter)."
     )
 
@@ -1106,8 +1106,9 @@ def main() -> None:
             max_value=default_until,
         )
     st.caption(
-        "Applies to the scorecard, trends, funnel, and campaign breakdown. "
-        "**Signups by membership level** charts below use full history with their own "
+        "Applies to the scorecard and trend charts (Spend, CPL, DCs, Signups). "
+        "The **funnel** chart below stays org-wide. "
+        "**Signups by membership level** charts use full history with their own "
         "year/quarter filters."
     )
     if since > until:
@@ -1134,10 +1135,6 @@ def main() -> None:
         st.warning("No campaign data returned for the selected date range.")
         st.stop()
 
-    with st.expander("Data sources & methodology", expanded=False):
-        for note in notes:
-            st.markdown(f"- {note}")
-
     with st.sidebar:
         st.header("Filters")
         channels = sorted(raw_df["channel"].dropna().unique())
@@ -1157,7 +1154,7 @@ def main() -> None:
             ),
         )
 
-        st.caption("GHL attribution (Jun 2025+)")
+        st.caption("GHL attribution (Sep 2025+)")
         attribution_labels = {key: label for key, label in GHL_ATTRIBUTION_OPTIONS}
         use_hear_about = st.checkbox(
             attribution_labels[GHL_ATTRIBUTION_HEAR_ABOUT],
@@ -1174,8 +1171,8 @@ def main() -> None:
             value=False,
             help=(
                 "All contacts with a Google tag/pixel or Meta lead tag/pixel for the "
-                "channel. Drives CPL, Cost per DC, and CPA when checked (overrides "
-                "hear-about when both are on)."
+                "channel. When both attribution sources are checked, counts use "
+                "deduped hear-about ∪ tracker (not double-counted)."
             ),
         )
         if not use_hear_about and not use_tracker:
@@ -1191,7 +1188,7 @@ def main() -> None:
                 help=(
                     "Hear-about only. When on, signups whose hear-about contains "
                     "\"word of mouth\" are spread by spend share (lowers CPA). "
-                    "Off by default. Pre-Jun 2025 tracker sheet months are unchanged."
+                    "Off by default. Pre-Sep 2025 tracker sheet months are unchanged."
                 ),
             )
 
@@ -1248,8 +1245,8 @@ def main() -> None:
             membership_options,
             default=membership_options,
             help=(
-                "Signups from Jun 2025: GHL Committed? = Yes, Sign Up Date in range, "
-                "filtered by Membership Level. Pre-Jun 2025 uses tracker sheet totals."
+                "Signups from Sep 2025: GHL Committed? = Yes, Sign Up Date in range, "
+                "filtered by Membership Level. Pre-Sep 2025 uses tracker sheet totals."
             ),
         )
         if not selected_membership_levels:
@@ -1331,12 +1328,6 @@ def main() -> None:
         channel_month_leads,
         cpl_channel_month_leads,
         unallocated_leads_by_attr,
-        since=since.isoformat(),
-        until=until.isoformat(),
-        sheet_signup_totals=sheet_signup_totals,
-        ghl_signups_by_month=ghl_signups_by_month,
-        sheet_dcs_totals=sheet_dcs_totals,
-        ghl_dcs_by_month=ghl_dcs_by_month,
         selected_channels=selected_channels,
         use_hear_about=use_hear_about,
         use_tracker=use_tracker,
@@ -1362,6 +1353,34 @@ def main() -> None:
         use_tracker=use_tracker,
         cpl_monthly=trend_monthlies.cpl,
     )
+
+    st.markdown("---")
+    st.subheader("Trends over time")
+    if use_quarterly:
+        st.caption(
+            "Date range exceeds 9 months — trend charts show **quarterly** totals on the x-axis."
+        )
+    else:
+        st.caption("Trend charts show **monthly** totals on the x-axis.")
+
+    funnel_chart = _funnel_over_time_chart(funnel_df)
+    if funnel_chart:
+        st.plotly_chart(funnel_chart, use_container_width=True)
+    else:
+        st.info("No funnel data for the selected date range.")
+    st.caption(
+        "**Org-wide funnel** — not affected by sidebar filters above. Monthly totals "
+        "through Aug 30, 2025 use **HubSpot** leads and **Digital Cross-Channel "
+        "Tracker** Calls completed and GRAND TOTAL signups. **GoHighLevel** for all "
+        "metrics from "
+        f"{pd.Timestamp(GHL_SIGNUPS_SINCE).strftime('%b %Y')} onward (new contacts by "
+        f"date added, {len(discovery_call_calendar_ids())} discovery-call calendars by "
+        "meeting date, committed signups by sign-up date)."
+    )
+    with st.expander("Funnel chart — data sources"):
+        st.caption(f"Loader revision: `{FUNNEL_OVER_TIME_REVISION}`")
+        for note in funnel_notes:
+            st.markdown(f"- {note}")
 
     _metric_row(
         [
@@ -1402,7 +1421,7 @@ def main() -> None:
             strict_signup_note += "Word of mouth signups are still spread when that toggle is on. "
         if since_month <= pd.Timestamp(SHEETS_SIGNUPS_UNTIL).to_period("M").to_timestamp():
             strict_signup_note += (
-                "Pre-Jun 2025 sheet months still use org-wide tracker totals split by spend."
+                "Pre-Sep 2025 sheet months still use org-wide tracker totals split by spend."
             )
         st.caption(strict_signup_note)
 
@@ -1456,15 +1475,6 @@ def main() -> None:
             f"Tracker only: CPL {track_cpl} · Cost per DC {track_cpdc} · CPA {track_cpa}."
         )
 
-    st.markdown("---")
-    st.subheader("Trends over time")
-    if use_quarterly:
-        st.caption(
-            "Date range exceeds 9 months — trend charts show **quarterly** totals on the x-axis."
-        )
-    else:
-        st.caption("Trend charts show **monthly** totals on the x-axis.")
-
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.plotly_chart(
@@ -1498,12 +1508,12 @@ def main() -> None:
             use_container_width=True,
         )
         st.caption(
-            "Org-wide discovery calls — **Digital Cross-Channel Tracker** Calls completed "
-            f"through {pd.Timestamp(SHEETS_DCS_UNTIL).strftime('%b %Y')}; "
-            f"**GoHighLevel** calendar meetings (startTime) on "
-            f"{len(discovery_call_calendar_ids())} discovery-call calendar(s) from "
-            f"{pd.Timestamp(GHL_DCS_SINCE).strftime('%b %Y')} onward. "
-            "Not affected by campaign or attribution filters."
+            "Discovery calls matching sidebar filters. From "
+            f"{pd.Timestamp(GHL_DCS_SINCE).strftime('%b %Y')}: **GoHighLevel meetings** "
+            f"(``startTime``) on {len(discovery_call_calendar_ids())} configured "
+            "discovery-call calendars — cancelled and no-show excluded. Same totals as "
+            "scorecard DCs. Pre-Sep 2025 uses tracker **Calls completed** "
+            "(spend-weighted splits)."
         )
     with c4:
         st.plotly_chart(
@@ -1516,30 +1526,13 @@ def main() -> None:
             use_container_width=True,
         )
         st.caption(
-            "Org-wide signups — **Digital Cross-Channel Tracker** GRAND TOTAL New Members "
-            f"through {pd.Timestamp(SHEETS_SIGNUPS_UNTIL).strftime('%b %Y')}; "
-            f"**GoHighLevel** committed members by Sign Up Date from "
-            f"{pd.Timestamp(GHL_SIGNUPS_SINCE).strftime('%b %Y')} onward. "
-            "Not affected by campaign or attribution filters."
+            "Signups matching sidebar filters and active attribution — same totals as "
+            "the scorecard Signups, rolled up by month. Pre-Sep 2025 sheet months "
+            "use spend-weighted tracker splits."
         )
 
-    funnel_chart = _funnel_over_time_chart(funnel_df)
-    if funnel_chart:
-        st.plotly_chart(funnel_chart, use_container_width=True)
-    else:
-        st.info("No funnel data for the selected date range.")
-    st.caption(
-        "Org-wide monthly totals through May 31, 2025 — **HubSpot** leads, **Digital "
-        "Cross-Channel Tracker** Calls completed and GRAND TOTAL signups (signups match "
-        "Signups Over Time). **GoHighLevel** for all metrics from "
-        f"{pd.Timestamp(GHL_SIGNUPS_SINCE).strftime('%b %Y')} onward (new contacts by "
-        f"date added, {len(discovery_call_calendar_ids())} discovery-call calendars by "
-        "meeting date, committed signups by sign-up date). "
-        "Not affected by campaign or attribution filters above."
-    )
-    with st.expander("Funnel chart — data sources"):
-        st.caption(f"Loader revision: `{FUNNEL_OVER_TIME_REVISION}`")
-        for note in funnel_notes:
+    with st.expander("Data sources & methodology", expanded=False):
+        for note in notes:
             st.markdown(f"- {note}")
 
     st.subheader("Signups by membership level")
