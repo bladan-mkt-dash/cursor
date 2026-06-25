@@ -2,3 +2,15 @@
 [server]
 address = "127.0.0.1"
 port = 8502
+
+[theme]
+base = "light"
+primaryColor = "#5DA68A"
+backgroundColor = "#F4F8FB"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#264540"
+borderColor = "#5DA68A"
+font = "sans serif"
+
+[browser]
+gatherUsageStats = false

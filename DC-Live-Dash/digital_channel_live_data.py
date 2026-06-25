@@ -40,7 +40,7 @@ GHL_ATTRIBUTION_OPTIONS: tuple[tuple[str, str], ...] = (
     (GHL_ATTRIBUTION_HEAR_ABOUT, "How did you hear about us?"),
     (GHL_ATTRIBUTION_TRACKER, "Tracker (GHL tag / pixel)"),
 )
-_EXPECTED_GHL_CLIENT_REVISION = "2026-06-24-deleted-calendar-skip-v1"
+_EXPECTED_GHL_CLIENT_REVISION = "2026-06-24-calendar-meetings-monthly-v1"
 
 import ghl_client as _ghl_client
 

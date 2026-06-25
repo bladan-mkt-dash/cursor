@@ -29,7 +29,21 @@ if str(_PROJECT_ROOT) not in sys.path:
 if str(_DC_LIVE_DIR) not in sys.path:
     sys.path.insert(0, str(_DC_LIVE_DIR))
 
-from ghl_client import discovery_call_calendar_ids
+import ghl_client as _ghl_client_mod
+
+_EXPECTED_GHL_CLIENT_REVISION = "2026-06-24-calendar-meetings-monthly-v1"
+if (
+    getattr(_ghl_client_mod, "GHL_CLIENT_REVISION", None)
+    != _EXPECTED_GHL_CLIENT_REVISION
+):
+    _ghl_client_mod = importlib.reload(_ghl_client_mod)
+
+discovery_call_calendar_ids = _ghl_client_mod.discovery_call_calendar_ids
+
+import total_new_members_yoy_chart as _tracker_chart_mod
+
+if not hasattr(_tracker_chart_mod, "_load_row_year_series"):
+    _tracker_chart_mod = importlib.reload(_tracker_chart_mod)
 
 import digital_channel_live_data as _live_data_mod
 
@@ -42,8 +56,9 @@ if (
 
 import funnel_over_time_data as _funnel_mod
 import signup_comparison_data as _signup_cmp_mod
+import bookings_meetings_comparison_data as _bookings_meetings_mod
 
-_EXPECTED_FUNNEL_REVISION = "2026-06-22-perf-shared-ghl-v1"
+_EXPECTED_FUNNEL_REVISION = "2026-06-25-consolidated-terminations-v1"
 if (
     getattr(_funnel_mod, "FUNNEL_OVER_TIME_REVISION", None)
     != _EXPECTED_FUNNEL_REVISION
@@ -57,12 +72,29 @@ if (
 ):
     _signup_cmp_mod = importlib.reload(_signup_cmp_mod)
 
+_EXPECTED_BOOKINGS_MEETINGS_REVISION = "2026-06-24-discovery-calls-charts-v5"
+if (
+    getattr(_bookings_meetings_mod, "BOOKINGS_MEETINGS_COMPARISON_REVISION", None)
+    != _EXPECTED_BOOKINGS_MEETINGS_REVISION
+):
+    _bookings_meetings_mod = importlib.reload(_bookings_meetings_mod)
+
 FUNNEL_OVER_TIME_REVISION = _funnel_mod.FUNNEL_OVER_TIME_REVISION
 GHL_FUNNEL_SINCE = _funnel_mod.GHL_FUNNEL_SINCE
 SIGNUP_COMPARISON_REVISION = _signup_cmp_mod.SIGNUP_COMPARISON_REVISION
+BOOKINGS_MEETINGS_COMPARISON_REVISION = (
+    _bookings_meetings_mod.BOOKINGS_MEETINGS_COMPARISON_REVISION
+)
+BOOKINGS_MEETINGS_CATEGORY = _bookings_meetings_mod.BOOKINGS_MEETINGS_CATEGORY
+DISCOVERY_CALLS_LABEL = _bookings_meetings_mod.DISCOVERY_CALLS_LABEL
 aggregate_signups_qoq = _signup_cmp_mod.aggregate_signups_qoq
 aggregate_signups_yoy = _signup_cmp_mod.aggregate_signups_yoy
 load_tier_signups_by_level_monthly = _signup_cmp_mod.load_tier_signups_by_level_monthly
+load_bookings_meetings_comparison_monthly = (
+    _bookings_meetings_mod.load_bookings_meetings_comparison_monthly
+)
+monthly_for_signup_charts = _bookings_meetings_mod.monthly_for_signup_charts
+bookings_meetings_until = _bookings_meetings_mod.bookings_meetings_until
 qoq_quarter_numbers = _signup_cmp_mod.qoq_quarter_numbers
 tier_quarter_filter_options = _signup_cmp_mod.tier_quarter_filter_options
 tier_signup_until = _signup_cmp_mod.tier_signup_until
@@ -98,6 +130,8 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 COLORS = {
     "accent": "#5DA68A",
     "accent_dark": "#264540",
+    "page_bg": "#F4F8FB",
+    "sidebar_bg": "#F7FBFF",
     "2023": "#4C78A8",
     "2024": "#F58518",
     "2025": "#54A24B",
@@ -125,47 +159,63 @@ _BASE_CHART_PADDING_PX = 12
 _TIER_TITLE_HEIGHT_PX = 18
 _TIER_LEGEND_HEIGHT_PX = 20
 _TIER_SECTION_GAP_PX = 20
+_DISCOVERY_CALLS_TITLE_LEGEND_GAP_PX = 36
 _TIER_CHART_LEFT = 48
 _TIER_CHART_BOTTOM = 52
 _TIER_CHART_RIGHT = 20
 
 
-def _signups_tier_top_margin_px() -> int:
-    """Title + 20px + legend + 20px above the plot."""
+def _signups_tier_top_margin_px(*, title_legend_gap_px: int | None = None) -> int:
+    """Title + gap + legend + gap above the plot."""
+    plot_gap = _TIER_SECTION_GAP_PX
+    title_legend_gap = (
+        title_legend_gap_px if title_legend_gap_px is not None else _TIER_SECTION_GAP_PX
+    )
     return (
         _TIER_TITLE_HEIGHT_PX
-        + _TIER_SECTION_GAP_PX
+        + title_legend_gap
         + _TIER_LEGEND_HEIGHT_PX
-        + _TIER_SECTION_GAP_PX
+        + plot_gap
     )
 
 
-def _signups_tier_plot_height_px(tier_height: int) -> float:
-    return float(
-        tier_height - _signups_tier_top_margin_px() - _TIER_CHART_BOTTOM
+def _signups_tier_pair_margin(*, title_legend_gap_px: int | None = None) -> dict[str, int]:
+    return dict(
+        l=_TIER_CHART_LEFT,
+        r=_TIER_CHART_RIGHT,
+        t=_signups_tier_top_margin_px(title_legend_gap_px=title_legend_gap_px),
+        b=_TIER_CHART_BOTTOM,
     )
 
 
-def _signups_tier_paper_above_plot(tier_height: int, px_above_plot_top: float) -> float:
+def _signups_tier_paper_above_plot(
+    tier_height: int,
+    px_above_plot_top: float,
+    *,
+    title_legend_gap_px: int | None = None,
+) -> float:
     """Paper y at ``px_above_plot_top`` pixels above the inner plot top (y=1)."""
-    plot_h = _signups_tier_plot_height_px(tier_height)
+    plot_h = _signups_tier_plot_height_px(
+        tier_height, title_legend_gap_px=title_legend_gap_px
+    )
     if plot_h <= 0:
         return 1.0
     return 1.0 + px_above_plot_top / plot_h
 
 
+def _signups_tier_plot_height_px(
+    tier_height: int, *, title_legend_gap_px: int | None = None
+) -> float:
+    return float(
+        tier_height
+        - _signups_tier_top_margin_px(title_legend_gap_px=title_legend_gap_px)
+        - _TIER_CHART_BOTTOM
+    )
+
+
 def _signups_tier_chart_height(quarter_count: int) -> int:
     """Shared figure height for YoY and QoQ signup tier charts."""
     return max(360, 120 * max(quarter_count, 1))
-
-
-def _signups_tier_pair_margin() -> dict[str, int]:
-    return dict(
-        l=_TIER_CHART_LEFT,
-        r=_TIER_CHART_RIGHT,
-        t=_signups_tier_top_margin_px(),
-        b=_TIER_CHART_BOTTOM,
-    )
 
 
 def _strip_plotly_auto_titles(fig: go.Figure) -> None:
@@ -182,23 +232,27 @@ def _apply_signups_tier_pair_layout(
     tier_height: int,
     title_text: str,
     quarter_labels: list[str] | None = None,
+    title_legend_gap_px: int | None = None,
 ) -> None:
     """
-    Precise vertical stack: title → 20px → legend → 20px → plot.
+    Precise vertical stack: title → gap → legend → gap → plot.
 
     Title and legend sit in the top margin using paper y > 1; the plot begins
     exactly 20px below the reserved legend band.
     """
-    gap = _TIER_SECTION_GAP_PX
+    plot_gap = _TIER_SECTION_GAP_PX
+    title_legend_gap = (
+        title_legend_gap_px if title_legend_gap_px is not None else _TIER_SECTION_GAP_PX
+    )
     legend_h = _TIER_LEGEND_HEIGHT_PX
     title_h = _TIER_TITLE_HEIGHT_PX
 
-    legend_bottom_px = gap
-    title_top_px = gap + legend_h + gap + title_h
+    legend_bottom_px = plot_gap
+    title_top_px = plot_gap + legend_h + title_legend_gap + title_h
 
     fig.update_layout(
         height=tier_height,
-        margin=_signups_tier_pair_margin(),
+        margin=_signups_tier_pair_margin(title_legend_gap_px=title_legend_gap_px),
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)",
         font=dict(family="Roboto, sans-serif", color=COLORS["accent_dark"]),
@@ -208,7 +262,11 @@ def _apply_signups_tier_pair_layout(
             x=0.5,
             xanchor="center",
             yanchor="bottom",
-            y=_signups_tier_paper_above_plot(tier_height, legend_bottom_px),
+            y=_signups_tier_paper_above_plot(
+                tier_height,
+                legend_bottom_px,
+                title_legend_gap_px=title_legend_gap_px,
+            ),
             bgcolor="rgba(0,0,0,0)",
             title_text="",
         ),
@@ -221,7 +279,11 @@ def _apply_signups_tier_pair_layout(
         x=0.5,
         xanchor="center",
         yanchor="top",
-        y=_signups_tier_paper_above_plot(tier_height, title_top_px),
+        y=_signups_tier_paper_above_plot(
+            tier_height,
+            title_top_px,
+            title_legend_gap_px=title_legend_gap_px,
+        ),
         showarrow=False,
         font=dict(size=14, color=COLORS["accent_dark"], weight=700),
     )
@@ -310,25 +372,69 @@ def _time_period_summary(
 
 def _inject_styles() -> None:
     st.markdown(
-        """
+        f"""
         <style>
-        .block-container { padding-top: 1.5rem; max-width: 100%; }
-        [data-testid="stMetric"] {
+        .stApp {{
+            background: {COLORS["page_bg"]} !important;
+            color: {COLORS["accent_dark"]};
+        }}
+        [data-testid="stAppViewContainer"] {{
+            background: {COLORS["page_bg"]};
+        }}
+        [data-testid="stHeader"] {{
+            background: rgba(244, 248, 251, 0.92);
+        }}
+        .block-container {{
+            padding-top: 1.5rem;
+            max-width: 100%;
+            color: {COLORS["accent_dark"]};
+        }}
+        [data-testid="stMetric"] {{
             background: white;
             border-radius: 12px;
             padding: 0.5rem 0.6rem;
             box-shadow: 0 1px 3px rgba(38,69,64,0.08);
             border: 1px solid rgba(93,166,138,0.15);
-        }
-        [data-testid="stMetricLabel"] {
-            color: #264540;
+        }}
+        [data-testid="stMetricLabel"] {{
+            color: {COLORS["accent_dark"]} !important;
             font-weight: 600;
             font-size: 0.72rem;
             white-space: nowrap;
-        }
-        [data-testid="stMetricValue"] { color: #5DA68A; font-size: 1.05rem; }
-        h5 { color: #264540; margin-top: 1rem !important; }
-        [data-testid="stSidebar"] { background: #f7fbff; }
+        }}
+        [data-testid="stMetricValue"] {{
+            color: {COLORS["accent"]} !important;
+            font-size: 1.05rem;
+        }}
+        h1, h2, h3, h4, h5 {{
+            color: {COLORS["accent_dark"]} !important;
+            margin-top: 1rem !important;
+        }}
+        [data-testid="stCaptionContainer"] p {{
+            color: {COLORS["muted"]} !important;
+        }}
+        [data-testid="stSidebar"] {{
+            background: {COLORS["sidebar_bg"]} !important;
+        }}
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
+        [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] {{
+            color: {COLORS["accent_dark"]} !important;
+        }}
+        [data-testid="stSidebar"] h1,
+        [data-testid="stSidebar"] h2,
+        [data-testid="stSidebar"] h3 {{
+            color: {COLORS["accent_dark"]} !important;
+        }}
+        [data-testid="stSidebar"] [data-testid="stWidgetLabel"] p,
+        [data-testid="stSidebar"] [data-testid="stWidgetLabel"],
+        [data-testid="stSidebar"] [data-testid="stCheckbox"] label p,
+        [data-testid="stSidebar"] [data-testid="stCheckbox"] label span,
+        [data-testid="stSidebar"] [data-testid="stMultiSelect"] label p {{
+            color: {COLORS["accent_dark"]} !important;
+        }}
+        [data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {{
+            color: {COLORS["muted"]} !important;
+        }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -468,7 +574,7 @@ def _line_chart(
 
 
 def _funnel_over_time_chart(funnel_df: pd.DataFrame) -> go.Figure | None:
-    """Org-wide monthly Leads, Discovery Calls, and Signups — independent of campaign filters."""
+    """Org-wide monthly Leads, Discovery Calls, Terminations, and Signups."""
     if funnel_df.empty:
         return None
 
@@ -480,8 +586,12 @@ def _funnel_over_time_chart(funnel_df: pd.DataFrame) -> go.Figure | None:
     series = (
         ("leads", "Leads", COLORS["accent"]),
         ("dcs", "Discovery Calls", COLORS["2023"]),
+        ("terminations", "Terminations", COLORS["2026"]),
         ("signups", "Signups", COLORS["2024"]),
     )
+    for col, _, _ in series:
+        if col not in plot_df.columns:
+            plot_df[col] = 0.0
 
     fig = go.Figure()
     for col, label, color in series:
@@ -525,7 +635,7 @@ def _funnel_over_time_chart(funnel_df: pd.DataFrame) -> go.Figure | None:
     n_months = len(x_order)
     fig.update_layout(
         height=440,
-        title="Leads, Discovery Calls & Signups Over Time",
+        title="Leads, Discovery Calls, Terminations & Signups Over Time",
         margin=_chart_margin(
             has_legend=True,
             left=48,
@@ -570,6 +680,9 @@ def _signups_yoy_bar_chart(
     levels: tuple[str, ...],
     chart_height: int | None = None,
     title_text: str = "Signups by tier — year over year",
+    value_label: str = "Signups",
+    hide_x_ticklabels: bool = False,
+    title_legend_gap_px: int | None = None,
 ) -> go.Figure | None:
     if yoy_df.empty:
         return None
@@ -587,7 +700,7 @@ def _signups_yoy_bar_chart(
         barmode="group",
         labels={
             "membership_level": "Membership level",
-            "signups": "Signups",
+            "signups": value_label,
             "year_label": "Year",
         },
         category_orders={
@@ -601,11 +714,16 @@ def _signups_yoy_bar_chart(
         fig,
         tier_height=tier_height,
         title_text=title_text,
+        title_legend_gap_px=title_legend_gap_px,
     )
     fig.update_layout(
         xaxis_title="",
-        yaxis_title="Signups",
+        yaxis_title=value_label,
         bargap=0.15,
+    )
+    fig.update_xaxes(
+        showticklabels=not hide_x_ticklabels,
+        title_text="",
     )
     fig.update_traces(hovertemplate="%{x}<br>%{fullData.name}: %{y:,0f}<extra></extra>")
     return fig
@@ -634,6 +752,14 @@ def _qoq_chart_title(qoq_df: pd.DataFrame) -> str:
     return "Signups by tier — same quarter across years"
 
 
+def _discovery_calls_yoy_chart_title(yoy_df: pd.DataFrame) -> str:
+    return _yoy_chart_title(yoy_df).replace("Signups by tier", DISCOVERY_CALLS_LABEL)
+
+
+def _discovery_calls_qoq_chart_title(qoq_df: pd.DataFrame) -> str:
+    return _qoq_chart_title(qoq_df).replace("Signups by tier", DISCOVERY_CALLS_LABEL)
+
+
 def _qoq_plot_years(qoq_df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     """Normalize QoQ year grouping so partial quarters share a bar group with full years."""
     plot_df = qoq_df.copy()
@@ -648,6 +774,9 @@ def _signups_qoq_bar_chart(
     levels: tuple[str, ...],
     chart_height: int | None = None,
     title_text: str | None = None,
+    value_label: str = "Signups",
+    hide_x_ticklabels: bool = False,
+    title_legend_gap_px: int | None = None,
 ) -> go.Figure | None:
     if qoq_df.empty:
         return None
@@ -670,7 +799,7 @@ def _signups_qoq_bar_chart(
             custom_data=["year_label"],
             labels={
                 "membership_level": "Membership level",
-                "signups": "Signups",
+                "signups": value_label,
                 "year_color": "Year",
             },
             category_orders={
@@ -684,11 +813,16 @@ def _signups_qoq_bar_chart(
             fig,
             tier_height=tier_height,
             title_text=chart_title,
+            title_legend_gap_px=title_legend_gap_px,
         )
         fig.update_layout(
             xaxis_title="",
-            yaxis_title="Signups",
+            yaxis_title=value_label,
             bargap=0.15,
+        )
+        fig.update_xaxes(
+            showticklabels=not hide_x_ticklabels,
+            title_text="",
         )
         fig.update_traces(
             hovertemplate="%{x}<br>%{customdata[0]}: %{y:,0f}<extra></extra>"
@@ -712,7 +846,7 @@ def _signups_qoq_bar_chart(
         custom_data=["year_label"],
         labels={
             "membership_level": "Membership level",
-            "signups": "Signups",
+            "signups": value_label,
             "year_color": "Year",
             "quarter_label": "Quarter",
         },
@@ -730,11 +864,15 @@ def _signups_qoq_bar_chart(
         tier_height=tier_height,
         title_text=chart_title,
         quarter_labels=quarter_labels,
+        title_legend_gap_px=title_legend_gap_px,
     )
     fig.update_layout(bargap=0.12)
     for col_idx in range(1, len(quarter_labels) + 1):
-        fig.update_yaxes(title_text="Signups" if col_idx == 1 else "", col=col_idx)
-    fig.update_xaxes(title_text="")
+        fig.update_yaxes(title_text=value_label if col_idx == 1 else "", col=col_idx)
+    fig.update_xaxes(
+        showticklabels=not hide_x_ticklabels,
+        title_text="",
+    )
     fig.update_traces(
         hovertemplate="%{x}<br>%{customdata[0]}: %{y:,0f}<extra></extra>"
     )
@@ -748,6 +886,62 @@ def _tier_signups_by_level_monthly(
 ) -> tuple[pd.DataFrame, tuple[str, ...]]:
     df, notes = load_tier_signups_by_level_monthly()
     return df, tuple(notes)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _bookings_meetings_monthly(
+    _revision: str = BOOKINGS_MEETINGS_COMPARISON_REVISION,
+    _data_until: str = "",
+) -> tuple[pd.DataFrame, tuple[str, ...]]:
+    df, notes = _bookings_meetings_mod.load_bookings_meetings_comparison_monthly()
+    return df, tuple(notes)
+
+
+def _reload_comparison_modules() -> None:
+    """Force-reload helper modules after code changes (Streamlit keeps stale imports)."""
+    global _bookings_meetings_mod, load_bookings_meetings_comparison_monthly
+    global monthly_for_signup_charts, bookings_meetings_until
+    global BOOKINGS_MEETINGS_COMPARISON_REVISION, BOOKINGS_MEETINGS_CATEGORY
+    global DISCOVERY_CALLS_LABEL
+    global _funnel_mod, FUNNEL_OVER_TIME_REVISION
+
+    import total_new_members_yoy_chart as _tracker_chart_mod
+
+    importlib.reload(_tracker_chart_mod)
+    importlib.reload(_funnel_mod)
+    FUNNEL_OVER_TIME_REVISION = _funnel_mod.FUNNEL_OVER_TIME_REVISION
+    importlib.reload(_bookings_meetings_mod)
+    BOOKINGS_MEETINGS_COMPARISON_REVISION = (
+        _bookings_meetings_mod.BOOKINGS_MEETINGS_COMPARISON_REVISION
+    )
+    BOOKINGS_MEETINGS_CATEGORY = _bookings_meetings_mod.BOOKINGS_MEETINGS_CATEGORY
+    DISCOVERY_CALLS_LABEL = _bookings_meetings_mod.DISCOVERY_CALLS_LABEL
+    load_bookings_meetings_comparison_monthly = (
+        _bookings_meetings_mod.load_bookings_meetings_comparison_monthly
+    )
+    monthly_for_signup_charts = _bookings_meetings_mod.monthly_for_signup_charts
+    bookings_meetings_until = _bookings_meetings_mod.bookings_meetings_until
+    _bookings_meetings_monthly.clear()
+    _tier_signups_by_level_monthly.clear()
+
+
+def _ensure_funnel_terminations(
+    funnel_df: pd.DataFrame, since: date, until: date
+) -> pd.DataFrame:
+    """Backfill terminations when Streamlit serves a cached funnel without that column."""
+    if funnel_df.empty or "terminations" in funnel_df.columns:
+        return funnel_df
+    term_by_month, _ = _funnel_mod.load_consolidated_terminations_monthly(
+        since.isoformat(),
+        until.isoformat(),
+    )
+    out = funnel_df.copy()
+    out["terminations"] = out["month"].apply(
+        lambda m: float(
+            term_by_month.get(pd.Timestamp(m).to_period("M").to_timestamp(), 0)
+        )
+    )
+    return out
 
 
 def _cpl_over_time_chart(monthly: pd.DataFrame) -> go.Figure | None:
@@ -1258,12 +1452,14 @@ def main() -> None:
             "Design only",
             help="Reload layout and styles only. Uses cached data — no Google Ads, Meta, or GHL calls.",
         ):
+            _reload_comparison_modules()
             st.rerun()
 
         if st.button("Refresh data", help="Reload ads + GHL. Keeps cached GHL daily lead files."):
             clear_dashboard_disk_cache()
             _load_dashboard.clear()
             _tier_signups_by_level_monthly.clear()
+            _bookings_meetings_monthly.clear()
             st.rerun()
 
         if st.button(
@@ -1274,6 +1470,7 @@ def main() -> None:
             clear_dashboard_disk_cache()
             _load_dashboard.clear()
             _tier_signups_by_level_monthly.clear()
+            _bookings_meetings_monthly.clear()
             st.rerun()
 
     attr_kwargs = dict(
@@ -1363,6 +1560,7 @@ def main() -> None:
     else:
         st.caption("Trend charts show **monthly** totals on the x-axis.")
 
+    funnel_df = _ensure_funnel_terminations(funnel_df, since, until)
     funnel_chart = _funnel_over_time_chart(funnel_df)
     if funnel_chart:
         st.plotly_chart(funnel_chart, use_container_width=True)
@@ -1371,11 +1569,11 @@ def main() -> None:
     st.caption(
         "**Org-wide funnel** — not affected by sidebar filters above. Monthly totals "
         "through Aug 30, 2025 use **HubSpot** leads and **Digital Cross-Channel "
-        "Tracker** Calls completed and GRAND TOTAL signups. **GoHighLevel** for all "
-        "metrics from "
-        f"{pd.Timestamp(GHL_SIGNUPS_SINCE).strftime('%b %Y')} onward (new contacts by "
-        f"date added, {len(discovery_call_calendar_ids())} discovery-call calendars by "
-        "meeting date, committed signups by sign-up date)."
+        "Tracker** Calls completed and GRAND TOTAL signups. **GoHighLevel** for leads, "
+        "discovery calls, and signups from "
+        f"{pd.Timestamp(GHL_SIGNUPS_SINCE).strftime('%b %Y')} onward. **Terminations** "
+        "from **Terminated Memberships 2023-2025** Consolidated Data tab (Date of "
+        "Termination), full history in range."
     )
     with st.expander("Funnel chart — data sources"):
         st.caption(f"Loader revision: `{FUNNEL_OVER_TIME_REVISION}`")
@@ -1625,6 +1823,107 @@ def main() -> None:
     if signup_cmp_notes:
         with st.expander("Signups comparison — data sources"):
             for note in signup_cmp_notes:
+                st.markdown(f"- {note}")
+
+    st.subheader(DISCOVERY_CALLS_LABEL)
+    bm_until = bookings_meetings_until()
+    bookings_meetings_df, bm_notes = _bookings_meetings_monthly(
+        _data_until=bm_until.isoformat(),
+    )
+    bm_chart_df = monthly_for_signup_charts(bookings_meetings_df)
+    bm_levels = (BOOKINGS_MEETINGS_CATEGORY,)
+    bm_chart_opts = dict(
+        hide_x_ticklabels=True,
+        title_legend_gap_px=_DISCOVERY_CALLS_TITLE_LEGEND_GAP_PX,
+    )
+    bm_yoy_col, bm_qoq_col = st.columns(2)
+    bm_chart_height = _signups_tier_chart_height(1)
+    with bm_yoy_col:
+        bm_yoy_year_options = list(tier_year_filter_options(bookings_meetings_df))
+        selected_bm_yoy_years = st.multiselect(
+            "Years (discovery calls)",
+            bm_yoy_year_options,
+            default=bm_yoy_year_options,
+            help=(
+                "Select one or more calendar years to compare. "
+                "Current year shows as YTD when still open."
+            ),
+        )
+        if not selected_bm_yoy_years:
+            st.info("Select at least one year to show the chart.")
+        else:
+            bm_yoy_plot_df = aggregate_signups_yoy(
+                bm_chart_df,
+                until=bm_until,
+                levels=bm_levels,
+                selected_years=tuple(int(y) for y in selected_bm_yoy_years),
+            )
+            bm_yoy_chart = _signups_yoy_bar_chart(
+                bm_yoy_plot_df,
+                levels=bm_levels,
+                chart_height=bm_chart_height,
+                title_text=_discovery_calls_yoy_chart_title(bm_yoy_plot_df),
+                value_label="Count",
+                **bm_chart_opts,
+            )
+            if bm_yoy_chart:
+                st.plotly_chart(bm_yoy_chart, use_container_width=True)
+            else:
+                st.info("No discovery call data for YoY comparison.")
+    with bm_qoq_col:
+        bm_qoq_quarter_options = list(tier_quarter_filter_options())
+        selected_bm_qoq_quarters = st.multiselect(
+            "Quarters (discovery calls)",
+            bm_qoq_quarter_options,
+            default=bm_qoq_quarter_options,
+            help=(
+                "Select one or more quarters to compare across years. "
+                "Current quarter shows as QTD when still open."
+            ),
+        )
+        if not selected_bm_qoq_quarters:
+            st.info("Select at least one quarter to show the chart.")
+        else:
+            bm_qoq_plot_df = aggregate_signups_qoq(
+                bm_chart_df,
+                until=bm_until,
+                levels=bm_levels,
+                selected_quarters=qoq_quarter_numbers(selected_bm_qoq_quarters),
+            )
+            bm_qoq_quarter_count = (
+                len(set(bm_qoq_plot_df["quarter"].unique()))
+                if not bm_qoq_plot_df.empty
+                else 1
+            )
+            bm_qoq_chart_height = (
+                _signups_tier_chart_height(1)
+                if bm_qoq_quarter_count == 1
+                else _signups_tier_chart_height(bm_qoq_quarter_count)
+            )
+            bm_qoq_chart = _signups_qoq_bar_chart(
+                bm_qoq_plot_df,
+                levels=bm_levels,
+                chart_height=bm_qoq_chart_height,
+                title_text=_discovery_calls_qoq_chart_title(bm_qoq_plot_df),
+                value_label="Count",
+                **bm_chart_opts,
+            )
+            if bm_qoq_chart:
+                st.plotly_chart(bm_qoq_chart, use_container_width=True)
+            else:
+                st.info("No discovery call data for quarter comparison.")
+    st.caption(
+        "Org-wide **Discovery Calls**: tracker **Bookings (all booked calls)** through "
+        f"{pd.Timestamp(SHEETS_SIGNUPS_UNTIL).strftime('%b %Y')}, then **GoHighLevel meetings** "
+        f"(calendar ``startTime``, all calendars) from {pd.Timestamp(GHL_SIGNUPS_SINCE).strftime('%b %Y')}. "
+        f"**These two charts ignore the date range above** — they always use full history through "
+        f"**{bm_until:%b %d, %Y}**. Use **Years** / **Quarters** multiselects to focus each chart; "
+        "current year/quarter shown as **YTD** / **QTD** when still open. Not affected by sidebar "
+        "channel, campaign, or attribution filters."
+    )
+    if bm_notes:
+        with st.expander("Discovery Calls comparison — data sources"):
+            for note in bm_notes:
                 st.markdown(f"- {note}")
 
     st.markdown("---")

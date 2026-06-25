@@ -38,8 +38,28 @@ from gmail_client import (
 from google_tasks_client import list_tasklists, tasks_service
 
 OUTPUT_DIR = _MWR_DIR / "outputs"
-JE_TODO_BOARD_ID = "4125103989"
-JE_APPROVAL_STATUS = "Ready for Publishing"
+
+STAFF_BOARD_NAMES = {
+    "je": "Je New To-Do List",
+    "sam": "Sam New To-Do List",
+    "voltaire": "Voltaire To-Do List",
+}
+STAFF_SECTION_TITLES = {
+    "Je": "Je - Reviews & Approvals",
+    "Sam": "Sam - Reviews & Approvals",
+    "Voltaire": "Voltaire - Reviews & Approvals",
+}
+STAFF_MENTION_RES = {
+    "je": re.compile(r"@je\b|@jerahmay|jerahmay buenviaje|32344872", re.I),
+    "sam": re.compile(r"@sam\b|@sam cimafranca|scimafranca", re.I),
+    "voltaire": re.compile(r"@voltaire\b|\bhi voltaire\b", re.I),
+}
+APPROVAL_COMMENT_RE = re.compile(
+    r"\bapproved\b|good to go|ready to publish|treat this as done",
+    re.I,
+)
+BRUNO_CREATOR_RE = re.compile(r"bruno", re.I)
+_IG_ITEM_RE = re.compile(r"^ig\s", re.I)
 
 _SKIP_TASK_RE = re.compile(
     r"^(re:|fwd:|fw:)|pay vas|welcome to your workplace|^hi bruno\.",
@@ -47,6 +67,13 @@ _SKIP_TASK_RE = re.compile(
 )
 _SKIP_EMAIL_SUBJECT_RE = re.compile(
     r"^(test$|missing docs report|welcome to your workplace|health insurance plan)",
+    re.IGNORECASE,
+)
+_SKIP_EMAIL_CHATTER_RE = re.compile(
+    r"\b(going to lunch|out for lunch|at lunch|on lunch)\b|"
+    r"\b(let me know when|be right back|\bbrb\b|on my way|heading out)\b|"
+    r"^(hi|hello|thanks|thank you|ok|okay|yes|no)\.?$|"
+    r"\bout of office\b|\booo\b",
     re.IGNORECASE,
 )
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w.-]+\.\w+")
@@ -69,6 +96,7 @@ class ActivitySummaryReport:
     milestones: list[tuple[str, str]]
     completed_sections: list[tuple[str, list[str]]]
     email_sections: list[tuple[str, list[str]]]
+    operational_work_groups: list[tuple[str, list[str]]] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
 
@@ -157,142 +185,338 @@ def _task_text(task: CompletedTask) -> str:
     return f"{task.title} {task.notes}".lower()
 
 
+def _is_results_oriented_email(subject: str, snippet: str = "") -> bool:
+    """Drop social/administrative mail that is not a work outcome."""
+    text = f"{subject} {snippet}".strip()
+    if not text:
+        return False
+    if _SKIP_EMAIL_CHATTER_RE.search(text):
+        return False
+    # Very short subjects with no clear deliverable are usually chatter.
+    subj = subject.strip()
+    if len(subj) < 18 and not re.search(
+        r"\b(report|review|update|launch|campaign|invoice|contract|approved|seo|"
+        r"integration|packet|board|payment|proposal|meeting|schedule|plan)\b",
+        subj,
+        re.I,
+    ):
+        return False
+    return True
+
+
+def _task_group_heading(title: str) -> str | None:
+    """Leading category before ' - ', ' -- ', or ' — ' (e.g. 'Advertising - …' → Advertising)."""
+    text = title.strip()
+    for sep in (" — ", " -- ", " - "):
+        if sep in text:
+            head = text.split(sep, 1)[0].strip()
+            if len(head) >= 2:
+                return head
+    return None
+
+
+def _strip_group_prefix(title: str, group_heading: str) -> str:
+    """Drop the group headline from a task title when it is already shown as h4."""
+    text = title.strip()
+    head = group_heading.strip()
+    if not head:
+        return text
+    for sep in (" — ", " -- ", " - ", ": "):
+        prefix = f"{head}{sep}"
+        if text.casefold().startswith(prefix.casefold()):
+            return text[len(prefix) :].strip()
+    if text.casefold().startswith(head.casefold()):
+        return text[len(head) :].lstrip(" -—:").strip() or text
+    return text
+
+
+def _strip_staff_oversight_tail(text: str) -> str:
+    """Staff Oversight - Je - Task name → Task name."""
+    match = re.match(r"^(Je|Sam|Voltaire)\s*[-—]\s*(.+)", text.strip(), re.I)
+    return match.group(2).strip() if match else text.strip()
+
+
+def _format_completed_task_bullet(
+    task: CompletedTask,
+    *,
+    group_heading: str | None = None,
+) -> str:
+    line = task.title.strip()
+    if group_heading:
+        line = _strip_group_prefix(line, group_heading)
+        if group_heading.casefold() == "staff oversight":
+            line = _strip_staff_oversight_tail(line)
+    if task.notes:
+        note = task.notes.replace("\n", " ").strip()
+        if note and note.casefold() not in line.casefold():
+            line = f"{line} — {note[:100]}"
+    return f"{line} ({_short_date(task.completed_date)})"
+
+
+def _group_completed_tasks(tasks: list[CompletedTask]) -> list[tuple[str, list[str]]]:
+    """Group completed tasks by shared title prefix; singletons → Miscellaneous."""
+    sorted_tasks = sorted(
+        tasks,
+        key=lambda t: (t.completed_date, t.list_name.casefold(), t.title.casefold()),
+    )
+    heading_counts: dict[str, int] = defaultdict(int)
+    for task in sorted_tasks:
+        head = _task_group_heading(task.title)
+        if head:
+            heading_counts[head] += 1
+
+    groups: dict[str, list[str]] = defaultdict(list)
+    misc: list[str] = []
+    seen: set[str] = set()
+
+    for task in sorted_tasks:
+        head = _task_group_heading(task.title)
+        bullet = _format_completed_task_bullet(
+            task,
+            group_heading=head if head and heading_counts.get(head, 0) >= 2 else None,
+        )
+        key = bullet.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+
+        if head and heading_counts[head] >= 2:
+            groups[head].append(bullet)
+        else:
+            misc.append(bullet)
+
+    ordered: list[tuple[str, list[str]]] = [
+        (head, groups[head]) for head in sorted(groups, key=str.casefold)
+    ]
+    if misc:
+        ordered.append(("Miscellaneous", misc))
+    return ordered
+
+
+def _is_zonia_activity(text: str) -> bool:
+    lower = text.casefold()
+    return "zonia" in lower or "immune for life" in lower
+
+
+def _zonia_vendor_bullets(
+    tasks: list[CompletedTask],
+    sent: list[GmailMessage],
+) -> list[str]:
+    bullets: list[str] = []
+    for task in tasks:
+        if _is_zonia_activity(_task_text(task)):
+            title = _strip_group_prefix(task.title.strip(), "Zonia")
+            line = title
+            if task.notes:
+                note = task.notes.replace("\n", " ").strip()
+                if note and note.casefold() not in line.casefold():
+                    line = f"{line} — {note[:100]}"
+            bullets.append(f"{line} ({_short_date(task.completed_date)})")
+    for msg in sent:
+        subject = _normalize_subject(msg.subject)
+        lower = f"{subject} {msg.to_addrs} {msg.from_addr}".casefold()
+        if "zonia" not in lower and "immune for life" not in lower:
+            continue
+        if not _is_results_oriented_email(subject, msg.snippet or ""):
+            continue
+        recipient = _first_recipient_name(msg.to_addrs)
+        day = _short_date(msg.date.date()) if msg.date else ""
+        line = f"{subject} → {recipient}" + (f" ({day})" if day else "")
+        bullets.append(line)
+    return _dedupe_lines(bullets)
+
+
 def _short_date(d: date) -> str:
     return f"{d.strftime('%b')} {d.day}"
 
 
-def _is_ig_item(name: str) -> bool:
-    lower = name.lower()
-    return lower.startswith("ig ") or lower.startswith("ig:") or " ig " in lower
+def _approval_date_in_range(created: datetime | None, *, start: date, end: date) -> bool:
+    if not created:
+        return False
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    start_dt = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
+    end_dt = datetime(end.year, end.month, end.day, tzinfo=timezone.utc) + timedelta(days=1)
+    return start_dt <= created < end_dt
 
 
-def _fetch_je_monday_approvals(
+def _resolve_staff_tag(*, board_key: str, body: str, text: str) -> str:
+    combined = f"{body}\n{text}"
+    # Direct staff call-out wins over assignee @mention (e.g. "@Je … Hi Voltaire — approved").
+    for staff_key in ("voltaire", "sam", "je"):
+        if STAFF_MENTION_RES[staff_key].search(combined):
+            return staff_key
+    return board_key
+
+
+def _short_item_name(name: str) -> str:
+    for prefix in (
+        "IG Carousel Post: ",
+        "IG Single Image Post: ",
+        "IG  Carousel Post:",
+        "IG Reel: ",
+    ):
+        if name.startswith(prefix):
+            return name[len(prefix) :].strip()
+    return name.strip()
+
+
+def _summarize_approval_items(items: list[tuple[date, str]]) -> list[str]:
+    """Turn raw Monday approval rows into readable bullets."""
+    if not items:
+        return []
+
+    ig_items = [(d, n) for d, n in items if _IG_ITEM_RE.match(n.strip())]
+    other_items = [(d, n) for d, n in items if not _IG_ITEM_RE.match(n.strip())]
+    bullets: list[str] = []
+
+    if len(ig_items) >= 3:
+        by_day: dict[date, int] = defaultdict(int)
+        for day, _ in ig_items:
+            by_day[day] += 1
+        day_labels = ", ".join(f"{count} on {_short_date(day)}" for day, count in sorted(by_day.items()))
+        bullets.append(f"{len(ig_items)} IG posts/reels approved — {day_labels}")
+    else:
+        other_items.extend(ig_items)
+
+    seen: set[str] = set()
+    for day, name in sorted(other_items, key=lambda row: (row[0], row[1].casefold())):
+        short = _short_item_name(name)
+        line = f"{short} ({_short_date(day)})"
+        key = line.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        bullets.append(line)
+    return bullets
+
+
+def _fetch_monday_staff_approvals(
     *,
     start: date,
     end: date,
-) -> tuple[list[str], str | None]:
-    """Je approvals = items moved to Ready for Publishing on her Monday board."""
+) -> tuple[dict[str, list[str]], str | None]:
+    """
+    Bruno's Monday comments that tag @je / @sam / @voltaire (or board owner)
+    and include approval language.
+    """
     try:
-        from monday_client import fetch_items_from_boards
-    except ImportError:
-        return [], None
-
-    try:
-        df, _ = fetch_items_from_boards(
-            [JE_TODO_BOARD_ID],
-            board_names={JE_TODO_BOARD_ID: "Je New To-Do List"},
+        from monday_client import resolve_board_ids_by_names
+        from monday_jbu_gbp_mentions import (
+            fetch_board_updates_pages,
+            parse_update_datetime,
+            strip_html,
         )
+    except ImportError as exc:
+        return {}, f"Monday imports: {exc}"
+
+    try:
+        board_map, missing = resolve_board_ids_by_names(list(STAFF_BOARD_NAMES.values()))
     except Exception as exc:
-        return [], f"Monday (Je approvals): {exc}"
+        return {}, f"Monday (staff boards): {exc}"
+    if missing:
+        return {}, f"Monday boards not found: {', '.join(missing)}"
 
-    if df.empty:
-        return [], None
-
+    name_to_key = {v: k for k, v in STAFF_BOARD_NAMES.items()}
+    by_staff: dict[str, list[tuple[date, str]]] = {k: [] for k in STAFF_BOARD_NAMES}
+    seen: set[str] = set()
     start_dt = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
-    end_dt = datetime(end.year, end.month, end.day, tzinfo=timezone.utc) + timedelta(days=1)
 
-    approved: list[tuple[date, str]] = []
-    for _, row in df.iterrows():
-        if str(row.get("status") or "") != JE_APPROVAL_STATUS:
+    for board_name, board_id in board_map.items():
+        board_key = name_to_key.get(board_name)
+        if not board_key:
             continue
-        updated_raw = row.get("updated_at")
-        if not updated_raw:
-            continue
-        updated = datetime.fromisoformat(str(updated_raw).replace("Z", "+00:00"))
-        if not (start_dt <= updated < end_dt):
-            continue
-        name = str(row.get("name") or "").strip()
-        if name:
-            approved.append((updated.date(), name))
+        try:
+            _, updates = fetch_board_updates_pages(
+                board_id,
+                page_limit=100,
+                max_pages=30,
+                sleep_s=0.2,
+                cutoff=start_dt - timedelta(days=14),
+            )
+        except Exception as exc:
+            return {}, f"Monday ({board_name}): {exc}"
 
-    if not approved:
-        return [], None
+        for upd in updates:
+            if not isinstance(upd, dict):
+                continue
+            item = upd.get("item") or {}
+            item_name = str(item.get("name") or "").strip()
+            if not item_name:
+                continue
+            for comment in [upd, *(upd.get("replies") or [])]:
+                if not isinstance(comment, dict):
+                    continue
+                creator = str((comment.get("creator") or {}).get("name") or "")
+                if not BRUNO_CREATOR_RE.search(creator):
+                    continue
+                created = parse_update_datetime(comment.get("created_at"))
+                if not _approval_date_in_range(created, start=start, end=end):
+                    continue
+                body = str(comment.get("body") or "")
+                text = strip_html(body + "\n" + str(comment.get("text_body") or ""))
+                if not APPROVAL_COMMENT_RE.search(text):
+                    continue
+                staff_key = _resolve_staff_tag(board_key=board_key, body=body, text=text)
+                dedupe_key = f"{staff_key}:{item_name.casefold()}"
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                by_staff[staff_key].append((created.date(), item_name))
 
-    highlights: list[str] = []
-    ig_by_day: dict[date, int] = defaultdict(int)
-    other_by_day: dict[date, list[str]] = defaultdict(list)
-
-    for day, name in approved:
-        lower = name.lower()
-        if "summer solstice" in lower:
-            highlights.append(f"Summer Solstice Sale creative approved ({_short_date(day)})")
-        elif _is_ig_item(name):
-            ig_by_day[day] += 1
-        else:
-            other_by_day[day].append(name)
-
-    bullets: list[str] = []
-    bullets.extend(highlights)
-    for day in sorted(ig_by_day):
-        count = ig_by_day[day]
-        label = "IG post" if count == 1 else "IG posts/reels"
-        bullets.append(f"{count} {label} approved for publishing ({_short_date(day)})")
-    for day in sorted(other_by_day):
-        for name in other_by_day[day][:3]:
-            bullets.append(f"{name} approved ({_short_date(day)})")
-        extra = len(other_by_day[day]) - 3
-        if extra > 0:
-            bullets.append(f"+{extra} more non-IG items approved ({_short_date(day)})")
-
-    return [f"Je — {'; '.join(bullets)}"], None
+    return {
+        staff.title(): _summarize_approval_items(rows)
+        for staff, rows in by_staff.items()
+        if rows
+    }, None
 
 
-def _build_staff_oversight(
+def _build_staff_sections(
     tasks: list[CompletedTask],
     *,
     start: date,
     end: date,
-) -> tuple[list[str], list[str]]:
-    staff: list[str] = []
+) -> tuple[list[tuple[str, list[str]]], list[str]]:
+    sections: list[tuple[str, list[str]]] = []
     errors: list[str] = []
 
-    sam_notes: list[str] = []
+    monday_by_staff, monday_err = _fetch_monday_staff_approvals(start=start, end=end)
+    if monday_err:
+        errors.append(monday_err)
+
+    task_notes: dict[str, list[str]] = defaultdict(list)
     for task in tasks:
         text = _task_text(task)
         if "staff oversight" in text and "sam" in text:
             if "monday board" in text:
-                sam_notes.append("Monday board cleanup")
+                task_notes["Sam"].append("Monday board cleanup (Google Tasks)")
             if "nurture" in text:
-                sam_notes.append("nurture sequence rebalance")
+                task_notes["Sam"].append("nurture sequence rebalance")
             if "vidiq" in text or "a/b" in text:
-                sam_notes.append("VidIQ A/B test")
+                task_notes["Sam"].append("VidIQ A/B test")
             if "newsletter" in text or "solstice" in text or "khafagy" in text:
-                sam_notes.append("newsletter, Khafagy copy, Solstice banner")
-    if sam_notes:
-        unique = list(dict.fromkeys(sam_notes))
-        staff.append(f"Sam — {', '.join(unique)}")
-
-    je_task_notes: list[str] = []
-    for task in tasks:
-        text = _task_text(task)
+                task_notes["Sam"].append("newsletter, Khafagy copy, Solstice banner")
         if "staff oversight" in text and re.search(r"\bje\b", text):
             note = task.notes.strip() or task.title.strip()
             if note:
-                je_task_notes.append(note)
+                task_notes["Je"].append(note)
         elif re.search(r"\bwith je\b|\bto je\b", text) and "share creative theme" in text:
-            je_task_notes.append("briefed on Summer Solstice sale creative theme")
-    if je_task_notes:
-        unique = list(dict.fromkeys(je_task_notes))
-        staff.append(f"Je — {', '.join(unique)}")
+            task_notes["Je"].append("briefed on Summer Solstice sale creative theme")
 
-    je_monday, je_err = _fetch_je_monday_approvals(start=start, end=end)
-    if je_err:
-        errors.append(je_err)
-    elif je_monday:
-        if any(line.startswith("Je —") for line in staff):
-            staff = [
-                f"{line}; {je_monday[0].removeprefix('Je — ')}"
-                if line.startswith("Je —")
-                else line
-                for line in staff
-            ]
-        else:
-            staff.extend(je_monday)
+    for staff in ("Je", "Sam", "Voltaire"):
+        bullets = list(monday_by_staff.get(staff, []))
+        monday_blob = " ".join(bullets).casefold()
+        for note in dict.fromkeys(task_notes.get(staff, [])):
+            if note.casefold().startswith("staff oversight"):
+                tail = note.split(" - ", 2)[-1].casefold()
+                if tail and tail in monday_blob:
+                    continue
+                note = _strip_staff_oversight_tail(_strip_group_prefix(note, "Staff Oversight"))
+            bullets.append(note)
+        if bullets:
+            sections.append((STAFF_SECTION_TITLES[staff], bullets))
 
-    if any("voltaire" in _task_text(t) or "blog #20" in _task_text(t) for t in tasks):
-        staff.append("Voltaire — blog #20 approved; blogs 17–19 cleared to proceed")
-
-    return staff, errors
+    return sections, errors
 
 
 def _consolidate_completed_tasks(
@@ -300,26 +524,29 @@ def _consolidate_completed_tasks(
     *,
     start: date,
     end: date,
-) -> tuple[list[tuple[str, list[str]]], list[str]]:
-    staff, staff_errors = _build_staff_oversight(tasks, start=start, end=end)
+    sent: list[GmailMessage] | None = None,
+    chat_lines: list[str] | None = None,
+) -> tuple[list[tuple[str, list[str]]], list[tuple[str, list[str]]], list[str]]:
+    staff_sections, staff_errors = _build_staff_sections(tasks, start=start, end=end)
 
-    if not tasks:
-        sections: list[tuple[str, list[str]]] = []
-        if staff:
-            sections.append(("Staff Oversight", staff))
-        return sections, staff_errors
+    blob = " ".join(_task_text(t) for t in tasks)
+    sent_blob = " ".join(_normalize_subject(m.subject).lower() for m in (sent or []))
+    chat_blob = " ".join((chat_lines or [])).lower()
+    combined = f"{blob} {sent_blob} {chat_blob}"
 
     campaigns: list[str] = []
-    if any(k in " ".join(_task_text(t) for t in tasks) for k in ("women", "zigi", "solstice", "ad campaign")):
+    if any(k in combined for k in ("women", "zigi", "solstice", "ad campaign")):
         campaigns.append(
-            "Women's health + Summer Solstice prep — asset rankings to Zigi Media, "
-            "ad campaign clarification, Solstice creative briefed internally"
+            "Women's health + Solstice — Zigi asset rankings shared, ad scope clarified with Kim"
+        )
+    if any(k in combined for k in ("world cup", "50% off", "hydration and hang over", "wellness iv")):
+        campaigns.append(
+            "World Cup 50% IV offer — landing page live, sandwich board + group GIF approved, staff FB post out"
         )
 
     seo: list[str] = []
-    blob = " ".join(_task_text(t) for t in tasks)
     if "search optimization" in blob or "supplement store" in blob:
-        seo.append("Supplement store SEO program — project sheet, Monday board, contractor authorized")
+        seo.append("Supplement store SEO — project sheet, Monday board, contractor authorized")
     if "referral" in blob and "npi" in blob:
         seo.append("Referral page updated with current providers and NPI numbers")
     if "indexed" in blob or "search console" in blob:
@@ -332,65 +559,62 @@ def _consolidate_completed_tasks(
         vendor.append("Subscription renewal token failures triaged with tech support (16 tokens)")
 
     print_items: list[str] = []
-    blob = " ".join(_task_text(t) for t in tasks)
     if "welcome packet" in blob or "meet the team" in blob:
-        print_items.append("Welcome packet Meet the Team update sent to print")
+        print_items.append("Welcome packet Meet the Team update to print")
     if any(k in blob for k in ("concierge", "wellness iv menu", "tamer")):
-        print_items.append(
-            "Concierge welcome cards, Wellness IV menu, and Tamer Khafagy business cards ordered"
-        )
+        print_items.append("Concierge cards, Wellness IV menu, and Tamer Khafagy business cards ordered")
     if "sandwich board" in blob:
-        print_items.append("Boylston sandwich boards finalized — functional medicine + HBOT/Wellness IV")
+        print_items.append("Boylston sandwich boards — functional medicine + HBOT/Wellness IV")
 
     sections: list[tuple[str, list[str]]] = []
     if campaigns:
         sections.append(("Campaigns", campaigns))
+
+    operational_work_groups = _group_completed_tasks(
+        [t for t in tasks if not _is_zonia_activity(_task_text(t))]
+    )
+
+    sections.extend(staff_sections)
     if seo:
         sections.append(("SEO & Web", seo))
     if vendor:
         sections.append(("Vendor / Tech Ops", vendor))
-    if staff:
-        sections.append(("Staff Oversight", staff))
     if print_items:
         sections.append(("Print & Collateral", print_items))
-    return sections, staff_errors
+    return sections, operational_work_groups, staff_errors
 
 
 def _detect_milestones(
     sent: list[GmailMessage],
     tasks: list[CompletedTask],
+    *,
+    chat_lines: list[str] | None = None,
 ) -> list[tuple[str, str]]:
     subjects = " ".join(_normalize_subject(m.subject).lower() for m in sent)
     task_blob = " ".join(_task_text(t) for t in tasks)
-    combined = f"{subjects} {task_blob}"
+    chat_blob = " ".join(chat_lines or []).lower()
+    combined = f"{subjects} {task_blob} {chat_blob}"
     milestones: list[tuple[str, str]] = []
 
     if any(k in combined for k in ("women", "zigi", "top 10", "ad campaign", "clarification on ad")):
         milestones.append(
             (
-                "Women's health campaign aligned with Zigi Media",
-                "Top 10 posts + asset rankings shared; ad scope and asset inventory clarified with Kim. Late-June launch.",
+                "Women's health campaign aligned with Zigi",
+                "Top 10 posts + asset rankings shared; ad scope locked with Kim.",
             )
         )
     if any(k in combined for k in ("seo", "search optimization", "danieltkseo", "supplement store")):
         milestones.append(
             (
                 "SEO supplement store program kicked off",
-                "Project sheet + Monday board; plan shared with Danil; payment terms agreed; work authorized.",
+                "Project sheet + Monday board; Danil briefed; work authorized.",
             )
         )
     if any(k in combined for k in ("week in review", "week in review", "benefits", "ideal patient", "predictable profits")):
         milestones.append(
             (
-                "Executive reporting & strategic positioning",
-                "Week In Review to Ed; Benefits/Promise framework + Ideal Patient profile to Predictable Profits.",
-            )
-        )
-    if "immune for life" in combined or "zonia" in combined:
-        milestones.append(
-            (
-                'Zonia "Immune for Life" partnership confirmed',
-                "Five Journeys in for August campaign.",
+                "Executive reporting & positioning",
+                "Week In Review to Ed; Benefits framework + Ideal Patient profile to Predictable Profits.",
             )
         )
     if any(
@@ -399,12 +623,18 @@ def _detect_milestones(
     ):
         milestones.append(
             (
-                "COO ops initiative + integration scoping",
-                "Operational priorities with Michelle; GHL duplicate-entry audit launched; "
-                "AthenaNet/Zenoti/GHL plan scoped and timeline pushed back.",
+                "COO ops + integration scoping",
+                "Ops priorities with Michelle; GHL duplicate-entry audit; AthenaNet/Zenoti/GHL plan scoped.",
             )
         )
-    return milestones[:5]
+    if any(k in combined for k in ("world cup", "50% off", "hydration and hang over")):
+        milestones.append(
+            (
+                "World Cup IV promo live",
+                "50% off Hydration & Hangover IVs — sandwich board, group GIF, All Staff FB post.",
+            )
+        )
+    return milestones[:6]
 
 
 def _build_net_read(
@@ -414,35 +644,106 @@ def _build_net_read(
     tasks: list[CompletedTask],
     milestones: list[tuple[str, str]],
 ) -> str:
-    themes: list[str] = []
+    work_items: list[str] = []
     blob = " ".join(title.lower() for title, _ in milestones)
-    if "women" in blob or "zigi" in blob:
-        themes.append("campaign prep (women's health, Solstice)")
+    if "world cup" in blob:
+        work_items.append("the World Cup 50% IV offer")
     if "seo" in blob:
-        themes.append("SEO launch")
+        work_items.append("supplement store SEO")
+    if "women" in blob or "zigi" in blob:
+        work_items.append("women's health and Solstice campaign prep")
     if any("print" in _task_text(t) or "sandwich" in _task_text(t) for t in tasks):
-        themes.append("print/collateral production")
+        work_items.append("print and collateral production")
     if "coo" in blob or "integration" in blob:
-        themes.append("COO-level ops")
+        work_items.append("COO-level integration scoping")
 
-    theme_text = ", ".join(themes) if themes else "email and task throughput"
-    task_days = {t.completed_date for t in tasks}
-    email_note = ""
-    if sent_count >= 30 and len(task_days) >= 3:
-        email_note = " Early days were email-driven; task completions ramped later in the period."
+    if len(work_items) >= 2:
+        work_phrase = ", ".join(work_items[:-1]) + f", and {work_items[-1]}"
+    elif work_items:
+        work_phrase = work_items[0]
+    else:
+        work_phrase = "campaign, content, and operational work"
+
+    task_count = len(tasks)
+    task_days = len({t.completed_date for t in tasks})
+
+    sentences: list[str] = [
+        f"This was a heavy week spanning {work_phrase}.",
+        (
+            f"We closed {task_count} Google Tasks across {task_days} days, sent {sent_count} "
+            f"outbound emails, and cleared a strong batch of creative reviews and approvals "
+            f"for Je, Sam, and Voltaire."
+        ),
+    ]
+
+    if sent_count >= 30 and task_days >= 3:
+        sentences.append(
+            "The first half of the week was email-driven; task completions and Monday "
+            "sign-offs stacked up in the back half."
+        )
     elif sent_count >= 20:
-        email_note = " Outbound email carried momentum; task completions stacked mid-to-late week."
+        sentences.append(
+            "Outbound email set the pace early; operational tasks and approvals closed "
+            "through the rest of the week."
+        )
 
-    inbox_note = f" Inbox stayed clean ({inbox_count} promo{'s' if inbox_count != 1 else ''} only)." if inbox_count <= 3 else ""
+    if inbox_count <= 3:
+        sentences.append(f"Inbox stayed clean ({inbox_count} promo only).")
 
-    return (
-        f"Heavy week on {theme_text}.{email_note}{inbox_note}".strip()
-    )
+    return " ".join(sentences)
+
+
+def _fetch_chat_lines(*, start: date, end: date) -> tuple[list[str], str | None]:
+    op_reports = _PROJECT_ROOT / "Op Reports"
+    if str(op_reports) not in sys.path:
+        sys.path.insert(0, str(op_reports))
+    try:
+        from weekly_report_data import fetch_sent_chat_messages
+    except ImportError as exc:
+        return [], f"Google Chat import: {exc}"
+    try:
+        rows = fetch_sent_chat_messages(start, end)
+    except Exception as exc:
+        return [], f"Google Chat: {exc}"
+    return [row.text for row in rows], None
+
+
+def _consolidate_contact_sections(
+    sent: list[GmailMessage],
+    chat_lines: list[str],
+) -> list[tuple[str, list[str]]]:
+    """People-specific correspondence (email + chat)."""
+    sections: list[tuple[str, list[str]]] = []
+    amanda: list[str] = []
+
+    for msg in sent:
+        lower = f"{msg.subject} {msg.to_addrs} {msg.from_addr}".lower()
+        if not any(x in lower for x in ("vashon", "klotz", "aklotz@")):
+            continue
+        recipient = _first_recipient_name(msg.to_addrs)
+        day = _short_date(msg.date.date()) if msg.date else ""
+        amanda.append(
+            f"Email: {_normalize_subject(msg.subject)} → {recipient}"
+            + (f" ({day})" if day else "")
+        )
+
+    for text in chat_lines:
+        lower = text.lower()
+        if "amanda" not in lower and "welcome packet" not in lower:
+            continue
+        snippet = text.replace("\n", " ").strip()[:180]
+        amanda.append(f"Chat: {snippet}")
+
+    if amanda:
+        sections.append(("Amanda Vashon (Klotz)", _dedupe_lines(amanda)))
+    return sections
 
 
 def _consolidate_other_email(
     sent: list[GmailMessage],
     milestones: list[tuple[str, str]],
+    *,
+    tasks: list[CompletedTask] | None = None,
 ) -> list[tuple[str, list[str]]]:
     milestone_subjects = " ".join(_normalize_subject(m.subject).lower() for m in sent)
     _ = milestone_subjects  # used implicitly via skip patterns below
@@ -456,7 +757,6 @@ def _consolidate_other_email(
         "week in review",
         "operational priorities and workflow improvements",
         "five journeys benefits flashed out",
-        "immune for life is back this august",
         "top 10 women's health posts",
         "clarification on ad campaigns",
         "seo",
@@ -468,6 +768,8 @@ def _consolidate_other_email(
         key = subject.casefold()
         if key in seen or key in skip_subjects or _SKIP_EMAIL_SUBJECT_RE.search(subject):
             continue
+        if not _is_results_oriented_email(subject, msg.snippet or ""):
+            continue
         if _first_email(msg.from_addr) == _first_email(msg.to_addrs) and "test" in key:
             continue
         seen.add(key)
@@ -476,6 +778,11 @@ def _consolidate_other_email(
         addr = _first_email(msg.to_addrs)
         line = f"{subject} → {recipient}"
         lower = f"{subject} {addr}".lower()
+
+        if any(x in lower for x in ("vashon", "klotz", "aklotz@")):
+            continue
+        if any(x in lower for x in ("world cup", "50% off of ivs")):
+            continue
 
         if any(x in lower for x in ("pupka", "levitan", "elevitan", "athena", "jbentley", "insurance")):
             if "operational priorities" in lower:
@@ -497,6 +804,9 @@ def _consolidate_other_email(
             vendor.append(line)
         elif "qt scan" in lower:
             vendor.append(f"QT Scan availability inquiry answered (launch delay) → {recipient}")
+
+    vendor.extend(_zonia_vendor_bullets(tasks or [], sent))
+    vendor = _dedupe_lines(vendor)
 
     sections: list[tuple[str, list[str]]] = []
     if leadership:
@@ -541,8 +851,18 @@ def load_activity_summary_report(
     except Exception as exc:
         errors.append(f"Google Tasks: {exc}")
 
-    milestones = _detect_milestones(sent, tasks)
-    completed_sections, staff_errors = _consolidate_completed_tasks(tasks, start=start, end=end)
+    chat_lines, chat_err = _fetch_chat_lines(start=start, end=end)
+    if chat_err:
+        errors.append(chat_err)
+
+    milestones = _detect_milestones(sent, tasks, chat_lines=chat_lines)
+    completed_sections, operational_work_groups, staff_errors = _consolidate_completed_tasks(
+        tasks,
+        start=start,
+        end=end,
+        sent=sent,
+        chat_lines=chat_lines,
+    )
     errors.extend(staff_errors)
     net_read = _build_net_read(
         sent_count=len(sent),
@@ -550,7 +870,16 @@ def load_activity_summary_report(
         tasks=tasks,
         milestones=milestones,
     )
-    meta_line = f"{len(sent)} sent · {len(tasks)} tasks completed · {len(milestones)} milestones"
+    meta_bits = [
+        f"{len(sent)} sent",
+        f"{len(tasks)} tasks completed",
+        f"{len(chat_lines)} chat messages",
+        f"{len(milestones)} milestones",
+    ]
+    meta_line = " · ".join(meta_bits)
+
+    email_sections = _consolidate_other_email(sent, milestones, tasks=tasks)
+    email_sections.extend(_consolidate_contact_sections(sent, chat_lines))
 
     return ActivitySummaryReport(
         period_start=start,
@@ -559,7 +888,8 @@ def load_activity_summary_report(
         meta_line=meta_line,
         milestones=milestones,
         completed_sections=completed_sections,
-        email_sections=_consolidate_other_email(sent, milestones),
+        email_sections=email_sections,
+        operational_work_groups=operational_work_groups,
         errors=errors,
     )
 
@@ -592,6 +922,13 @@ def render_activity_summary_html(report: ActivitySummaryReport) -> str:
     for section_title, bullets in report.completed_sections:
         completed_html += f"<h3>{html.escape(section_title)}</h3>\n{_bullets(bullets)}\n"
 
+    if report.operational_work_groups:
+        completed_html += "<h3>Operational Work</h3>\n"
+        for sub_title, bullets in report.operational_work_groups:
+            completed_html += (
+                f"<h4>{html.escape(sub_title)}</h4>\n{_bullets(bullets)}\n"
+            )
+
     email_html = ""
     for section_title, bullets in report.email_sections:
         email_html += f"<h3>{html.escape(section_title)}</h3>\n{_bullets(bullets)}\n"
@@ -610,6 +947,7 @@ body {{ font-family: Arial, sans-serif; font-size: 10pt; margin: 16px; line-heig
 h1 {{ font-size: 12pt; font-weight: bold; margin: 0 0 8px 0; }}
 h2 {{ font-size: 11pt; font-weight: bold; margin: 16px 0 6px 0; }}
 h3 {{ font-size: 10pt; font-weight: bold; margin: 10px 0 4px 0; }}
+h4 {{ font-size: 10pt; font-weight: bold; margin: 8px 0 3px 0; color: #444; }}
 .net-read {{ margin: 0 0 14px 0; }}
 .meta {{ margin-bottom: 12px; color: #444; }}
 ul {{ margin: 0 0 8px 0; padding-left: 20px; }}

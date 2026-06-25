@@ -74,6 +74,7 @@ class WeeklyInReviewEmail:
     funnel_snapshot: WorkWeekSnapshot
     ops_sections: list[tuple[str, list[str]]]
     vendor_lines: list[str]
+    operational_work_groups: list[tuple[str, list[str]]] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
 
 
@@ -126,46 +127,55 @@ def _find_source(rows: list[SourceDeltaRow], *names: str) -> SourceDeltaRow | No
 
 def _funnel_one_liner(snap: WorkWeekSnapshot) -> str:
     nc_chg = pct_label(snap.new_contacts, snap.prior_new_contacts)
-    paid_chg = pct_label(snap.paid_current.combined_leads, snap.paid_prior.combined_leads)
     spend_chg = pct_label(snap.paid_current.spend, snap.paid_prior.spend)
+    paid_chg = pct_label(snap.paid_current.combined_leads, snap.paid_prior.combined_leads)
     wom_meet = _find_source(snap.meetings_by_source, "WOM", "Word of mouth")
-    wom_sig = _find_source(snap.signups_by_source, "WOM", "Word of mouth")
-    google_sig = _find_source(snap.signups_by_source, "Google")
+    organic = _find_source(snap.sessions_by_channel, "Organic Search")
+
+    growth_stages = sum(
+        [
+            snap.new_contacts > snap.prior_new_contacts,
+            snap.paid_current.combined_leads > snap.paid_prior.combined_leads,
+            snap.meetings > snap.prior_meetings,
+            snap.signups_all > snap.prior_signups_all,
+        ]
+    )
 
     parts: list[str] = []
-    if snap.new_contacts >= snap.prior_new_contacts:
+    if growth_stages >= 3:
         parts.append(
-            f"More people entered the funnel ({nc_chg} new contacts) and paid leads "
-            f"{'held' if abs(snap.paid_current.combined_leads - snap.paid_prior.combined_leads) <= 3 else 'moved'} "
-            f"on {spend_chg} spend"
+            f"Funnel mostly up WoW — contacts {nc_chg}, paid leads {paid_chg}, "
+            f"meetings {pct_label(snap.meetings, snap.prior_meetings)}, "
+            f"signups {pct_label(snap.signups_all, snap.prior_signups_all)} "
+            f"on {spend_chg} spend."
+        )
+    elif snap.new_contacts >= snap.prior_new_contacts:
+        parts.append(
+            f"Contacts {nc_chg}; paid leads {paid_chg} on {spend_chg} spend."
         )
     else:
         parts.append(
-            f"New contacts {snap.new_contacts:,} ({nc_chg} vs prior) with paid leads "
+            f"Contacts {snap.new_contacts:,} ({nc_chg}); paid leads "
             f"{snap.paid_current.combined_leads:.0f} ({paid_chg})."
         )
 
     if wom_meet and wom_meet.delta < 0:
-        wom_pct = pct_label(wom_meet.current, wom_meet.prior)
         parts.append(
-            f"but WOM meeting volume fell hard ({wom_pct}), pulling signups down "
-            f"({pct_label(snap.signups_all, snap.prior_signups_all)})."
+            f"WOM meetings down {pct_label(wom_meet.current, wom_meet.prior)} — dragging signups."
         )
     elif snap.signups_all < snap.prior_signups_all:
-        parts.append(
-            f"Signups softened ({pct_label(snap.signups_all, snap.prior_signups_all)})."
-        )
-
-    if google_sig and google_sig.delta >= 0:
-        parts.append(
-            "Google is the one channel holding or improving across meetings and signups."
-        )
+        parts.append(f"Signups down {pct_label(snap.signups_all, snap.prior_signups_all)}.")
 
     if snap.bookings < snap.prior_bookings:
-        parts.append(
-            f"Bookings declined ({pct_label(snap.bookings, snap.prior_bookings)}) on a "
-            f"similar WOM pattern but less severely than downstream conversion."
-        )
+        if organic and organic.delta < 0:
+            parts.append(
+                f"Bookings {pct_label(snap.bookings, snap.prior_bookings)}; organic sessions "
+                f"{pct_label(organic.current, organic.prior)}. Top-of-funnel softness, not conversion."
+            )
+        else:
+            parts.append(
+                f"Bookings {pct_label(snap.bookings, snap.prior_bookings)} despite growth elsewhere."
+            )
     return " ".join(parts)
 
 
@@ -191,8 +201,19 @@ def _summary_bullets(snap: WorkWeekSnapshot, pulse_blocks: dict[str, list[str]])
 
     if snap.paid_current.spend < snap.paid_prior.spend and snap.paid_current.combined_leads >= snap.paid_prior.combined_leads * 0.9:
         bullets.append(
-            "Paid is doing more with less. Lead volume held despite lower spend. "
-            "This is not a paid-media collapse — it's a downstream conversion issue."
+            "Paid is doing more with less — lead volume held despite lower spend."
+        )
+
+    organic = _find_source(snap.sessions_by_channel, "Organic Search")
+    if (
+        snap.bookings < snap.prior_bookings
+        and organic
+        and organic.delta < 0
+        and not any("organic" in b.casefold() for b in bullets)
+    ):
+        bullets.append(
+            f"Organic search {pct_label(organic.current, organic.prior)} "
+            f"({organic.prior:,} → {organic.current:,}) — watch volume into July."
         )
 
     for block in pulse_blocks.get("What needs attention", []):
@@ -207,33 +228,94 @@ def _auto_funnel_narrative(
     pulse_exec: str,
     interpretation: list[str],
 ) -> str:
-    interp_text = " ".join(
-        _strip_md_bold(re.sub(r"^[-*]\s*", "", line))
-        for line in interpretation
-        if line.strip() and not line.startswith("**") or line.startswith("- ")
+    organic = _find_source(snap.sessions_by_channel, "Organic Search")
+    growth_stages = sum(
+        [
+            snap.new_contacts > snap.prior_new_contacts,
+            snap.paid_current.combined_leads > snap.paid_prior.combined_leads,
+            snap.meetings > snap.prior_meetings,
+            snap.signups_all > snap.prior_signups_all,
+        ]
     )
-    intro = (
-        "There are signs of softening at the bottom of the funnel, mainly driven by "
-        "WOM underperformance, while the top of the funnel remains relatively strong."
-    )
-    if snap.new_contacts > snap.prior_new_contacts:
-        intro = (
-            "New contacts grew week-over-week, but conversion efficiency slipped downstream — "
-            "the softening is concentrated in WOM and close rates, not paid lead volume."
+    bookings_down = snap.bookings < snap.prior_bookings
+    bookings_flat = snap.bookings == snap.prior_bookings
+
+    nc = pct_label(snap.new_contacts, snap.prior_new_contacts)
+    paid = pct_label(snap.paid_current.combined_leads, snap.paid_prior.combined_leads)
+    meet = pct_label(snap.meetings, snap.prior_meetings)
+    sig = pct_label(snap.signups_all, snap.prior_signups_all)
+    book = pct_label(snap.bookings, snap.prior_bookings)
+    spend = pct_label(snap.paid_current.spend, snap.paid_prior.spend)
+
+    sentences: list[str] = []
+
+    if growth_stages >= 3:
+        sentences.append(
+            f"This was a constructive week through most of the funnel. New contacts ({nc}), "
+            f"paid leads ({paid}), meetings ({meet}), and signups ({sig}) all grew week over "
+            f"week on {spend} ad spend."
+        )
+    elif snap.new_contacts >= snap.prior_new_contacts:
+        sentences.append(
+            f"New contacts grew ({nc}) and paid leads moved ({paid}) on {spend} spend, "
+            f"but downstream stages were mixed."
+        )
+    else:
+        sentences.append(
+            f"The funnel softened week over week, with bookings ({book}) and new contacts "
+            f"({nc}) both under pressure."
         )
 
-    action = (
-        "I will likely need to increase budget on the already well-performing Google channel "
-        "to compensate for drag in other channels through the summer."
-    )
-    if "June gloom" in pulse_exec:
-        action = (
-            "June seasonality is real — consider a modest Google ad test alongside WOM and "
-            "mid-funnel fixes rather than overreacting to a single soft week."
+    if bookings_down:
+        sentences.append(
+            f"Bookings fell to {snap.bookings:,} ({book}). That looks more like a lag from "
+            f"softer top-of-funnel traffic than a mid-funnel conversion breakdown."
+        )
+    elif bookings_flat and growth_stages >= 2:
+        sentences.append(
+            f"Bookings held flat at {snap.bookings:,} ({book}), which usually trails traffic "
+            f"by one to two weeks rather than reflecting this week's funnel activity."
+        )
+    elif growth_stages >= 2:
+        sentences.append(
+            f"Bookings came in at {snap.bookings:,} ({book}), so mid-funnel conversion appears "
+            f"to be holding even as more volume moves through the pipeline."
         )
 
-    body = interp_text[:600] if interp_text else intro
-    return f"{intro} {body} {action}"
+    organic_soft = (
+        organic
+        and organic.prior > 0
+        and (organic.delta <= -40 or organic.current / organic.prior <= 0.97)
+    )
+    organic_strong = organic and organic.prior > 0 and organic.delta >= 50
+
+    if organic_soft:
+        sentences.append(
+            f"Organic search eased to {organic.current:,} sessions from {organic.prior:,} "
+            f"({pct_label(organic.current, organic.prior)}) — watch that trend weekly; "
+            f"traffic is the leading indicator for bookings."
+        )
+    elif organic_strong:
+        sentences.append(
+            f"Organic search strengthened ({pct_label(organic.current, organic.prior)}), "
+            f"which should support bookings over the next one to two weeks if the trend holds."
+        )
+    elif bookings_down or growth_stages >= 2:
+        sentences.append(
+            "Heading into July, the priority is building traffic and awareness at the top of "
+            "the pipeline rather than tuning mid-funnel mechanics."
+        )
+
+    if "June gloom" in pulse_exec and len(sentences) < 3:
+        sentences.append(
+            "June is historically our slowest month, so read the data in that context before "
+            "making sharp changes."
+        )
+
+    text = " ".join(sentences[:3])
+    if len(text.split()) > 78:
+        text = " ".join(sentences[:2])
+    return text
 
 
 def _cross_period_lines(snap: WorkWeekSnapshot) -> list[str]:
@@ -261,22 +343,35 @@ def _stage_direction_table(snap: WorkWeekSnapshot) -> list[tuple[str, str, str]]
 
     meet_dir = "Down" if snap.meetings < snap.prior_meetings else "Up"
     meet_driver = (
-        f"WOM collapse ({wom_meet.delta:+} meetings)"
+        f"WOM ({wom_meet.delta:+} meetings)"
         if wom_meet and wom_meet.delta < 0
         else "Mixed by source"
     )
     rows.append(("Meetings", meet_dir, meet_driver))
 
     sig_dir = "Down" if snap.signups_all < snap.prior_signups_all else "Up"
-    rows.append(("Sign Ups", sig_dir, "WOM + close-rate slip; Google held"))
+    wom_sig = _find_source(snap.signups_by_source, "WOM", "Word of mouth")
+    if snap.signups_all >= snap.prior_signups_all:
+        sig_driver = "Volume up across sources"
+    elif wom_sig and wom_sig.delta < 0:
+        sig_driver = f"WOM signups ({wom_sig.delta:+})"
+    else:
+        sig_driver = "Mixed by source"
+    rows.append(("Sign Ups", sig_dir, sig_driver))
 
     book_dir = "Down" if snap.bookings < snap.prior_bookings else "Up"
-    wom_book = _find_source(snap.bookings_by_source, "WOM", "Word of mouth")
-    book_driver = (
-        f"WOM ({wom_book.delta:+}); less severe than meetings/signups"
-        if wom_book and wom_book.delta < 0
-        else "Mixed by source"
-    )
+    organic = _find_source(snap.sessions_by_channel, "Organic Search")
+    if book_dir == "Down" and organic and organic.delta < 0:
+        book_driver = (
+            f"Organic traffic softer ({organic.delta:+,} sessions); bookings lag traffic"
+        )
+    else:
+        wom_book = _find_source(snap.bookings_by_source, "WOM", "Word of mouth")
+        book_driver = (
+            f"WOM ({wom_book.delta:+})"
+            if wom_book and wom_book.delta < 0
+            else "Mixed by source"
+        )
     rows.append(("Bookings", book_dir, book_driver))
     return rows
 
@@ -416,17 +511,14 @@ def load_weekly_in_review_email(
         next_week = rec_block[:3]
 
     ops_sections: list[tuple[str, list[str]]] = []
+    operational_work_groups: list[tuple[str, list[str]]] = []
     if activity:
         ops_sections.extend(activity.completed_sections)
+        ops_sections.extend(activity.email_sections)
+        operational_work_groups = list(activity.operational_work_groups)
     ops_sections.extend(notes.extra_ops)
 
-    vendor_lines: list[str] = []
-    if activity:
-        for title, bullets in activity.email_sections:
-            if "vendor" in title.lower() or "partner" in title.lower():
-                vendor_lines.extend(bullets)
-
-    ops_sections, vendor_lines = _merge_vendor_sections(ops_sections, vendor_lines)
+    ops_sections, vendor_lines = _merge_vendor_sections(ops_sections, [])
 
     return WeeklyInReviewEmail(
         period_start=start,
@@ -440,9 +532,20 @@ def load_weekly_in_review_email(
         next_week=next_week,
         funnel_snapshot=funnel,
         ops_sections=ops_sections,
+        operational_work_groups=operational_work_groups,
         vendor_lines=vendor_lines,
         errors=errors,
     )
+
+
+def _render_operational_work_html(groups: list[tuple[str, list[str]]]) -> str:
+    if not groups:
+        return ""
+    parts = ["<h3>Operational Work</h3>"]
+    for sub_title, bullets in groups:
+        items = "".join(f"<li>{html.escape(b)}</li>" for b in bullets)
+        parts.append(f"<h4>{html.escape(sub_title)}</h4><ul>{items}</ul>")
+    return "".join(parts)
 
 
 def _html_table(headers: list[str], rows: list[list[str]]) -> str:
@@ -667,9 +770,15 @@ def render_weekly_in_review_html(report: WeeklyInReviewEmail) -> str:
     )
 
     ops_html = ""
+    has_campaigns = any(title.casefold() == "campaigns" for title, _ in report.ops_sections)
     for section_title, bullets in report.ops_sections:
         items = "".join(f"<li>{html.escape(b)}</li>" for b in bullets)
         ops_html += f"<h3>{html.escape(section_title)}</h3><ul>{items}</ul>"
+        if section_title.casefold() == "campaigns" and report.operational_work_groups:
+            ops_html += _render_operational_work_html(report.operational_work_groups)
+
+    if report.operational_work_groups and not has_campaigns:
+        ops_html = _render_operational_work_html(report.operational_work_groups) + ops_html
 
     if report.vendor_lines:
         items = "".join(f"<li>{html.escape(b)}</li>" for b in report.vendor_lines)
@@ -688,6 +797,7 @@ def render_weekly_in_review_html(report: WeeklyInReviewEmail) -> str:
 body {{ font-family: Arial, sans-serif; font-size: 10pt; margin: 16px; line-height: 1.45; color: #222; max-width: 720px; }}
 h2 {{ font-size: 11pt; font-weight: bold; margin: 18px 0 8px 0; border-bottom: 1px solid #ccc; padding-bottom: 4px; }}
 h3 {{ font-size: 10pt; font-weight: bold; margin: 14px 0 6px 0; }}
+h4 {{ font-size: 10pt; font-weight: bold; margin: 10px 0 4px 0; color: #444; }}
 p {{ margin: 0 0 10px 0; }}
 ul {{ margin: 0 0 10px 0; padding-left: 20px; }}
 li {{ margin-bottom: 4px; }}
@@ -747,6 +857,12 @@ def write_weekly_in_review_email(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Unified weekly in-review email report")
     parser.add_argument(
+        "--start",
+        type=str,
+        default="",
+        help="Period start YYYY-MM-DD (default: Sunday on or before --end)",
+    )
+    parser.add_argument(
         "--end",
         type=str,
         default="",
@@ -762,8 +878,11 @@ def main() -> None:
     parser.add_argument("--output-dir", type=str, default="")
     args = parser.parse_args()
 
-    end_date = date.fromisoformat(args.end) if args.end else default_end_date()
-    start, end = sunday_friday_range(end=end_date)
+    end = date.fromisoformat(args.end) if args.end else default_end_date()
+    if args.start:
+        start = date.fromisoformat(args.start)
+    else:
+        start, end = sunday_friday_range(end=end)
 
     notes = NotesSections()
     if args.notes_file:

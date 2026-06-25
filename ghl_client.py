@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 # Bump when hear-about normalization or fetch helpers change (war_room_data reloads).
-GHL_CLIENT_REVISION = "2026-06-24-deleted-calendar-skip-v1"
+GHL_CLIENT_REVISION = "2026-06-24-calendar-meetings-monthly-v1"
 
 import os
 import time
@@ -2882,6 +2882,49 @@ def fetch_bookings_and_meetings_by_hear_about_us(
         "unique_contacts": len(contact_cache),
         "bookings": bookings,
         "meetings": meetings,
+    }
+
+
+def fetch_calendar_meetings_monthly_by_start_time(
+    since: str,
+    until: str,
+    *,
+    location_id: str | None = None,
+) -> dict[str, Any]:
+    """
+    Org-wide calendar **meetings** (``startTime`` in range), rolled up by month.
+
+    Counts all non-deleted calendar events whose meeting date falls in range —
+    same meeting definition as :func:`fetch_bookings_and_meetings_by_hear_about_us`.
+    """
+    allowed_days = _calendar_allowed_days(since, until)
+    events, api_errors = _fetch_calendar_events_deduped(
+        since, until, location_id=location_id
+    )
+    per_month: dict[str, int] = {}
+    for event in events:
+        day = _event_start_time_ymd(event)
+        if day not in allowed_days:
+            continue
+        per_month[day[:7]] = per_month.get(day[:7], 0) + 1
+
+    monthly: list[dict[str, Any]] = []
+    for month_start, month_label in _month_periods_inclusive(since, until):
+        ym = month_start[:7]
+        monthly.append(
+            {
+                "month_start": month_start,
+                "month_label": month_label,
+                "meetings": int(per_month.get(ym, 0)),
+            }
+        )
+
+    return {
+        "since": since,
+        "until": until,
+        "monthly": monthly,
+        "meetings_total": int(sum(per_month.values())),
+        "calendar_api_errors": api_errors,
     }
 
 

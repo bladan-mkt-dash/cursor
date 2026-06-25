@@ -14,6 +14,8 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+TRACKER_CHART_REVISION = "2026-06-24-bookings-row-v1"
+
 TOKEN_PATH = Path.home() / ".config" / "mcp-google-sheets" / "token.json"
 OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
 DEFAULT_SHEET = "Monthly Tracker"
@@ -284,6 +286,18 @@ def _find_calls_completed_row(sheets, spreadsheet_id: str, sheet_name: str) -> i
     raise SystemExit(f"Could not find Calls completed row in {spreadsheet_id}")
 
 
+def _find_bookings_all_booked_calls_row(
+    sheets, spreadsheet_id: str, sheet_name: str
+) -> int:
+    grid = _get_tracker_grid(sheets, spreadsheet_id, sheet_name)
+    for i in range(1, min(len(grid), 250) + 1):
+        if _grid_col_c_label(grid, i) == "Bookings (all booked calls)":
+            return i
+    raise SystemExit(
+        f"Could not find Bookings (all booked calls) row in {spreadsheet_id}"
+    )
+
+
 def _to_numeric(value: str) -> float | None:
     text = str(value).strip().replace(",", "")
     if not text or text in {"-", "N/A", "#N/A", "#DIV/0!"}:
@@ -353,6 +367,13 @@ def _load_calls_completed_year_series(
     sheets, spreadsheet_id: str, sheet_name: str, year: int
 ) -> pd.Series:
     row_num = _find_calls_completed_row(sheets, spreadsheet_id, sheet_name)
+    return _load_row_year_series(sheets, spreadsheet_id, sheet_name, year, row_num)
+
+
+def _load_bookings_year_series(
+    sheets, spreadsheet_id: str, sheet_name: str, year: int
+) -> pd.Series:
+    row_num = _find_bookings_all_booked_calls_row(sheets, spreadsheet_id, sheet_name)
     return _load_row_year_series(sheets, spreadsheet_id, sheet_name, year, row_num)
 
 

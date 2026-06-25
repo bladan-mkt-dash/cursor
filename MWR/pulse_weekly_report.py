@@ -300,20 +300,21 @@ def load_pulse_weekly_report(*, end: date | None = None) -> PulseWeeklyReport:
         )
 
     recommendations_bullets = [
+        "Push organic: 2+ SEO/blog posts + IG tied to top search terms.",
         (
-            f"Test ~10–15% ad bump (~$200–300/wk) on Google at {cpa_display} CPA — "
-            "2-week trial; judge on bookings."
+            f"Test ~10–15% Google ad bump (~$200–300/wk) at {cpa_display} CPA — "
+            "2-week trial, judge on bookings."
         ),
-        "Pair spend with free levers: WOM/referral push + Summer Solstice Sale (Jun 20–21).",
-        "Mid-funnel first: show-rate, same-day follow-up, no-show recovery — target 28+ signups/wk.",
+        "Shore up top-of-funnel before July — traffic first, not mid-funnel fixes.",
         "5+ IG posts tied to top SEO/blog content.",
-        'Tighten GHL hear-about field — reduce "(Not set)" before scaling spend.',
+        'Tighten GHL hear-about field — cut "(Not set)" before scaling spend.',
     ]
 
     executive = (
         f"Marketing Pulse · week ending {period_end.strftime('%B %d')}. "
         f"Bookings {_fmt_count(snap.bookings)} ({bookings_chg or 'steady'}). "
-        f"June gloom is real — consider a modest ad test alongside WOM and mid-funnel fixes."
+        "When bookings lag while other stages hold, look upstream — organic traffic and "
+        "awareness before mid-funnel tweaks."
     )
 
     metric_line = (

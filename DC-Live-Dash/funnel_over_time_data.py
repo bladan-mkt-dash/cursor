@@ -9,6 +9,8 @@ Sources (no campaign attribution, no spend weighting):
   - **Signups** — Tracker **GRAND TOTAL New Members** (same as Signups Over Time).
 - From Sep 1, 2025 (after Aug 30): GoHighLevel — new contacts (dateAdded),
   discovery-call meetings (calendar startTime), committed signups (Sign Up Date).
+- **Terminations** — Terminated Memberships 2023-2025 **Consolidated Data** tab
+  (Date of Termination), all months in range.
 """
 
 from __future__ import annotations
@@ -37,9 +39,12 @@ from ghl_client import (
 )
 
 # Bump when loader logic changes (Streamlit cache key).
-FUNNEL_OVER_TIME_REVISION = "2026-06-22-perf-shared-ghl-v1"
+FUNNEL_OVER_TIME_REVISION = "2026-06-25-consolidated-terminations-v1"
 
-_FUNNEL_COLUMNS = ("month", "leads", "dcs", "signups", "source")
+_TERMINATIONS_SPREADSHEET_ID = "18fDtd3xEHHXC6sCeRFFadSwcshk4SJqFUG6aV006DhU"
+_TERMINATIONS_SHEET = "Consolidated Data"
+
+_FUNNEL_COLUMNS = ("month", "leads", "dcs", "terminations", "signups", "source")
 
 
 def _month_range(since: str, until: str) -> list[pd.Timestamp]:
@@ -157,6 +162,7 @@ def load_sheet_funnel_monthly(
                 "month": month,
                 "leads": leads,
                 "dcs": dcs,
+                "terminations": 0.0,
                 "signups": signups,
                 "source": "hubspot+tracker",
             }
@@ -346,11 +352,51 @@ def load_ghl_funnel_monthly(
                 "month": month,
                 "leads": float(leads_by_month.get(month, 0)),
                 "dcs": float(dcs_by_month.get(month, 0)),
+                "terminations": 0.0,
                 "signups": float(signups_by_month.get(month, 0)),
                 "source": "ghl",
             }
         )
     return pd.DataFrame(rows), notes
+
+
+def load_consolidated_terminations_monthly(
+    since: str,
+    until: str,
+) -> tuple[dict[pd.Timestamp, int], list[str]]:
+    """
+    Monthly termination counts from **Consolidated Data** (Date of Termination).
+    """
+    from acquisition_retention_data import load_consolidated_by_name
+
+    since_day = pd.Timestamp(since).date()
+    until_day = pd.Timestamp(until).date()
+    since_month = pd.Timestamp(since).to_period("M").to_timestamp()
+    until_month = pd.Timestamp(until).to_period("M").to_timestamp()
+
+    try:
+        consolidated = load_consolidated_by_name()
+    except Exception as exc:
+        return {}, [f"Terminations skipped: {exc}"]
+
+    by_month: dict[pd.Timestamp, int] = {}
+    for row in consolidated.values():
+        term_day = row.get("termination_date")
+        if term_day is None:
+            continue
+        if term_day < since_day or term_day > until_day:
+            continue
+        month = pd.Timestamp(term_day).to_period("M").to_timestamp()
+        if month < since_month or month > until_month:
+            continue
+        by_month[month] = by_month.get(month, 0) + 1
+
+    total = sum(by_month.values())
+    notes = [
+        f"Terminations: {total:,} from **Terminated Memberships 2023-2025** "
+        f"**{_TERMINATIONS_SHEET}** tab (Date of Termination, {since} → {until})."
+    ]
+    return by_month, notes
 
 
 def load_funnel_over_time(
@@ -365,7 +411,7 @@ def load_funnel_over_time(
     Stitch pre-GHL months (through Aug 30, 2025) with GHL months (Sep 2025 onward).
 
     Returns one row per calendar month in range with columns:
-    month, leads, dcs, signups, source ('hubspot+tracker' | 'ghl').
+    month, leads, dcs, terminations, signups, source ('hubspot+tracker' | 'ghl').
 
     When ``ghl_*_by_month`` dicts are supplied (from :func:`load_live_campaign_data`),
     GHL API calls are skipped for the funnel chart.
@@ -386,28 +432,53 @@ def load_funnel_over_time(
     )
     notes.extend(ghl_notes)
 
-    if sheet_df.empty and ghl_df.empty:
+    term_by_month, term_notes = load_consolidated_terminations_monthly(since, until)
+    notes.extend(term_notes)
+
+    since_month = pd.Timestamp(since).to_period("M").to_timestamp()
+    until_month = pd.Timestamp(until).to_period("M").to_timestamp()
+
+    if sheet_df.empty and ghl_df.empty and not term_by_month:
         return _empty_funnel(), notes
 
     combined = pd.concat([sheet_df, ghl_df], ignore_index=True)
     combined = combined.sort_values("month").drop_duplicates(subset=["month"], keep="last")
     combined["month"] = pd.to_datetime(combined["month"])
 
-    since_month = pd.Timestamp(since).to_period("M").to_timestamp()
-    until_month = pd.Timestamp(until).to_period("M").to_timestamp()
-    combined = combined[
-        (combined["month"] >= since_month) & (combined["month"] <= until_month)
+    by_month: dict[pd.Timestamp, dict[str, Any]] = {}
+    for _, row in combined.iterrows():
+        month = pd.Timestamp(row["month"]).to_period("M").to_timestamp()
+        by_month[month] = row.to_dict()
+
+    rows: list[dict[str, Any]] = []
+    for month in _month_range(since, until):
+        existing = by_month.get(month, {})
+        rows.append(
+            {
+                "month": month,
+                "leads": float(existing.get("leads", 0.0)),
+                "dcs": float(existing.get("dcs", 0.0)),
+                "terminations": float(term_by_month.get(month, 0)),
+                "signups": float(existing.get("signups", 0.0)),
+                "source": existing.get("source", ""),
+            }
+        )
+
+    out = pd.DataFrame(rows)
+    out = out[
+        (out["month"] >= since_month) & (out["month"] <= until_month)
     ].copy()
 
-    for col in ("leads", "dcs", "signups"):
-        combined[col] = pd.to_numeric(combined[col], errors="coerce").fillna(0.0)
+    for col in ("leads", "dcs", "terminations", "signups"):
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
 
-    return combined[list(_FUNNEL_COLUMNS)], notes
+    return out[list(_FUNNEL_COLUMNS)], notes
 
 
 __all__ = [
     "FUNNEL_OVER_TIME_REVISION",
     "GHL_FUNNEL_SINCE",
+    "load_consolidated_terminations_monthly",
     "load_funnel_over_time",
     "load_sheet_funnel_monthly",
     "load_ghl_funnel_monthly",
