@@ -11,6 +11,7 @@ Open:
 from __future__ import annotations
 
 import importlib
+import html as html_module
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -47,7 +48,7 @@ if not hasattr(_tracker_chart_mod, "_load_row_year_series"):
 
 import digital_channel_live_data as _live_data_mod
 
-_EXPECTED_LIVE_DATA_REVISION = "2026-06-24-dc-calendar-audit-v1"
+_EXPECTED_LIVE_DATA_REVISION = "2026-06-24-hear-about-data-tab-signups-v1"
 if (
     getattr(_live_data_mod, "LIVE_DATA_REVISION", None)
     != _EXPECTED_LIVE_DATA_REVISION
@@ -104,6 +105,7 @@ from digital_channel_live_data import (
     GHL_ATTRIBUTION_HEAR_ABOUT,
     GHL_ATTRIBUTION_OPTIONS,
     GHL_ATTRIBUTION_TRACKER,
+    GHL_ATTRIBUTED_SIGNUPS_SINCE,
     GHL_SIGNUPS_SINCE,
     GHL_DCS_SINCE,
     LIVE_DATA_REVISION,
@@ -137,6 +139,10 @@ COLORS = {
     "2025": "#54A24B",
     "2026": "#B279A2",
     "muted": "#6B7C93",
+    "funnel_leads": "#7EC8E3",
+    "funnel_dcs": "#1E5FA8",
+    "funnel_signups": "#54A24B",
+    "funnel_terminations": "#D64545",
 }
 
 YEAR_BAR_COLORS = {
@@ -370,6 +376,241 @@ def _time_period_summary(
     return out, True
 
 
+def _help_paragraphs_html(*paragraphs: str) -> str:
+    """Build tooltip body from HTML paragraph strings."""
+    parts = [p.strip() for p in paragraphs if p and p.strip()]
+    return "".join(f"<p>{part}</p>" for part in parts)
+
+
+def _help_list_html(items: list[str]) -> str:
+    if not items:
+        return ""
+    lis = "".join(f"<li>{html_module.escape(item)}</li>" for item in items)
+    return f'<ul class="dash-help-list">{lis}</ul>'
+
+
+def _render_heading_with_help(
+    title: str,
+    tooltip_html: str,
+    *,
+    style: str = "section",
+    aria_label: str | None = None,
+) -> None:
+    """Render a heading with a hover/focus ? tooltip."""
+    styles: dict[str, tuple[str, str, str]] = {
+        "title": ("h1", "dash-title-row", "dash-title"),
+        "section": ("h2", "dash-section-row", "dash-section-heading"),
+        "subsection": ("h3", "dash-subsection-row", "dash-subsection-heading"),
+        "sidebar": ("h2", "dash-sidebar-row", "dash-sidebar-heading"),
+        "label": ("span", "dash-label-row", "dash-label-heading"),
+    }
+    tag, row_cls, head_cls = styles.get(style, styles["section"])
+    safe_title = html_module.escape(title)
+    safe_label = html_module.escape(aria_label or f"About {title}")
+    st.markdown(
+        f"""
+        <div class="{row_cls}">
+            <{tag} class="{head_cls}">{safe_title}</{tag}>
+            <span class="dash-help-wrap dash-help-wrap--{style}">
+                <button type="button" class="dash-help-btn" aria-label="{safe_label}">?</button>
+                <div class="dash-help-tooltip" role="tooltip">{tooltip_html}</div>
+            </span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _dashboard_methodology_tooltip_body() -> str:
+    """Consolidated methodology copy for the title help tooltip."""
+    return _help_paragraphs_html(
+        f"""Live data from <strong>Google Ads</strong>, <strong>Meta</strong>, and
+<strong>GoHighLevel</strong>. Leads through Jun 2025 use
+<strong>Digital Channel Dashboard 2024-25</strong> Data tab; later months use GHL
+new contacts (attributed + unallocated spread by spend, same approach as DCs).
+<strong>First load</strong> for a wide date range can take a minute while GHL lead
+data is pulled day-by-day (Jul 2025 onward only); <strong>repeat loads use disk
+cache</strong> and are much faster. Default view is the last
+<strong>{DEFAULT_DASHBOARD_MONTHS} months</strong> — widen the date range below for
+full history.""",
+        """<strong>Signups</strong> through Aug 2025: <strong>GRAND TOTAL New Members</strong>
+from Digital Cross-Channel Tracker sheets; from Sep 2025: GHL
+<strong>Committed?</strong> = Yes + <strong>Sign Up Date</strong>, with
+<strong>Membership Level</strong> slicer (sheet months ignore membership filter).""",
+        """Applies to the scorecard and trend charts (Spend, CPL, DCs, Signups). The
+<strong>funnel</strong> chart below stays org-wide.
+<strong>Signups by membership level</strong> charts use full history with their own
+year/quarter filters.""",
+    )
+
+
+def _filters_help_html() -> str:
+    return _help_paragraphs_html(
+        """Channel, campaign, asset type, FB/IG type, and membership level narrow the
+scorecard and trend charts (Spend, CPL, DCs, Signups). Membership level affects
+GHL signups from Sep 2025 onward.""",
+        """<strong>Non-paid inclusion</strong> — optional additions to paid metrics, not ad
+channels. <strong>Include Organic leads</strong> adds GHL contacts without Google/Meta
+attribution (blank hear-about, Word of Mouth, other non-paid values, or conflicts).
+Leads only — not signups. Not channel-filtered.""",
+        """<strong>GHL attribution (Sep 2025+)</strong> — <strong>How did you hear about us?</strong>
+maps self-reported Google / FB/IG responses. <strong>Tracker</strong> uses tag/pixel
+attribution. When both are checked, counts use deduped hear-about ∪ tracker (not
+double-counted). Optional toggles spread Word of Mouth or Other signups by spend share.""",
+    )
+
+
+def _refresh_help_html() -> str:
+    return _help_paragraphs_html(
+        """<strong>Design only</strong> — reload layout and styles using cached data (no API calls).""",
+        """<strong>Refresh data</strong> — reload Google Ads, Meta, and GoHighLevel while
+keeping cached GHL daily lead files.""",
+        """<strong>Hard refresh GHL leads</strong> — clear GHL daily lead cache first, then
+reload (use if lead counts look wrong).""",
+    )
+
+
+def _trends_over_time_help_html(
+    *,
+    use_quarterly: bool,
+    scorecard_lead_notes: list[str],
+    strict_signup_note: str | None,
+    active_attribution_note: str | None,
+    show_july_cpl_note: bool,
+    include_organic_leads: bool,
+    loader_notes: list[str],
+    funnel_notes: list[str],
+) -> str:
+    grain = (
+        "Date range exceeds 9 months — trend charts show <strong>quarterly</strong> totals."
+        if use_quarterly
+        else "Trend charts show <strong>monthly</strong> totals on the x-axis."
+    )
+    parts = [
+        grain,
+        """<strong>Org-wide funnel</strong> — not affected by sidebar filters. Through Aug 30,
+2025: <strong>HubSpot</strong> leads and <strong>Digital Cross-Channel Tracker</strong>
+Calls completed and GRAND TOTAL signups. From """
+        + f"{pd.Timestamp(GHL_SIGNUPS_SINCE).strftime('%b %Y')}: "
+        """<strong>GoHighLevel</strong> for leads, discovery calls, and signups.
+<strong>Terminations</strong> from <strong>Terminated Memberships 2023-2025</strong>
+Consolidated Data tab (Date of Termination).""",
+        """Scorecard and the four trend charts (Spend, CPL, DCs, Signups) follow sidebar
+filters and active attribution.""",
+    ]
+    if scorecard_lead_notes:
+        parts.append(" ".join(scorecard_lead_notes))
+    if strict_signup_note:
+        parts.append(strict_signup_note)
+    if active_attribution_note:
+        parts.append(active_attribution_note)
+    if show_july_cpl_note:
+        parts.append(
+            "Jul 2025 CPL uses the average of Jun and Aug 2025 (legacy CRM import into GHL)."
+        )
+    if include_organic_leads:
+        parts.append(
+            "CPL includes <strong>Organic</strong> leads in the denominator; spend still "
+            "follows channel and campaign filters."
+        )
+    parts.append(
+        f"""<strong>DCs Over Time</strong> — discovery calls matching sidebar filters. From
+{pd.Timestamp(GHL_DCS_SINCE).strftime('%b %Y')}: GoHighLevel meetings (<code>startTime</code>)
+on {len(discovery_call_calendar_ids())} configured discovery-call calendars (cancelled and
+no-show excluded). Pre-Sep 2025 uses tracker <strong>Calls completed</strong> (spend-weighted)."""
+    )
+    parts.append(
+        """<strong>Signups Over Time</strong> — same totals as scorecard Signups, rolled up by
+month. Pre-Sep 2025 sheet months use spend-weighted tracker splits unless hear-about mode
+uses the Data tab (pre-Jul) or GHL (Jul–Aug)."""
+    )
+    body = _help_paragraphs_html(*parts)
+    if funnel_notes:
+        body += (
+            "<p><strong>Funnel chart sources</strong></p>"
+            + _help_list_html(list(funnel_notes))
+        )
+    if loader_notes:
+        body += (
+            "<p><strong>Loader notes</strong></p>" + _help_list_html(list(loader_notes))
+        )
+    return body
+
+
+def _signups_by_level_help_html(
+    *,
+    tier_until: date,
+    signup_cmp_notes: list[str],
+) -> str:
+    body = _help_paragraphs_html(
+        """Org-wide committed signups by <strong>Membership Level</strong>.""",
+        f"""Through {pd.Timestamp(SHEETS_SIGNUPS_UNTIL).strftime('%b %Y')}: <strong>Digital
+Cross-Channel Tracker</strong> Both Locations tier rows. From
+{pd.Timestamp(GHL_SIGNUPS_SINCE).strftime('%b %Y')}: <strong>GoHighLevel</strong> (Sign Up
+Date, Committed? = Yes).""",
+        f"""These charts ignore the main date range — full history through
+<strong>{tier_until:%b %d, %Y}</strong>. Use <strong>Years</strong> / <strong>Quarters</strong>
+multiselects; current year/quarter shown as <strong>YTD</strong> / <strong>QTD</strong> when
+still open. Respects membership level filter; not affected by channel, campaign, or Word of
+Mouth toggles.""",
+    )
+    if signup_cmp_notes:
+        body += (
+            "<p><strong>Data sources</strong></p>" + _help_list_html(list(signup_cmp_notes))
+        )
+    return body
+
+
+def _discovery_calls_help_html(
+    *,
+    bm_until: date,
+    bm_notes: list[str],
+) -> str:
+    body = _help_paragraphs_html(
+        """Org-wide <strong>Discovery Calls</strong>: tracker <strong>Bookings (all booked
+calls)</strong> through """
+        + f"{pd.Timestamp(SHEETS_SIGNUPS_UNTIL).strftime('%b %Y')}, then "
+        + f"""<strong>GoHighLevel meetings</strong> (calendar <code>startTime</code>, all
+calendars) from {pd.Timestamp(GHL_SIGNUPS_SINCE).strftime('%b %Y')}.""",
+        f"""These charts ignore the main date range — full history through
+<strong>{bm_until:%b %d, %Y}</strong>. Use <strong>Years</strong> / <strong>Quarters</strong>
+multiselects; current year/quarter shown as <strong>YTD</strong> / <strong>QTD</strong> when
+still open. Not affected by sidebar channel, campaign, or attribution filters.""",
+    )
+    if bm_notes:
+        body += "<p><strong>Data sources</strong></p>" + _help_list_html(list(bm_notes))
+    return body
+
+
+def _campaign_breakdown_help_html() -> str:
+    return _help_paragraphs_html(
+        """Filtered campaign rows for the selected date range and sidebar filters.""",
+        """<strong>Creative allocation</strong> — spend share by asset type (Text, Video,
+Image, Combo, etc.).""",
+        """<strong>Spend vs clicks</strong> — correlation scatter for filtered campaigns.""",
+        """Expand <strong>View filtered campaign data</strong> for the underlying table.""",
+    )
+
+
+def _date_range_help_html() -> str:
+    return _help_paragraphs_html(
+        f"Default view is the last <strong>{DEFAULT_DASHBOARD_MONTHS} months</strong>. "
+        "Widen for full history.",
+        """Applies to the scorecard and trend charts (Spend, CPL, DCs, Signups). The
+funnel uses the same range but stays org-wide. Signups by membership level and
+Discovery Calls use full history with their own year/quarter filters.""",
+    )
+
+
+def _render_dashboard_title() -> None:
+    """Dashboard title with hover/focus methodology tooltip."""
+    _render_heading_with_help(
+        "Digital Channel Dashboard",
+        _dashboard_methodology_tooltip_body(),
+        style="title",
+    )
+
+
 def _inject_styles() -> None:
     st.markdown(
         f"""
@@ -434,6 +675,162 @@ def _inject_styles() -> None:
         }}
         [data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {{
             color: {COLORS["muted"]} !important;
+        }}
+        .dash-title-row {{
+            display: flex;
+            align-items: center;
+            gap: 0.65rem;
+            margin: 0 0 0.35rem 0;
+        }}
+        .dash-section-row,
+        .dash-subsection-row,
+        .dash-sidebar-row,
+        .dash-label-row {{
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin: 0 0 0.5rem 0;
+        }}
+        .dash-title {{
+            margin: 0 !important;
+            padding: 0;
+            font-size: 2.25rem;
+            font-weight: 600;
+            line-height: 1.2;
+            color: {COLORS["accent_dark"]} !important;
+        }}
+        .dash-section-heading {{
+            margin: 0 !important;
+            padding: 0;
+            font-size: 1.5rem;
+            font-weight: 600;
+            line-height: 1.25;
+            color: {COLORS["accent_dark"]} !important;
+        }}
+        .dash-subsection-heading {{
+            margin: 0 !important;
+            padding: 0;
+            font-size: 1.15rem;
+            font-weight: 600;
+            line-height: 1.25;
+            color: {COLORS["accent_dark"]} !important;
+        }}
+        .dash-sidebar-heading {{
+            margin: 0 !important;
+            padding: 0;
+            font-size: 1.25rem;
+            font-weight: 600;
+            line-height: 1.25;
+            color: {COLORS["accent_dark"]} !important;
+        }}
+        .dash-label-heading {{
+            margin: 0 !important;
+            padding: 0;
+            font-size: 1rem;
+            font-weight: 600;
+            line-height: 1.25;
+            color: {COLORS["accent_dark"]} !important;
+        }}
+        .dash-help-wrap {{
+            position: relative;
+            display: inline-flex;
+            align-items: center;
+            flex-shrink: 0;
+        }}
+        .dash-help-wrap--title {{
+            margin-top: 0.35rem;
+        }}
+        .dash-help-wrap--section .dash-help-btn,
+        .dash-help-wrap--subsection .dash-help-btn {{
+            width: 1.2rem;
+            height: 1.2rem;
+            font-size: 0.72rem;
+        }}
+        .dash-help-wrap--sidebar .dash-help-btn,
+        .dash-help-wrap--label .dash-help-btn {{
+            width: 1.1rem;
+            height: 1.1rem;
+            font-size: 0.68rem;
+        }}
+        .dash-help-btn {{
+            width: 1.35rem;
+            height: 1.35rem;
+            border-radius: 50%;
+            border: 1.5px solid {COLORS["muted"]};
+            background: white;
+            color: {COLORS["muted"]};
+            font-size: 0.78rem;
+            font-weight: 700;
+            cursor: help;
+            padding: 0;
+            line-height: 1;
+            flex-shrink: 0;
+            transition: border-color 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+        }}
+        .dash-help-btn:hover,
+        .dash-help-btn:focus-visible {{
+            border-color: {COLORS["accent"]};
+            color: {COLORS["accent"]};
+            outline: none;
+            box-shadow: 0 0 0 3px rgba(93, 166, 138, 0.22);
+        }}
+        .dash-help-tooltip {{
+            position: absolute;
+            top: calc(100% + 10px);
+            left: 0;
+            z-index: 10000;
+            width: min(440px, calc(100vw - 2rem));
+            padding: 0.9rem 1rem;
+            background: white;
+            border: 1px solid rgba(93, 166, 138, 0.22);
+            border-radius: 12px;
+            box-shadow: 0 10px 28px rgba(38, 69, 64, 0.14);
+            opacity: 0;
+            visibility: hidden;
+            pointer-events: none;
+            transition: opacity 0.15s ease, visibility 0.15s ease;
+            text-align: left;
+        }}
+        .dash-help-tooltip p {{
+            margin: 0 0 0.7rem 0;
+            color: {COLORS["accent_dark"]};
+            font-size: 0.84rem;
+            line-height: 1.5;
+            font-weight: 400;
+        }}
+        .dash-help-tooltip p:last-child {{
+            margin-bottom: 0;
+        }}
+        .dash-help-tooltip strong {{
+            color: {COLORS["accent_dark"]};
+            font-weight: 600;
+        }}
+        .dash-help-tooltip code {{
+            font-size: 0.8em;
+            color: {COLORS["muted"]};
+        }}
+        .dash-help-list {{
+            margin: 0.35rem 0 0.65rem 0;
+            padding-left: 1.1rem;
+            color: {COLORS["accent_dark"]};
+            font-size: 0.82rem;
+            line-height: 1.45;
+        }}
+        .dash-help-list li {{
+            margin-bottom: 0.35rem;
+        }}
+        .dash-help-list li:last-child {{
+            margin-bottom: 0;
+        }}
+        [data-testid="stSidebar"] .dash-help-tooltip {{
+            left: auto;
+            right: 0;
+            width: min(360px, calc(100vw - 2rem));
+        }}
+        .dash-help-wrap:hover .dash-help-tooltip,
+        .dash-help-wrap:focus-within .dash-help-tooltip {{
+            opacity: 1;
+            visibility: visible;
         }}
         </style>
         """,
@@ -584,10 +981,10 @@ def _funnel_over_time_chart(funnel_df: pd.DataFrame) -> go.Figure | None:
     x_order = plot_df["period_label"].tolist()
 
     series = (
-        ("leads", "Leads", COLORS["accent"]),
-        ("dcs", "Discovery Calls", COLORS["2023"]),
-        ("terminations", "Terminations", COLORS["2026"]),
-        ("signups", "Signups", COLORS["2024"]),
+        ("leads", "Leads", COLORS["funnel_leads"]),
+        ("dcs", "Discovery Calls", COLORS["funnel_dcs"]),
+        ("terminations", "Terminations", COLORS["funnel_terminations"]),
+        ("signups", "Signups", COLORS["funnel_signups"]),
     )
     for col, _, _ in series:
         if col not in plot_df.columns:
@@ -1266,26 +1663,17 @@ def main() -> None:
     )
     _inject_styles()
 
-    st.title("Digital Channel Dashboard")
-    st.caption(
-        "Live data from **Google Ads**, **Meta**, and **GoHighLevel**. "
-        "Leads through Jun 2025 use **Digital Channel Dashboard 2024-25** Data tab; "
-        "later months use GHL new contacts (attributed + unallocated spread by spend, "
-        "same approach as DCs). "
-        "**First load** for a wide date range can take a minute while GHL lead data "
-        "is pulled day-by-day (Jul 2025 onward only); **repeat loads use disk cache** "
-        "and are much faster. Default view is the last "
-        f"**{DEFAULT_DASHBOARD_MONTHS} months** — widen the date range below for full history. "
-        "**Signups** through Aug 2025: **GRAND TOTAL New Members** from Digital Cross-Channel "
-        "Tracker sheets; from Sep 2025: GHL **Committed?** = Yes + **Sign Up Date**, with "
-        "**Membership Level** slicer (sheet months ignore membership filter)."
-    )
+    _render_dashboard_title()
 
     today = date.today()
     default_until = today - timedelta(days=1)
     default_since = default_dashboard_since(until=default_until)
 
-    st.markdown("**Date range**")
+    _render_heading_with_help(
+        "Date range",
+        _date_range_help_html(),
+        style="label",
+    )
     date_start_col, date_end_col = st.columns(2)
     with date_start_col:
         since = st.date_input(
@@ -1299,12 +1687,6 @@ def main() -> None:
             value=default_until,
             max_value=default_until,
         )
-    st.caption(
-        "Applies to the scorecard and trend charts (Spend, CPL, DCs, Signups). "
-        "The **funnel** chart below stays org-wide. "
-        "**Signups by membership level** charts use full history with their own "
-        "year/quarter filters."
-    )
     if since > until:
         st.error("Start date must be on or before end date.")
         st.stop()
@@ -1330,12 +1712,11 @@ def main() -> None:
         st.stop()
 
     with st.sidebar:
-        st.header("Filters")
+        _render_heading_with_help("Filters", _filters_help_html(), style="sidebar")
         channels = sorted(raw_df["channel"].dropna().unique())
         selected_channels = st.multiselect("Channel", channels, default=channels)
 
         st.markdown("**Non-paid inclusion**")
-        st.caption("Optional additions to paid metrics — not ad channels.")
         include_organic_leads = st.checkbox(
             "Include Organic leads",
             value=False,
@@ -1348,7 +1729,7 @@ def main() -> None:
             ),
         )
 
-        st.caption("GHL attribution (Sep 2025+)")
+        st.markdown("**GHL attribution**")
         attribution_labels = {key: label for key, label in GHL_ATTRIBUTION_OPTIONS}
         use_hear_about = st.checkbox(
             attribution_labels[GHL_ATTRIBUTION_HEAR_ABOUT],
@@ -1447,7 +1828,7 @@ def main() -> None:
             selected_membership_levels = membership_options
 
         st.markdown("---")
-        st.header("Refresh")
+        _render_heading_with_help("Refresh", _refresh_help_html(), style="sidebar")
         if st.button(
             "Design only",
             help="Reload layout and styles only. Uses cached data — no Google Ads, Meta, or GHL calls.",
@@ -1551,80 +1932,55 @@ def main() -> None:
         cpl_monthly=trend_monthlies.cpl,
     )
 
-    st.markdown("---")
-    st.subheader("Trends over time")
-    if use_quarterly:
-        st.caption(
-            "Date range exceeds 9 months — trend charts show **quarterly** totals on the x-axis."
-        )
-    else:
-        st.caption("Trend charts show **monthly** totals on the x-axis.")
-
     funnel_df = _ensure_funnel_terminations(funnel_df, since, until)
-    funnel_chart = _funnel_over_time_chart(funnel_df)
-    if funnel_chart:
-        st.plotly_chart(funnel_chart, use_container_width=True)
-    else:
-        st.info("No funnel data for the selected date range.")
-    st.caption(
-        "**Org-wide funnel** — not affected by sidebar filters above. Monthly totals "
-        "through Aug 30, 2025 use **HubSpot** leads and **Digital Cross-Channel "
-        "Tracker** Calls completed and GRAND TOTAL signups. **GoHighLevel** for leads, "
-        "discovery calls, and signups from "
-        f"{pd.Timestamp(GHL_SIGNUPS_SINCE).strftime('%b %Y')} onward. **Terminations** "
-        "from **Terminated Memberships 2023-2025** Consolidated Data tab (Date of "
-        "Termination), full history in range."
-    )
-    with st.expander("Funnel chart — data sources"):
-        st.caption(f"Loader revision: `{FUNNEL_OVER_TIME_REVISION}`")
-        for note in funnel_notes:
-            st.markdown(f"- {note}")
 
-    _metric_row(
-        [
-            ("Spend", _fmt_currency(scores["spend"])),
-            ("Clicks", _fmt_int(scores["clicks"])),
-            ("Cost per click", _fmt_currency(scores["cpc"])),
-            ("Leads", _fmt_int(scores["leads"])),
-            ("Cost per lead", _fmt_currency(scores["cpl"])),
-            ("DCs", _fmt_int(scores["dcs"])),
-            ("Avg. $ per DC", _fmt_currency(scores["cpdc"])),
-            ("Signups", _fmt_int(scores["conversions"])),
-            ("Avg. CPA", _fmt_currency(scores["cac"])),
-            ("Signup to DC %", _fmt_pct(scores["lead_to_patient_pct"])),
-        ],
-    )
     scorecard_lead_notes: list[str] = []
     if include_organic_leads:
         scorecard_lead_notes.append(
-            "Leads and CPL include **Organic** (non–paid-attributed) contacts."
+            "Leads and CPL include <strong>Organic</strong> (non–paid-attributed) contacts."
         )
     if until_month <= pd.Timestamp(SHEET_LEADS_UNTIL).to_period("M").to_timestamp():
         scorecard_lead_notes.append(
-            "Selected range uses **sheet lead totals** (through Jun 2025) — "
+            "Selected range uses <strong>sheet lead totals</strong> (through Jun 2025) — "
             "attribution toggles do not change lead counts."
         )
     elif since_month <= pd.Timestamp(SHEET_LEADS_UNTIL).to_period("M").to_timestamp():
         scorecard_lead_notes.append(
-            "Lead counts through **Jun 2025** come from the sheet (same total for all "
-            "attribution modes); **Jul 2025+** follows the GHL attribution checkboxes."
+            "Lead counts through <strong>Jun 2025</strong> come from the sheet (same total for "
+            "all attribution modes); <strong>Jul 2025+</strong> follows the GHL attribution "
+            "checkboxes."
         )
-    if scorecard_lead_notes:
-        st.caption(" ".join(scorecard_lead_notes))
+
+    strict_signup_note: str | None = None
     if (use_hear_about or use_tracker) and not include_other_signups:
         strict_signup_note = (
-            "Signups use **strict** Google / FB/IG attribution (Other excluded). "
+            "Signups use <strong>strict</strong> Google / FB/IG attribution (Other excluded). "
         )
         if use_hear_about and include_wom_signups:
-            strict_signup_note += "Word of mouth signups are still spread when that toggle is on. "
-        if since_month <= pd.Timestamp(SHEETS_SIGNUPS_UNTIL).to_period("M").to_timestamp():
             strict_signup_note += (
-                "Pre-Sep 2025 sheet months still use org-wide tracker totals split by spend."
+                "Word of mouth signups are still spread when that toggle is on. "
             )
-        st.caption(strict_signup_note)
+        if (
+            use_hear_about
+            and since_month
+            <= pd.Timestamp(SHEETS_SIGNUPS_UNTIL).to_period("M").to_timestamp()
+        ):
+            strict_signup_note += (
+                f"Pre-{GHL_ATTRIBUTED_SIGNUPS_SINCE} hear-about signups use the "
+                "<strong>Data tab</strong>; Jul–Aug 2025 use GHL hear-about; Sep 2025+ uses GHL. "
+            )
+        elif (
+            use_tracker
+            and not use_hear_about
+            and since_month
+            <= pd.Timestamp(SHEETS_SIGNUPS_UNTIL).to_period("M").to_timestamp()
+        ):
+            strict_signup_note += (
+                "Pre-Sep 2025 tracker-only signups still use org-wide tracker totals split by spend."
+            )
 
+    active_attribution_note: str | None = None
     if use_hear_about or use_tracker:
-        active_label = "Tracker" if use_tracker else "Hear-about"
 
         def _attrib_snapshot(
             use_hear: bool,
@@ -1652,6 +2008,7 @@ def main() -> None:
             cpa = _fmt_currency(spend / signups if signups else None)
             return cpl, cpdc, cpa
 
+        active_label = "Tracker" if use_tracker else "Hear-about"
         hear_cpl, hear_cpdc, hear_cpa = _attrib_snapshot(
             True, False, strict_signups=True
         )
@@ -1666,12 +2023,58 @@ def main() -> None:
             if use_hear_about and use_tracker
             else ""
         )
-        st.caption(
-            f"Active attribution: **{active_label}**{override_note} — "
+        active_attribution_note = (
+            f"Active attribution: <strong>{active_label}</strong>{override_note} — "
             f"CPL {active_cpl} · Cost per DC {active_cpdc} · CPA {active_cpa}. "
             f"Hear-about only: CPL {hear_cpl} · Cost per DC {hear_cpdc} · CPA {hear_cpa} · "
             f"Tracker only: CPL {track_cpl} · Cost per DC {track_cpdc} · CPA {track_cpa}."
         )
+
+    show_july_cpl_note = False
+    if not cpl_period_df.empty:
+        july = pd.Timestamp("2025-07-01")
+        show_july_cpl_note = july in set(
+            pd.to_datetime(cpl_period_df["month"]).dt.to_period("M").dt.to_timestamp()
+        ) or cpl_period_df["period_label"].astype(str).str.contains(
+            "Q3 2025", na=False
+        ).any()
+
+    st.markdown("---")
+    _render_heading_with_help(
+        "Trends over time",
+        _trends_over_time_help_html(
+            use_quarterly=use_quarterly,
+            scorecard_lead_notes=scorecard_lead_notes,
+            strict_signup_note=strict_signup_note,
+            active_attribution_note=active_attribution_note,
+            show_july_cpl_note=show_july_cpl_note,
+            include_organic_leads=include_organic_leads,
+            loader_notes=notes,
+            funnel_notes=list(funnel_notes),
+        ),
+        style="section",
+    )
+
+    funnel_chart = _funnel_over_time_chart(funnel_df)
+    if funnel_chart:
+        st.plotly_chart(funnel_chart, use_container_width=True)
+    else:
+        st.info("No funnel data for the selected date range.")
+
+    _metric_row(
+        [
+            ("Spend", _fmt_currency(scores["spend"])),
+            ("Clicks", _fmt_int(scores["clicks"])),
+            ("Cost per click", _fmt_currency(scores["cpc"])),
+            ("Leads", _fmt_int(scores["leads"])),
+            ("Cost per lead", _fmt_currency(scores["cpl"])),
+            ("DCs", _fmt_int(scores["dcs"])),
+            ("Avg. $ per DC", _fmt_currency(scores["cpdc"])),
+            ("Signups", _fmt_int(scores["conversions"])),
+            ("Avg. CPA", _fmt_currency(scores["cac"])),
+            ("Signup to DC %", _fmt_pct(scores["lead_to_patient_pct"])),
+        ],
+    )
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -1683,35 +2086,12 @@ def main() -> None:
         cpl_chart = _cpl_over_time_chart(cpl_period_df)
         if cpl_chart:
             st.plotly_chart(cpl_chart, use_container_width=True)
-            july = pd.Timestamp("2025-07-01")
-            if not cpl_period_df.empty and (
-                july in set(pd.to_datetime(cpl_period_df["month"]).dt.to_period("M").dt.to_timestamp())
-                or (
-                    cpl_period_df["period_label"].astype(str).str.contains("Q3 2025", na=False).any()
-                )
-            ):
-                st.caption(
-                    "Jul 2025 uses the average of Jun and Aug 2025 (legacy CRM import into GHL)."
-                )
-            if include_organic_leads:
-                st.caption(
-                    "CPL includes **Organic** leads (non–paid-attributed contacts) in the "
-                    "denominator; spend still follows channel and campaign filters."
-                )
         else:
             st.info("CPL over time unavailable (no leads in the selected range).")
     with c3:
         st.plotly_chart(
             _line_chart(dcs_period_df, ["dcs"], "DCs Over Time", "DCs"),
             use_container_width=True,
-        )
-        st.caption(
-            "Discovery calls matching sidebar filters. From "
-            f"{pd.Timestamp(GHL_DCS_SINCE).strftime('%b %Y')}: **GoHighLevel meetings** "
-            f"(``startTime``) on {len(discovery_call_calendar_ids())} configured "
-            "discovery-call calendars — cancelled and no-show excluded. Same totals as "
-            "scorecard DCs. Pre-Sep 2025 uses tracker **Calls completed** "
-            "(spend-weighted splits)."
         )
     with c4:
         st.plotly_chart(
@@ -1723,21 +2103,20 @@ def main() -> None:
             ),
             use_container_width=True,
         )
-        st.caption(
-            "Signups matching sidebar filters and active attribution — same totals as "
-            "the scorecard Signups, rolled up by month. Pre-Sep 2025 sheet months "
-            "use spend-weighted tracker splits."
-        )
 
-    with st.expander("Data sources & methodology", expanded=False):
-        for note in notes:
-            st.markdown(f"- {note}")
-
-    st.subheader("Signups by membership level")
+    st.markdown("---")
     signup_levels = tuple(selected_membership_levels)
     tier_until = tier_signup_until()
     signups_by_level_df, signup_cmp_notes = _tier_signups_by_level_monthly(
         _data_until=tier_until.isoformat(),
+    )
+    _render_heading_with_help(
+        "Signups by membership level",
+        _signups_by_level_help_html(
+            tier_until=tier_until,
+            signup_cmp_notes=list(signup_cmp_notes),
+        ),
+        style="section",
     )
     yoy_col, qoq_col = st.columns(2)
     yoy_chart_height = _signups_tier_chart_height(1)
@@ -1809,26 +2188,19 @@ def main() -> None:
                 st.plotly_chart(qoq_chart, use_container_width=True)
             else:
                 st.info("No signup tier data for quarter comparison.")
-    st.caption(
-        "Org-wide committed signups by **Membership Level**. "
-        f"Through {pd.Timestamp(SHEETS_SIGNUPS_UNTIL).strftime('%b %Y')}: **Digital Cross-Channel "
-        "Tracker** Both Locations tier rows. "
-        f"From {pd.Timestamp(GHL_SIGNUPS_SINCE).strftime('%b %Y')}: **GoHighLevel** (Sign Up Date, "
-        "Committed? = Yes). **These two charts ignore the date range above** — they always "
-        f"use full history through **{tier_until:%b %d, %Y}**. Use **Years** / **Quarters** multiselects "
-        "to focus each chart; current year/quarter shown as **YTD** / **QTD** when still open. "
-        "Respects the membership level filter above; not affected by channel, campaign, or "
-        "Word of Mouth attribution toggles."
-    )
-    if signup_cmp_notes:
-        with st.expander("Signups comparison — data sources"):
-            for note in signup_cmp_notes:
-                st.markdown(f"- {note}")
 
-    st.subheader(DISCOVERY_CALLS_LABEL)
+    st.markdown("---")
     bm_until = bookings_meetings_until()
     bookings_meetings_df, bm_notes = _bookings_meetings_monthly(
         _data_until=bm_until.isoformat(),
+    )
+    _render_heading_with_help(
+        DISCOVERY_CALLS_LABEL,
+        _discovery_calls_help_html(
+            bm_until=bm_until,
+            bm_notes=list(bm_notes),
+        ),
+        style="section",
     )
     bm_chart_df = monthly_for_signup_charts(bookings_meetings_df)
     bm_levels = (BOOKINGS_MEETINGS_CATEGORY,)
@@ -1912,22 +2284,13 @@ def main() -> None:
                 st.plotly_chart(bm_qoq_chart, use_container_width=True)
             else:
                 st.info("No discovery call data for quarter comparison.")
-    st.caption(
-        "Org-wide **Discovery Calls**: tracker **Bookings (all booked calls)** through "
-        f"{pd.Timestamp(SHEETS_SIGNUPS_UNTIL).strftime('%b %Y')}, then **GoHighLevel meetings** "
-        f"(calendar ``startTime``, all calendars) from {pd.Timestamp(GHL_SIGNUPS_SINCE).strftime('%b %Y')}. "
-        f"**These two charts ignore the date range above** — they always use full history through "
-        f"**{bm_until:%b %d, %Y}**. Use **Years** / **Quarters** multiselects to focus each chart; "
-        "current year/quarter shown as **YTD** / **QTD** when still open. Not affected by sidebar "
-        "channel, campaign, or attribution filters."
-    )
-    if bm_notes:
-        with st.expander("Discovery Calls comparison — data sources"):
-            for note in bm_notes:
-                st.markdown(f"- {note}")
 
     st.markdown("---")
-    st.subheader("Campaign breakdown")
+    _render_heading_with_help(
+        "Campaign breakdown",
+        _campaign_breakdown_help_html(),
+        style="section",
+    )
 
     col_pie, col_bar = st.columns(2)
     with col_pie:

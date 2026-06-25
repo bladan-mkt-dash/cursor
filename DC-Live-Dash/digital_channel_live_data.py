@@ -12,8 +12,10 @@ Replaces the Google Sheet **Data** tab as the source of truth. Metrics mapping:
   calendars; Google/Meta split via hear-about on the linked contact; remainder
   allocated by spend share. Sheet Data tab fills months where live counts are zero.
 - **Conversions (signups)** — Through Aug 2025: **GRAND TOTAL New Members** from Digital
-  Cross-Channel Tracker Google Sheets; from Sep 2025: GHL committed members with Sign Up Date
-  in range (hear-about attribution where available, remainder by spend share).
+  Cross-Channel Tracker Google Sheets (org-wide, split by spend) when no hear-about toggle;
+  Jul–Aug 2025 hear-about signups use GHL contacts with Sign Up Date in range. From Sep 2025:
+  GHL committed members with Sign Up Date in range (hear-about attribution where available,
+  remainder by spend share).
 """
 
 from __future__ import annotations
@@ -33,7 +35,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 # Bump when loader logic or ghl_client signup/DC helpers change — Streamlit keeps
 # imported modules across reruns; reload ghl_client when its revision differs.
-LIVE_DATA_REVISION = "2026-06-24-dc-calendar-audit-v1"
+LIVE_DATA_REVISION = "2026-06-24-hear-about-data-tab-signups-v1"
 GHL_ATTRIBUTION_HEAR_ABOUT = "hear_about"
 GHL_ATTRIBUTION_TRACKER = "tracker"
 GHL_ATTRIBUTION_OPTIONS: tuple[tuple[str, str], ...] = (
@@ -157,6 +159,8 @@ def build_ghl_signups_by_level_monthly(
 DEFAULT_SINCE = "2023-01-01"
 DEFAULT_DASHBOARD_MONTHS = 12
 GHL_SIGNUPS_SINCE = "2025-09-01"
+# Hear-about / tracker signup attribution is available from Jul 2025 GHL contacts.
+GHL_ATTRIBUTED_SIGNUPS_SINCE = "2025-07-01"
 SHEETS_SIGNUPS_UNTIL = "2025-08-31"
 # DCs trend chart uses the same sheet / GHL cutover as signups.
 SHEETS_DCS_UNTIL = SHEETS_SIGNUPS_UNTIL
@@ -436,6 +440,80 @@ def _apply_sheet_lead_baseline(
                 out.loc[mask, cpl_col] = values
 
     return out
+
+
+def _sheet_signups_by_month_channel(
+    since: str, until: str
+) -> tuple[pd.DataFrame, pd.Timestamp | None, list[str]]:
+    """Channel-month signup totals from the Digital Channel Dashboard Data tab."""
+    try:
+        sheet_df = load_campaign_data()
+    except Exception as exc:
+        return pd.DataFrame(), None, [f"Sheet signup baseline skipped: {exc}"]
+
+    if sheet_df.empty:
+        return pd.DataFrame(), None, []
+
+    sheet_max_month = sheet_df["date"].max().to_period("M").to_timestamp()
+    since_month = pd.Timestamp(since).to_period("M").to_timestamp()
+    until_month = min(
+        pd.Timestamp(until).to_period("M").to_timestamp(), sheet_max_month
+    )
+    data_tab_until = min(
+        until_month,
+        pd.Timestamp(GHL_ATTRIBUTED_SIGNUPS_SINCE).to_period("M").to_timestamp()
+        - pd.offsets.MonthBegin(1),
+    )
+    if since_month > data_tab_until:
+        return pd.DataFrame(), sheet_max_month, []
+
+    subset = sheet_df[
+        (sheet_df["month"] >= since_month) & (sheet_df["month"] <= data_tab_until)
+    ]
+    if subset.empty:
+        return pd.DataFrame(), sheet_max_month, []
+
+    monthly = (
+        subset.groupby(["month", "channel"], as_index=False)
+        .agg(conversions=("conversions", "sum"))
+        .sort_values(["month", "channel"])
+    )
+    notes = [
+        f"Signups (Data tab): {SPREADSHEET_NAME} Data tab through "
+        f"{data_tab_until.date()} (hear-about pre-{GHL_ATTRIBUTED_SIGNUPS_SINCE})."
+    ]
+    return monthly, sheet_max_month, notes
+
+
+def _apply_channel_month_signups(
+    out: pd.DataFrame,
+    totals: pd.DataFrame,
+    *,
+    months: set[pd.Timestamp],
+    ghl_month_mask: pd.Series,
+) -> None:
+    """Write channel-month signup totals onto campaign rows by spend share."""
+    if totals.empty or not months:
+        return
+    work = totals[totals["month"].isin(months)]
+    if work.empty:
+        return
+    grouped = work.groupby(["month", "channel"], as_index=False)["conversions"].sum()
+    for row in grouped.itertuples(index=False):
+        month, channel, channel_conv = row.month, row.channel, float(row.conversions)
+        if channel_conv <= 0:
+            continue
+        mask = ghl_month_mask & (out["month"] == month) & (out["channel"] == channel)
+        chunk = out.loc[mask]
+        if chunk.empty:
+            continue
+        total_spend = chunk["spend"].sum()
+        if total_spend > 0:
+            weights = chunk["spend"] / total_spend
+            out.loc[mask, "conversions"] = weights * channel_conv
+        else:
+            share = channel_conv / len(chunk)
+            out.loc[mask, "conversions"] = share
 
 
 def _sheet_dcs_by_month_channel(
@@ -1202,7 +1280,7 @@ def fetch_ghl_channel_monthly(
     ghl_leads_org_by_month: dict[pd.Timestamp, float] = {}
     leads_since = max(since, GHL_LEADS_SINCE)
     dc_since = max(since, GHL_DCS_SINCE)
-    ghl_conv_since = max(since, GHL_SIGNUPS_SINCE)
+    ghl_conv_since = max(since, GHL_ATTRIBUTED_SIGNUPS_SINCE)
     since_month = pd.Timestamp(since).to_period("M").to_timestamp()
     until_month = pd.Timestamp(until).to_period("M").to_timestamp()
 
@@ -1236,7 +1314,8 @@ def fetch_ghl_channel_monthly(
             )
         else:
             notes.append(
-                f"GHL signups not queried (range ends before {GHL_SIGNUPS_SINCE})."
+                f"GHL signups not queried (range ends before "
+                f"{GHL_ATTRIBUTED_SIGNUPS_SINCE})."
             )
 
         for name, future in futures.items():
@@ -1841,14 +1920,16 @@ def apply_membership_conversion_filter(
     include_wom_signups: bool = True,
     include_other_signups: bool = False,
     sheet_signup_months: set[pd.Timestamp] | None = None,
+    use_ghl_attributed_signups: bool = False,
+    include_na_membership: bool = False,
 ) -> pd.DataFrame:
     """
     Re-allocate new-patient (conversion) counts for selected membership tiers.
 
-    Sheet-sourced months (pre-Jun 2025 tracker totals) are preserved unchanged.
-    Other (unattributed) GHL signups spread by spend share only when
-    ``include_other_signups`` is True. Word-of-mouth signups spread only when
-    ``include_wom_signups`` is True.
+    Tracker GRAND TOTAL months (split by spend) are preserved when attribution is
+    tracker-only. Hear-about / combined modes use the **Data tab** for months before
+    ``GHL_ATTRIBUTED_SIGNUPS_SINCE``, GHL hear-about counts for Jul–Aug 2025, and GHL
+    from Sep 2025 onward.
     """
     if df.empty:
         return df
@@ -1857,23 +1938,60 @@ def apply_membership_conversion_filter(
     if "month" not in out.columns:
         out["month"] = out["date"].dt.to_period("M").dt.to_timestamp()
 
-    sheet_months = sheet_signup_months or set()
-    sheet_mask = out["month"].isin(sheet_months)
-    preserved = out.loc[sheet_mask, ["conversions"]].copy()
+    all_sheet = sheet_signup_months or set()
+    attrib_start = pd.Timestamp(GHL_ATTRIBUTED_SIGNUPS_SINCE).to_period("M").to_timestamp()
+
+    if use_ghl_attributed_signups:
+        data_tab_months = {m for m in all_sheet if m < attrib_start}
+        sheet_months = data_tab_months
+        preserve_tracker_split = False
+    else:
+        data_tab_months = set()
+        sheet_months = all_sheet
+        preserve_tracker_split = True
+
+    preserved = (
+        out.loc[out["month"].isin(all_sheet), ["conversions"]].copy()
+        if preserve_tracker_split
+        else out.loc[out["month"].isin(set()), ["conversions"]].copy()
+    )
 
     out["conversions"] = 0.0
     levels = [lv for lv in selected_levels if lv in MEMBERSHIP_LEVELS]
     if not levels:
-        if not preserved.empty:
-            out.loc[sheet_mask, "conversions"] = preserved["conversions"]
+        if preserve_tracker_split and not preserved.empty:
+            out.loc[out["month"].isin(all_sheet), "conversions"] = preserved[
+                "conversions"
+            ]
         return _update_conversion_derived_columns(out)
 
     ghl_month_mask = ~out["month"].isin(sheet_months)
 
+    if use_ghl_attributed_signups and data_tab_months:
+        tab_since = min(data_tab_months).strftime("%Y-%m-%d")
+        tab_until = (
+            max(data_tab_months) + pd.offsets.MonthEnd(0)
+        ).strftime("%Y-%m-%d")
+        sheet_signups, _, _ = _sheet_signups_by_month_channel(tab_since, tab_until)
+        data_tab_mask = out["month"].isin(data_tab_months)
+        _apply_channel_month_signups(
+            out,
+            sheet_signups,
+            months=data_tab_months,
+            ghl_month_mask=data_tab_mask,
+        )
+
     if conv_by_level_df is not None and not conv_by_level_df.empty:
-        filtered = conv_by_level_df[
-            conv_by_level_df["membership_level"].isin(levels)
-        ]
+        work_conv = conv_by_level_df.copy()
+        work_conv["month"] = pd.to_datetime(work_conv["month"])
+        tier_mask = work_conv["membership_level"].isin(levels)
+        if include_na_membership:
+            ghl_signup_month = pd.Timestamp(GHL_SIGNUPS_SINCE).to_period("M").to_timestamp()
+            tier_mask = tier_mask | (
+                (work_conv["membership_level"] == "n/a")
+                & (work_conv["month"] >= ghl_signup_month)
+            )
+        filtered = work_conv[tier_mask]
         if not filtered.empty:
             totals = (
                 filtered.groupby(["month", "channel"], as_index=False)["conversions"]
@@ -1936,8 +2054,8 @@ def apply_membership_conversion_filter(
                     share = month_conv / len(chunk)
                     out.loc[mask, "conversions"] += share
 
-    if not preserved.empty:
-        out.loc[sheet_mask, "conversions"] = preserved["conversions"]
+    if preserve_tracker_split and not preserved.empty:
+        out.loc[out["month"].isin(all_sheet), "conversions"] = preserved["conversions"]
 
     return _update_conversion_derived_columns(out)
 
@@ -2430,6 +2548,8 @@ def apply_dashboard_ghl_attribution(
         lambda r: r["spend"] / r["dcs"] if r["dcs"] and r["dcs"] > 0 else pd.NA,
         axis=1,
     )
+    use_ghl_attributed_signups = use_hear_about
+    include_na_membership = use_ghl_attributed_signups and not include_other_signups
     return apply_membership_conversion_filter(
         work,
         conv_df,
@@ -2439,6 +2559,8 @@ def apply_dashboard_ghl_attribution(
         include_wom_signups=use_wom,
         include_other_signups=include_other_signups,
         sheet_signup_months=sheet_signup_months,
+        use_ghl_attributed_signups=use_ghl_attributed_signups,
+        include_na_membership=include_na_membership,
     )
 
 
@@ -2536,14 +2658,16 @@ def load_live_campaign_data(
         f"earlier months use {SPREADSHEET_NAME} Data tab (allocated by spend share).",
         "GHL DCs: discovery-call calendar meetings (startTime); hear-about or "
         "tag/pixel attribution selected in sidebar.",
-        f"Signups (GHL): Committed? = Yes, Sign Up Date from {GHL_SIGNUPS_SINCE} onward; "
+        f"Signups (GHL): Committed? = Yes; hear-about/tracker attribution from "
+        f"{GHL_ATTRIBUTED_SIGNUPS_SINCE}; org-wide GHL signups from {GHL_SIGNUPS_SINCE}. "
         "Toggle hear-about vs tracker, or both for deduped hear-about ∪ tracker "
         "for leads, DCs, and signups.",
         "Leads (GHL tracker): new contacts with meta lead tag / pixel or "
         f"{GOOGLE_LEAD_TAG!r} / gaClientId.",
         "Leads (GHL hear-about): new contacts whose hear-about maps to Google/Meta.",
         f"Signups (sheet): GRAND TOTAL New Members through {SHEETS_SIGNUPS_UNTIL} from "
-        "Digital Cross-Channel Tracker workbooks.",
+        "Digital Cross-Channel Tracker workbooks (tracker-only attribution). "
+        f"Hear-about pre-{GHL_ATTRIBUTED_SIGNUPS_SINCE} uses {SPREADSHEET_NAME} Data tab.",
         "Campaign-level signups are allocated by spend share within channel-month.",
     ]
 
@@ -2896,6 +3020,7 @@ def load_dashboard_bundle(
 __all__ = [
     "MEMBERSHIP_LEVELS",
     "GHL_SIGNUPS_SINCE",
+    "GHL_ATTRIBUTED_SIGNUPS_SINCE",
     "GHL_LEADS_SINCE",
     "SHEETS_SIGNUPS_UNTIL",
     "GHL_DCS_SINCE",
