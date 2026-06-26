@@ -1,17 +1,20 @@
 """
-Weekly In Review — unified leadership email (stats + interpretation + operations).
+Weekly In Review — leadership email (HTML).
 
-Combines:
-  - work_week_in_review.py   (Sun–Fri funnel WoW)
-  - pulse_weekly_report.py   (narrative, recommendations, seasonality)
-  - activity_summary_report.py (milestones, completed tasks, vendor email)
-  - weekly_leadership_report.py (--notes-file for manual milestones / narrative)
+Four sections:
+  1. Executive summary (≤120 words) — funnel health, next-week priorities, team focus
+  2. Milestones & achievements (3–5 auto-detected; override via --notes-file)
+  3. Key channel performance — selective WoW highlights from work_week_in_review data
+  4. Operations — Monday ops view (Requested / Working on / Reviewed & Approved)
 
-Run every Saturday (or any day) from Op Reports:
+Sources:
+  - work_week_in_review.py   Sun–Fri funnel snapshot vs prior Sun–Fri
+  - monday_ops_view.py       team task boards
+  - war_room_data.py         organic social (milestones)
+  - activity_summary_report  completed Google Tasks (milestones)
 
     python weekly_in_review_email.py
-    python weekly_in_review_email.py --end 2026-06-13 --open
-    python weekly_in_review_email.py --notes-file inputs/weekly_notes_2026-06-05.md
+    python weekly_in_review_email.py --end 2026-06-26 --open
 
 Writes: Op Reports/outputs/weekly_in_review_email_YYYY-MM-DD.html
 """
@@ -23,8 +26,9 @@ import html
 import re
 import sys
 import webbrowser
+from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date
 from pathlib import Path
 
 from _bootstrap import OP_REPORTS_DIR, PROJECT_ROOT, setup
@@ -35,8 +39,10 @@ _MWR_DIR = PROJECT_ROOT / "MWR"
 if str(_MWR_DIR) not in sys.path:
     sys.path.insert(0, str(_MWR_DIR))
 
-from activity_summary_report import load_activity_summary_report  # noqa: E402
-from pulse_weekly_report import load_pulse_weekly_report  # noqa: E402
+from activity_summary_report import fetch_completed_tasks  # noqa: E402
+from google_tasks_client import tasks_service  # noqa: E402
+from monday_ops_view import MondayOpsView, load_monday_ops_view  # noqa: E402
+from war_room_data import OrganicSocialMetrics, load_organic_social  # noqa: E402
 from work_week_in_review import (  # noqa: E402
     SourceDeltaRow,
     WorkWeekSnapshot,
@@ -49,15 +55,24 @@ from work_week_in_review import (  # noqa: E402
 )
 
 OUTPUT_DIR = OP_REPORTS_DIR / "outputs"
-INPUTS_DIR = OP_REPORTS_DIR / "inputs"
+
+MILESTONE_KEYWORDS = re.compile(
+    r"campaign|launch|partnership|partner|brand|collateral|print|media house|rebrand",
+    re.IGNORECASE,
+)
 
 
 @dataclass
 class NotesSections:
+    executive_summary: str = ""
     milestones: list[str] = field(default_factory=list)
-    funnel_narrative: str = ""
-    next_week: list[str] = field(default_factory=list)
-    extra_ops: list[tuple[str, list[str]]] = field(default_factory=list)
+
+
+@dataclass
+class ChannelTable:
+    title: str
+    headers: list[str]
+    rows: list[list[str]]
 
 
 @dataclass
@@ -66,15 +81,12 @@ class WeeklyInReviewEmail:
     period_end: date
     prior_start: date
     prior_end: date
-    opening: str
-    milestones: list[tuple[str, str]]
-    funnel_narrative: str
-    summary_bullets: list[str]
-    next_week: list[str]
-    funnel_snapshot: WorkWeekSnapshot
-    ops_sections: list[tuple[str, list[str]]]
-    vendor_lines: list[str]
-    operational_work_groups: list[tuple[str, list[str]]] = field(default_factory=list)
+    executive_summary: str
+    executive_word_count: int
+    milestones: list[str]
+    channel_bullets: list[str]
+    channel_tables: list[ChannelTable]
+    monday_ops: MondayOpsView
     errors: list[str] = field(default_factory=list)
 
 
@@ -88,10 +100,8 @@ def _strip_md_bold(text: str) -> str:
 
 
 def parse_notes_file(path: Path) -> NotesSections:
-    """Parse optional ## sections from a notes markdown file."""
     if not path.exists():
         return NotesSections()
-
     sections: dict[str, list[str]] = {}
     current: str | None = None
     for raw in path.read_text(encoding="utf-8").splitlines():
@@ -102,691 +112,546 @@ def parse_notes_file(path: Path) -> NotesSections:
             continue
         if current and line.startswith("- "):
             sections[current].append(_strip_md_bold(line[2:].strip()))
-
+        elif current and line and not line.startswith("#"):
+            sections[current].append(_strip_md_bold(line))
     notes = NotesSections()
     for key, bullets in sections.items():
-        if "milestone" in key:
+        if "executive" in key or key == "summary":
+            notes.executive_summary = " ".join(bullets)
+        elif "milestone" in key or "achievement" in key:
             notes.milestones.extend(bullets)
-        elif "funnel" in key or "narrative" in key or "deep dive" in key:
-            notes.funnel_narrative = " ".join(bullets)
-        elif "next week" in key:
-            notes.next_week.extend(bullets)
-        elif bullets:
-            title = key.title()
-            notes.extra_ops.append((title, bullets))
     return notes
 
 
-def _find_source(rows: list[SourceDeltaRow], *names: str) -> SourceDeltaRow | None:
-    targets = {n.casefold() for n in names}
-    for row in rows:
-        if row.source.casefold() in targets:
-            return row
-    return None
+def _limit_words(text: str, max_words: int = 120) -> str:
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    return " ".join(words[:max_words]).rstrip(".,;") + "…"
 
 
-def _funnel_one_liner(snap: WorkWeekSnapshot) -> str:
-    nc_chg = pct_label(snap.new_contacts, snap.prior_new_contacts)
-    spend_chg = pct_label(snap.paid_current.spend, snap.paid_prior.spend)
-    paid_chg = pct_label(snap.paid_current.combined_leads, snap.paid_prior.combined_leads)
-    wom_meet = _find_source(snap.meetings_by_source, "WOM", "Word of mouth")
-    organic = _find_source(snap.sessions_by_channel, "Organic Search")
+def _word_count(text: str) -> int:
+    return len(text.split())
 
-    growth_stages = sum(
-        [
-            snap.new_contacts > snap.prior_new_contacts,
-            snap.paid_current.combined_leads > snap.paid_prior.combined_leads,
-            snap.meetings > snap.prior_meetings,
-            snap.signups_all > snap.prior_signups_all,
-        ]
-    )
+
+def _fmt_money(value: float | None) -> str:
+    if value is None:
+        return "n/a"
+    return f"${value:,.0f}"
+
+
+def _summarize_team_focus(monday: MondayOpsView) -> str:
+    if monday.rate_limited:
+        return (
+            "Team ops data was unavailable (Monday API limit); "
+            "re-run when quota resets to include publishing focus."
+        )
+
+    working: list[tuple[str, int]] = []
+    approved_total = 0
+    approved_people: list[str] = []
+    for panel in monday.panels:
+        for sub in panel.subsections:
+            if sub.title == "Working on" and sub.tasks:
+                working.append((panel.person, len(sub.tasks)))
+            if sub.title == "Reviewed & Approved" and sub.tasks:
+                approved_total += len(sub.tasks)
+                approved_people.append(panel.person)
 
     parts: list[str] = []
-    if growth_stages >= 3:
+    if working:
+        working.sort(key=lambda x: (-x[1], x[0].casefold()))
+        lead = ", ".join(f"{name} ({count})" for name, count in working[:3])
+        parts.append(f"active delivery centered on {lead}")
+    if approved_total:
+        who = ", ".join(sorted(set(approved_people), key=str.casefold))
         parts.append(
-            f"Funnel mostly up WoW — contacts {nc_chg}, paid leads {paid_chg}, "
-            f"meetings {pct_label(snap.meetings, snap.prior_meetings)}, "
-            f"signups {pct_label(snap.signups_all, snap.prior_signups_all)} "
-            f"on {spend_chg} spend."
-        )
-    elif snap.new_contacts >= snap.prior_new_contacts:
-        parts.append(
-            f"Contacts {nc_chg}; paid leads {paid_chg} on {spend_chg} spend."
-        )
-    else:
-        parts.append(
-            f"Contacts {snap.new_contacts:,} ({nc_chg}); paid leads "
-            f"{snap.paid_current.combined_leads:.0f} ({paid_chg})."
+            f"{approved_total} item{'s' if approved_total != 1 else ''} cleared review "
+            f"({who})"
         )
 
-    if wom_meet and wom_meet.delta < 0:
-        parts.append(
-            f"WOM meetings down {pct_label(wom_meet.current, wom_meet.prior)} — dragging signups."
-        )
-    elif snap.signups_all < snap.prior_signups_all:
-        parts.append(f"Signups down {pct_label(snap.signups_all, snap.prior_signups_all)}.")
-
-    if snap.bookings < snap.prior_bookings:
-        if organic and organic.delta < 0:
-            parts.append(
-                f"Bookings {pct_label(snap.bookings, snap.prior_bookings)}; organic sessions "
-                f"{pct_label(organic.current, organic.prior)}. Top-of-funnel softness, not conversion."
-            )
-        else:
-            parts.append(
-                f"Bookings {pct_label(snap.bookings, snap.prior_bookings)} despite growth elsewhere."
-            )
-    return " ".join(parts)
+    if not parts:
+        return "Monday boards show light queue activity this week."
+    return "Operationally, " + "; ".join(parts) + "."
 
 
-def _summary_bullets(snap: WorkWeekSnapshot, pulse_blocks: dict[str, list[str]]) -> list[str]:
-    bullets: list[str] = [_funnel_one_liner(snap)]
-
-    wom_sig = _find_source(snap.signups_by_source, "WOM", "Word of mouth")
-    if wom_sig and wom_sig.delta < 0:
-        total_drop = snap.signups_all - snap.prior_signups_all
-        bullets.append(
-            f"Signups fell on volume and close rate. WOM drove most of the drop "
-            f"({wom_sig.delta:+} committed signups"
-            f"{f' = half the total decline' if total_drop and abs(wom_sig.delta) >= abs(total_drop) // 2 else ''}). "
-            f"Google signups {'improved' if _find_source(snap.signups_by_source, 'Google') and _find_source(snap.signups_by_source, 'Google').delta >= 0 else 'held'} while everything else softened."
-        )
-
-    wom_meet = _find_source(snap.meetings_by_source, "WOM", "Word of mouth")
-    if wom_meet and wom_meet.delta < 0:
-        bullets.append(
-            "Meeting volume fell mainly on referral/WOM, not paid search. "
-            "Google meetings were flat-to-up while WOM dropped sharply."
-        )
-
-    if snap.paid_current.spend < snap.paid_prior.spend and snap.paid_current.combined_leads >= snap.paid_prior.combined_leads * 0.9:
-        bullets.append(
-            "Paid is doing more with less — lead volume held despite lower spend."
-        )
-
-    organic = _find_source(snap.sessions_by_channel, "Organic Search")
-    if (
-        snap.bookings < snap.prior_bookings
-        and organic
-        and organic.delta < 0
-        and not any("organic" in b.casefold() for b in bullets)
-    ):
-        bullets.append(
-            f"Organic search {pct_label(organic.current, organic.prior)} "
-            f"({organic.prior:,} → {organic.current:,}) — watch volume into July."
-        )
-
-    for block in pulse_blocks.get("What needs attention", []):
-        if "June gloom" in block or "seasonality" in block.lower():
-            bullets.append(block)
-
-    return bullets
-
-
-def _auto_funnel_narrative(
-    snap: WorkWeekSnapshot,
-    pulse_exec: str,
-    interpretation: list[str],
-) -> str:
-    organic = _find_source(snap.sessions_by_channel, "Organic Search")
-    growth_stages = sum(
-        [
-            snap.new_contacts > snap.prior_new_contacts,
-            snap.paid_current.combined_leads > snap.paid_prior.combined_leads,
-            snap.meetings > snap.prior_meetings,
-            snap.signups_all > snap.prior_signups_all,
-        ]
-    )
+def _next_week_priorities(snap: WorkWeekSnapshot) -> list[str]:
+    priorities: list[str] = []
+    sessions_down = snap.sessions < snap.prior_sessions * 0.92
+    signups_soft = snap.signups_all <= snap.prior_signups_all
     bookings_down = snap.bookings < snap.prior_bookings
-    bookings_flat = snap.bookings == snap.prior_bookings
+    meetings_up = snap.meetings > snap.prior_meetings
 
-    nc = pct_label(snap.new_contacts, snap.prior_new_contacts)
-    paid = pct_label(snap.paid_current.combined_leads, snap.paid_prior.combined_leads)
-    meet = pct_label(snap.meetings, snap.prior_meetings)
-    sig = pct_label(snap.signups_all, snap.prior_signups_all)
-    book = pct_label(snap.bookings, snap.prior_bookings)
-    spend = pct_label(snap.paid_current.spend, snap.paid_prior.spend)
+    if sessions_down:
+        priorities.append("diagnose and stabilize organic/direct traffic before scaling paid")
+    if bookings_down and meetings_up:
+        priorities.append("protect meeting-to-signup conversion while refilling the top of the pipe")
+    elif bookings_down:
+        priorities.append("recover booking volume — check intake and hear-about tagging")
+    if signups_soft and not sessions_down:
+        priorities.append("tighten close rate and committed-signup follow-through")
 
-    sentences: list[str] = []
-
-    if growth_stages >= 3:
-        sentences.append(
-            f"This was a constructive week through most of the funnel. New contacts ({nc}), "
-            f"paid leads ({paid}), meetings ({meet}), and signups ({sig}) all grew week over "
-            f"week on {spend} ad spend."
-        )
-    elif snap.new_contacts >= snap.prior_new_contacts:
-        sentences.append(
-            f"New contacts grew ({nc}) and paid leads moved ({paid}) on {spend} spend, "
-            f"but downstream stages were mixed."
-        )
-    else:
-        sentences.append(
-            f"The funnel softened week over week, with bookings ({book}) and new contacts "
-            f"({nc}) both under pressure."
-        )
-
-    if bookings_down:
-        sentences.append(
-            f"Bookings fell to {snap.bookings:,} ({book}). That looks more like a lag from "
-            f"softer top-of-funnel traffic than a mid-funnel conversion breakdown."
-        )
-    elif bookings_flat and growth_stages >= 2:
-        sentences.append(
-            f"Bookings held flat at {snap.bookings:,} ({book}), which usually trails traffic "
-            f"by one to two weeks rather than reflecting this week's funnel activity."
-        )
-    elif growth_stages >= 2:
-        sentences.append(
-            f"Bookings came in at {snap.bookings:,} ({book}), so mid-funnel conversion appears "
-            f"to be holding even as more volume moves through the pipeline."
-        )
-
-    organic_soft = (
-        organic
-        and organic.prior > 0
-        and (organic.delta <= -40 or organic.current / organic.prior <= 0.97)
+    cur_cpa = (
+        snap.paid_current.spend / snap.paid_current.combined_leads
+        if snap.paid_current.combined_leads
+        else None
     )
-    organic_strong = organic and organic.prior > 0 and organic.delta >= 50
-
-    if organic_soft:
-        sentences.append(
-            f"Organic search eased to {organic.current:,} sessions from {organic.prior:,} "
-            f"({pct_label(organic.current, organic.prior)}) — watch that trend weekly; "
-            f"traffic is the leading indicator for bookings."
-        )
-    elif organic_strong:
-        sentences.append(
-            f"Organic search strengthened ({pct_label(organic.current, organic.prior)}), "
-            f"which should support bookings over the next one to two weeks if the trend holds."
-        )
-    elif bookings_down or growth_stages >= 2:
-        sentences.append(
-            "Heading into July, the priority is building traffic and awareness at the top of "
-            "the pipeline rather than tuning mid-funnel mechanics."
-        )
-
-    if "June gloom" in pulse_exec and len(sentences) < 3:
-        sentences.append(
-            "June is historically our slowest month, so read the data in that context before "
-            "making sharp changes."
-        )
-
-    text = " ".join(sentences[:3])
-    if len(text.split()) > 78:
-        text = " ".join(sentences[:2])
-    return text
-
-
-def _cross_period_lines(snap: WorkWeekSnapshot) -> list[str]:
-    return [
-        f"New Contacts {snap.new_contacts:,} ({pct_label(snap.new_contacts, snap.prior_new_contacts)})",
-        f"↓ Paid Leads {snap.paid_current.combined_leads:.0f} ({pct_label(snap.paid_current.combined_leads, snap.paid_prior.combined_leads)})",
-        f"↓ Meetings {snap.meetings:,} ({pct_label(snap.meetings, snap.prior_meetings)})",
-        f"↓ Sign Ups {snap.signups_all:,} ({pct_label(snap.signups_all, snap.prior_signups_all)})",
-        f"Bookings (separate) {snap.bookings:,} ({pct_label(snap.bookings, snap.prior_bookings)})",
-    ]
-
-
-def _stage_direction_table(snap: WorkWeekSnapshot) -> list[tuple[str, str, str]]:
-    wom_meet = _find_source(snap.meetings_by_source, "WOM", "Word of mouth")
-    rows: list[tuple[str, str, str]] = []
-
-    nc_dir = "Up" if snap.new_contacts >= snap.prior_new_contacts else "Down"
-    nc_driver = f"Broad intake growth ({snap.new_contacts - snap.prior_new_contacts:+})"
-    rows.append(("New Contacts", nc_dir, nc_driver))
-
-    leads_dir = "Up" if snap.paid_current.combined_leads >= snap.paid_prior.combined_leads else "Down"
-    g_chg = pct_label(snap.paid_current.google_leads, snap.paid_prior.google_leads)
-    m_chg = pct_label(snap.paid_current.meta_leads, snap.paid_prior.meta_leads)
-    rows.append(("Leads", leads_dir, f"Google paid {g_chg}; Meta {m_chg}"))
-
-    meet_dir = "Down" if snap.meetings < snap.prior_meetings else "Up"
-    meet_driver = (
-        f"WOM ({wom_meet.delta:+} meetings)"
-        if wom_meet and wom_meet.delta < 0
-        else "Mixed by source"
+    prior_cpa = (
+        snap.paid_prior.spend / snap.paid_prior.combined_leads
+        if snap.paid_prior.combined_leads
+        else None
     )
-    rows.append(("Meetings", meet_dir, meet_driver))
+    if cur_cpa and prior_cpa and cur_cpa > prior_cpa * 1.12:
+        priorities.append("review paid creative and landing paths — CPA drifted up")
 
-    sig_dir = "Down" if snap.signups_all < snap.prior_signups_all else "Up"
-    wom_sig = _find_source(snap.signups_by_source, "WOM", "Word of mouth")
-    if snap.signups_all >= snap.prior_signups_all:
-        sig_driver = "Volume up across sources"
-    elif wom_sig and wom_sig.delta < 0:
-        sig_driver = f"WOM signups ({wom_sig.delta:+})"
-    else:
-        sig_driver = "Mixed by source"
-    rows.append(("Sign Ups", sig_dir, sig_driver))
-
-    book_dir = "Down" if snap.bookings < snap.prior_bookings else "Up"
-    organic = _find_source(snap.sessions_by_channel, "Organic Search")
-    if book_dir == "Down" and organic and organic.delta < 0:
-        book_driver = (
-            f"Organic traffic softer ({organic.delta:+,} sessions); bookings lag traffic"
-        )
-    else:
-        wom_book = _find_source(snap.bookings_by_source, "WOM", "Word of mouth")
-        book_driver = (
-            f"WOM ({wom_book.delta:+})"
-            if wom_book and wom_book.delta < 0
-            else "Mixed by source"
-        )
-    rows.append(("Bookings", book_dir, book_driver))
-    return rows
+    if not priorities:
+        priorities.append("maintain momentum and ship the publishing backlog")
+    return priorities[:2]
 
 
-def _source_mover_table(
-    rows: list[SourceDeltaRow],
+def build_executive_summary(
+    snap: WorkWeekSnapshot,
+    monday: MondayOpsView,
     *,
-    limit: int = 4,
-) -> list[tuple[str, int, int, str]]:
-    movers = sorted(rows, key=lambda r: abs(r.delta), reverse=True)[:limit]
-    out: list[tuple[str, int, int, str]] = []
-    for row in movers:
-        if row.delta == 0:
-            continue
-        chg = pct_label(row.current, row.prior)
-        delta_label = f"{row.delta:+} ({chg})" if chg not in ("n/a", "new") else f"{row.delta:+}"
-        out.append((row.source, row.current, row.prior, delta_label))
-    return out
+    override: str = "",
+) -> str:
+    if override.strip():
+        return _limit_words(override.strip(), 120)
+
+    s_pct = pct_label(snap.sessions, snap.prior_sessions)
+    b_pct = pct_label(snap.bookings, snap.prior_bookings)
+    m_pct = pct_label(snap.meetings, snap.prior_meetings)
+    su_pct = pct_label(snap.signups_all, snap.prior_signups_all)
+
+    sessions_down = snap.sessions < snap.prior_sessions * 0.92
+    signups_soft = snap.signups_all <= snap.prior_signups_all
+    bookings_down = snap.bookings < snap.prior_bookings
+    meetings_up = snap.meetings > snap.prior_meetings
+
+    if sessions_down and signups_soft:
+        health = (
+            f"This Sun–Fri window was soft upstream: sessions {s_pct}, bookings {b_pct}, "
+            f"signups {su_pct} vs the prior week."
+        )
+    elif not bookings_down and not signups_soft:
+        health = (
+            f"Funnel held or improved — bookings {b_pct}, meetings {m_pct}, signups {su_pct} "
+            f"on {snap.sessions:,} sessions ({s_pct})."
+        )
+    elif meetings_up and bookings_down:
+        health = (
+            f"Mixed week: meetings rose {m_pct} but bookings {b_pct} and signups {su_pct}; "
+            f"sessions {s_pct}."
+        )
+    else:
+        health = (
+            f"Bookings {b_pct}, meetings {m_pct}, signups {su_pct}, sessions {s_pct} "
+            f"vs prior Sun–Fri."
+        )
+
+    prios = _next_week_priorities(snap)
+    priority_sentence = (
+        f"Next week: {prios[0]}"
+        + (f"; {prios[1]}" if len(prios) > 1 else "")
+        + "."
+    )
+    team = _summarize_team_focus(monday)
+
+    return _limit_words(f"{health} {priority_sentence} {team}", 120)
 
 
-def _merge_vendor_sections(
-    ops_sections: list[tuple[str, list[str]]],
-    vendor_lines: list[str],
-) -> tuple[list[tuple[str, list[str]]], list[str]]:
-    """Combine Vendor / Tech Ops (tasks) and Vendor / Partner (email) under one list."""
-    merged = list(vendor_lines)
-    kept: list[tuple[str, list[str]]] = []
-    for title, bullets in ops_sections:
-        if "vendor" in title.lower():
-            merged.extend(bullets)
-        else:
-            kept.append((title, bullets))
-    # Preserve order, drop duplicates
+def _load_completed_tasks(*, start: date, end: date) -> tuple[list[tuple[str, list[str]]], list[str]]:
+    errors: list[str] = []
+    try:
+        tasks = fetch_completed_tasks(tasks_service(), start=start, end=end)
+    except Exception as exc:
+        return [], [f"Google Tasks: {exc}"]
+    grouped: dict[str, list[tuple[date, str]]] = defaultdict(list)
+    for task in tasks:
+        grouped[task.list_name].append((task.completed_date, task.title))
+    sections: list[tuple[str, list[str]]] = []
+    for list_name in sorted(grouped, key=str.casefold):
+        rows = sorted(grouped[list_name], key=lambda r: (r[0], r[1].casefold()))
+        bullets = [f"{title} ({completed.strftime('%b %d')})" for completed, title in rows]
+        sections.append((list_name, bullets))
+    return sections, errors
+
+
+def _load_organic(*, start: date, end: date) -> tuple[OrganicSocialMetrics | None, list[str]]:
+    try:
+        return load_organic_social(period_start=start, period_end=end, as_of=end), []
+    except Exception as exc:
+        return None, [f"Organic social: {exc}"]
+
+
+def build_milestones(
+    snap: WorkWeekSnapshot,
+    monday: MondayOpsView,
+    completed_tasks: list[tuple[str, list[str]]],
+    organic: OrganicSocialMetrics | None,
+    *,
+    override: list[str] | None = None,
+) -> list[str]:
+    if override:
+        return override[:5]
+
+    scored: list[tuple[int, str]] = []
+
+    cur_cpa = (
+        snap.paid_current.spend / snap.paid_current.combined_leads
+        if snap.paid_current.combined_leads
+        else None
+    )
+    prior_cpa = (
+        snap.paid_prior.spend / snap.paid_prior.combined_leads
+        if snap.paid_prior.combined_leads
+        else None
+    )
+    if cur_cpa and prior_cpa and cur_cpa < prior_cpa * 0.9:
+        drop = (prior_cpa - cur_cpa) / prior_cpa * 100
+        scored.append(
+            (
+                85,
+                f"Paid efficiency win: blended CPA improved ~{drop:.0f}% "
+                f"({_fmt_money(prior_cpa)} → {_fmt_money(cur_cpa)}/lead) on "
+                f"{pct_label(snap.paid_current.spend, snap.paid_prior.spend)} spend.",
+            )
+        )
+    elif cur_cpa and prior_cpa and cur_cpa > prior_cpa * 1.15:
+        rise = (cur_cpa - prior_cpa) / prior_cpa * 100
+        scored.append(
+            (
+                50,
+                f"Paid CPA rose ~{rise:.0f}% WoW — worth a creative/landing-page review "
+                f"({_fmt_money(prior_cpa)} → {_fmt_money(cur_cpa)}/lead).",
+            )
+        )
+
+    for row in snap.signups_by_source:
+        if row.source.casefold() == "google" and row.prior > 0 and row.current >= row.prior * 1.2:
+            scored.append(
+                (
+                    78,
+                    f"Google committed signups strengthened ({row.prior} → {row.current}, "
+                    f"{pct_label(row.current, row.prior)}) — paid intake converting better at close.",
+                )
+            )
+
+    if snap.meetings > snap.prior_meetings * 1.08:
+        scored.append(
+            (
+                65,
+                f"Meeting volume increased to {snap.meetings:,} "
+                f"({pct_label(snap.meetings, snap.prior_meetings)}), keeping mid-funnel activity up.",
+            )
+        )
+
+    if organic and organic.ig_reach_7d and organic.ig_engagement_7d:
+        posts = organic.posts_in_period or 0
+        if organic.ig_engagement_7d >= 30 or (posts >= 3 and organic.ig_reach_7d >= 800):
+            scored.append(
+                (
+                    60,
+                    f"Organic social activity: {organic.ig_reach_7d:,} IG reach, "
+                    f"{organic.ig_engagement_7d:,} engagements across {posts} posts.",
+                )
+            )
+        if organic.top_post and (organic.top_post_engagement or 0) >= 20:
+            scored.append(
+                (
+                    58,
+                    f"Standout social post: “{organic.top_post}” "
+                    f"({organic.top_post_engagement:,} engagements).",
+                )
+            )
+
+    approved_samples: list[str] = []
+    for panel in monday.panels:
+        for sub in panel.subsections:
+            if sub.title == "Reviewed & Approved":
+                for task in sub.tasks[:2]:
+                    short = task.split("(", 1)[0].strip()
+                    approved_samples.append(f"{panel.person}: {short}")
+    if approved_samples:
+        scored.append(
+            (
+                72,
+                f"Publishing pipeline: {len(approved_samples)}+ deliverables cleared review "
+                f"({'; '.join(approved_samples[:2])}{'…' if len(approved_samples) > 2 else ''}).",
+            )
+        )
+
+    for _list_name, bullets in completed_tasks:
+        for bullet in bullets:
+            title = bullet.rsplit("(", 1)[0].strip()
+            if MILESTONE_KEYWORDS.search(title):
+                scored.append((80, f"Completed: {title}."))
+
+    if snap.signups_all >= snap.prior_signups_all and snap.bookings >= snap.prior_bookings:
+        scored.append(
+            (
+                55,
+                f"Core funnel metrics held or improved — bookings {pct_label(snap.bookings, snap.prior_bookings)}, "
+                f"signups {pct_label(snap.signups_all, snap.prior_signups_all)}.",
+            )
+        )
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
     seen: set[str] = set()
-    deduped: list[str] = []
-    for line in merged:
-        key = line.casefold()
+    results: list[str] = []
+    for _, text in scored:
+        key = text[:50].casefold()
         if key in seen:
             continue
         seen.add(key)
-        deduped.append(line)
-    return kept, deduped
+        results.append(text)
+        if len(results) >= 5:
+            break
+
+    while len(results) < 3:
+        fillers = [
+            f"Paid generated {snap.paid_current.combined_leads:.0f} leads on "
+            f"{_fmt_money(snap.paid_current.spend)} spend ({pct_label(snap.paid_current.combined_leads, snap.paid_prior.combined_leads)} vs prior).",
+            f"GA4 recorded {snap.sessions:,} sessions ({pct_label(snap.sessions, snap.prior_sessions)} WoW).",
+            "Review Section 3 channel tables and edit milestones manually if something strategic shipped off-dashboard.",
+        ]
+        for line in fillers:
+            if line not in results and len(results) < 3:
+                results.append(line)
+
+    return results[:5]
+
+
+def _significant_rows(
+    rows: list[SourceDeltaRow],
+    *,
+    min_abs_delta: int = 2,
+    min_pct: float = 15.0,
+) -> list[SourceDeltaRow]:
+    picked: list[SourceDeltaRow] = []
+    for row in rows:
+        pct = row.pct_change
+        if row.prior == 0 and row.current > 0 and row.current >= min_abs_delta:
+            picked.append(row)
+        elif abs(row.delta) >= min_abs_delta and pct is not None and abs(pct) >= min_pct:
+            picked.append(row)
+        elif abs(row.delta) >= max(min_abs_delta * 2, 5):
+            picked.append(row)
+    return picked[:8]
+
+
+def _delta_table(title: str, rows: list[SourceDeltaRow], *, total_cur: int, total_prior: int) -> ChannelTable | None:
+    sig = _significant_rows(rows)
+    if not sig:
+        return None
+    headers = ["Source", "This week", "Prior week", "Δ", "Change"]
+    body: list[list[str]] = []
+    for row in sig:
+        body.append(
+            [
+                row.source,
+                f"{row.current:,}",
+                f"{row.prior:,}",
+                f"{row.delta:+,}",
+                pct_label(row.current, row.prior),
+            ]
+        )
+    body.append(
+        [
+            "Total",
+            f"{total_cur:,}",
+            f"{total_prior:,}",
+            f"{total_cur - total_prior:+,}",
+            pct_label(total_cur, total_prior),
+        ]
+    )
+    return ChannelTable(title=title, headers=headers, rows=body)
+
+
+def build_channel_section(snap: WorkWeekSnapshot) -> tuple[list[str], list[ChannelTable]]:
+    bullets: list[str] = []
+
+    for block in build_interpretation(snap):
+        for line in block.splitlines():
+            cleaned = _strip_md_bold(line.strip().lstrip("- "))
+            if not cleaned or cleaned.endswith(":"):
+                continue
+            if cleaned.casefold() in {"primary drivers", "worth watching", "what is holding"}:
+                continue
+            bullets.append(cleaned)
+
+    cur_cpa = (
+        snap.paid_current.spend / snap.paid_current.combined_leads
+        if snap.paid_current.combined_leads
+        else None
+    )
+    prior_cpa = (
+        snap.paid_prior.spend / snap.paid_prior.combined_leads
+        if snap.paid_prior.combined_leads
+        else None
+    )
+    bullets.append(
+        f"Paid: Google {snap.paid_current.google_leads:.0f} leads vs "
+        f"{snap.paid_prior.google_leads:.0f} prior; Meta {snap.paid_current.meta_leads:.0f} vs "
+        f"{snap.paid_prior.meta_leads:.0f}; spend {_fmt_money(snap.paid_current.spend)} "
+        f"({pct_label(snap.paid_current.spend, snap.paid_prior.spend)})."
+    )
+    if cur_cpa and prior_cpa:
+        bullets.append(
+            f"Blended CPA {_fmt_money(cur_cpa)} vs {_fmt_money(prior_cpa)} prior "
+            f"({pct_label(cur_cpa, prior_cpa)})."
+        )
+
+    headline = ChannelTable(
+        title="Headline funnel metrics",
+        headers=["Metric", "This week", "Prior week", "Change"],
+        rows=[
+            ["Bookings", f"{snap.bookings:,}", f"{snap.prior_bookings:,}", pct_label(snap.bookings, snap.prior_bookings)],
+            ["Meetings", f"{snap.meetings:,}", f"{snap.prior_meetings:,}", pct_label(snap.meetings, snap.prior_meetings)],
+            ["Signups (all)", f"{snap.signups_all:,}", f"{snap.prior_signups_all:,}", pct_label(snap.signups_all, snap.prior_signups_all)],
+            ["Signups (committed)", f"{snap.signups_committed:,}", f"{snap.prior_signups_committed:,}", pct_label(snap.signups_committed, snap.prior_signups_committed)],
+            ["GA4 sessions", f"{snap.sessions:,}", f"{snap.prior_sessions:,}", pct_label(snap.sessions, snap.prior_sessions)],
+            ["Paid leads", f"{snap.paid_current.combined_leads:.0f}", f"{snap.paid_prior.combined_leads:.0f}", pct_label(snap.paid_current.combined_leads, snap.paid_prior.combined_leads)],
+        ],
+    )
+
+    tables: list[ChannelTable] = [headline]
+    for title, rows, total_cur, total_prior in [
+        ("Bookings by hear-about (significant moves)", snap.bookings_by_source, snap.bookings, snap.prior_bookings),
+        ("Committed signups by hear-about (significant moves)", snap.signups_by_source, snap.signups_committed, snap.prior_signups_committed),
+        ("GA4 sessions by channel (significant moves)", snap.sessions_by_channel, snap.sessions, snap.prior_sessions),
+    ]:
+        table = _delta_table(title, rows, total_cur=total_cur, total_prior=total_prior)
+        if table:
+            tables.append(table)
+
+    return bullets[:8], tables
 
 
 def load_weekly_in_review_email(
     *,
-    start: date,
     end: date,
     notes: NotesSections | None = None,
 ) -> WeeklyInReviewEmail:
     notes = notes or NotesSections()
-    prior_start, prior_end = prior_sunday_friday_period(start, end)
+    period_start, period_end = sunday_friday_range(end=end)
+    prior_start, prior_end = prior_sunday_friday_period(period_start, period_end)
     errors: list[str] = []
 
-    print(f"Loading funnel snapshot {start} .. {end} …")
-    funnel: WorkWeekSnapshot | None = None
-    try:
-        funnel = load_work_week_snapshot(start=start, end=end)
-    except Exception as exc:
-        errors.append(f"Funnel: {exc}")
+    print(f"Loading work-week funnel {period_start} .. {period_end} …")
+    snap = load_work_week_snapshot(start=period_start, end=period_end)
+    errors.extend(snap.errors)
 
-    if funnel is None:
-        from work_week_in_review import PaidMediaWeek
+    print("Loading Monday ops boards …")
+    monday = load_monday_ops_view()
+    errors.extend(monday.errors)
 
-        funnel = WorkWeekSnapshot(
-            start=start,
-            end=end,
-            prior_start=prior_start,
-            prior_end=prior_end,
-            bookings=0,
-            prior_bookings=0,
-            meetings=0,
-            prior_meetings=0,
-            signups_all=0,
-            prior_signups_all=0,
-            signups_committed=0,
-            prior_signups_committed=0,
-            new_contacts=0,
-            prior_new_contacts=0,
-            sessions=0,
-            prior_sessions=0,
-            paid_current=PaidMediaWeek(0, 0, 0),
-            paid_prior=PaidMediaWeek(0, 0, 0),
-        )
+    print("Loading organic social + completed tasks …")
+    organic, organic_errors = _load_organic(start=period_start, end=period_end)
+    errors.extend(organic_errors)
+    completed_tasks, task_errors = _load_completed_tasks(start=period_start, end=period_end)
+    errors.extend(task_errors)
 
-    print("Loading activity summary …")
-    try:
-        activity = load_activity_summary_report(start=start, end=end)
-    except Exception as exc:
-        errors.append(f"Activity: {exc}")
-        activity = None
-
-    print("Loading pulse narrative …")
-    try:
-        pulse = load_pulse_weekly_report(end=end)
-    except Exception as exc:
-        errors.append(f"Pulse: {exc}")
-        pulse = None
-
-    errors.extend(funnel.errors)
-    if activity:
-        errors.extend(activity.errors)
-
-    milestones = list(activity.milestones) if activity else []
-    for bullet in notes.milestones:
-        if " — " in bullet:
-            title, detail = bullet.split(" — ", 1)
-            milestones.append((title.strip(), detail.strip()))
-        else:
-            milestones.append((bullet, ""))
-
-    opening = activity.net_read if activity else "Weekly marketing and operations review."
-    if opening.startswith("Heavy week on"):
-        pass
-    elif activity:
-        opening = activity.net_read
-
-    pulse_blocks: dict[str, list[str]] = {}
-    if pulse:
-        for block in pulse.narrative_blocks:
-            pulse_blocks[block.title] = block.bullets
-
-    interpretation = build_interpretation(funnel)
-    funnel_narrative = notes.funnel_narrative.strip()
-    if not funnel_narrative:
-        funnel_narrative = _auto_funnel_narrative(
-            funnel,
-            pulse.executive_summary if pulse else "",
-            interpretation,
-        )
-
-    summary_bullets = _summary_bullets(funnel, pulse_blocks)
-
-    next_week = list(notes.next_week)
-    if not next_week and pulse:
-        rec_block = pulse_blocks.get("Recommendations", [])
-        next_week = rec_block[:3]
-
-    ops_sections: list[tuple[str, list[str]]] = []
-    operational_work_groups: list[tuple[str, list[str]]] = []
-    if activity:
-        ops_sections.extend(activity.completed_sections)
-        ops_sections.extend(activity.email_sections)
-        operational_work_groups = list(activity.operational_work_groups)
-    ops_sections.extend(notes.extra_ops)
-
-    ops_sections, vendor_lines = _merge_vendor_sections(ops_sections, [])
+    executive = build_executive_summary(
+        snap, monday, override=notes.executive_summary
+    )
+    milestones = build_milestones(
+        snap,
+        monday,
+        completed_tasks,
+        organic,
+        override=notes.milestones or None,
+    )
+    channel_bullets, channel_tables = build_channel_section(snap)
 
     return WeeklyInReviewEmail(
-        period_start=start,
-        period_end=end,
+        period_start=period_start,
+        period_end=period_end,
         prior_start=prior_start,
         prior_end=prior_end,
-        opening=opening,
+        executive_summary=executive,
+        executive_word_count=_word_count(executive),
         milestones=milestones,
-        funnel_narrative=funnel_narrative,
-        summary_bullets=summary_bullets,
-        next_week=next_week,
-        funnel_snapshot=funnel,
-        ops_sections=ops_sections,
-        operational_work_groups=operational_work_groups,
-        vendor_lines=vendor_lines,
+        channel_bullets=channel_bullets,
+        channel_tables=channel_tables,
+        monday_ops=monday,
         errors=errors,
     )
 
 
-def _render_operational_work_html(groups: list[tuple[str, list[str]]]) -> str:
-    if not groups:
-        return ""
-    parts = ["<h3>Operational Work</h3>"]
-    for sub_title, bullets in groups:
-        items = "".join(f"<li>{html.escape(b)}</li>" for b in bullets)
-        parts.append(f"<h4>{html.escape(sub_title)}</h4><ul>{items}</ul>")
+def _render_table(table: ChannelTable) -> str:
+    head = "".join(f"<th>{html.escape(h)}</th>" for h in table.headers)
+    body_rows = ""
+    for row in table.rows:
+        cells = "".join(f"<td>{html.escape(c)}</td>" for c in row)
+        is_total = row and row[0].casefold() == "total"
+        body_rows += f"<tr{' class=\"total-row\"' if is_total else ''}>{cells}</tr>"
+    return f"""
+<h3>{html.escape(table.title)}</h3>
+<table>
+  <thead><tr>{head}</tr></thead>
+  <tbody>{body_rows}</tbody>
+</table>
+"""
+
+
+def _render_ops_section(monday: MondayOpsView) -> str:
+    parts: list[str] = []
+    if monday.rate_limited:
+        parts.append(
+            "<p class='note'><em>Monday.com daily API limit reached — task lists are "
+            "placeholders until quota resets.</em></p>"
+        )
+
+    for panel in monday.panels:
+        sub_html = ""
+        for sub in panel.subsections:
+            if sub.tasks:
+                items = "".join(f"<li>{html.escape(t)}</li>" for t in sub.tasks)
+                body = f"<ul>{items}</ul>"
+            else:
+                body = "<p class='empty'><em>None right now.</em></p>"
+            sub_html += f"""
+            <div class="ops-sub">
+              <h4>{html.escape(sub.title)} <span class="count">({len(sub.tasks)})</span></h4>
+              {body}
+            </div>
+            """
+        parts.append(
+            f"""
+        <div class="ops-person">
+          <h3>{html.escape(panel.person)}</h3>
+          {sub_html}
+        </div>
+        """
+        )
     return "".join(parts)
 
 
-def _html_table(headers: list[str], rows: list[list[str]]) -> str:
-    head = "".join(f"<th>{html.escape(h)}</th>" for h in headers)
-    body_rows = []
-    for row in rows:
-        cells = "".join(f"<td>{html.escape(c)}</td>" for c in row)
-        body_rows.append(f"<tr>{cells}</tr>")
-    return (
-        f"<table><thead><tr>{head}</tr></thead>"
-        f"<tbody>{''.join(body_rows)}</tbody></table>"
-    )
-
-
 def render_weekly_in_review_html(report: WeeklyInReviewEmail) -> str:
-    snap = report.funnel_snapshot
     title = (
         f"Weekly In Review — {report.period_start.strftime('%b %d')}–"
         f"{report.period_end.strftime('%b %d, %Y')}"
     )
 
-    milestone_html = ""
-    if report.milestones:
-        items = "".join(
-            f"<li><strong>{html.escape(t)}</strong>"
-            f"{f' — {html.escape(d)}' if d else ''}</li>"
-            for t, d in report.milestones
-        )
-        milestone_html = f"<h2>Milestones</h2><ul>{items}</ul>"
-
-    summary_html = "".join(f"<p>{html.escape(b)}</p>" for b in report.summary_bullets)
-    next_week_html = ""
-    if report.next_week:
-        items = "".join(f"<li>{html.escape(b)}</li>" for b in report.next_week)
-        next_week_html = f"<p><strong>Next week:</strong></p><ul>{items}</ul>"
-
-    cross_lines = _cross_period_lines(snap)
-    cross_html = "<br>".join(html.escape(line) for line in cross_lines)
-
-    meet_movers = _source_mover_table(snap.meetings_by_source)
-    meet_table = ""
-    if meet_movers:
-        meet_table = (
-            "<p><strong>Meetings by source (biggest movers):</strong></p>"
-            + _html_table(
-                ["Source", "This week", "Prior", "Change"],
-                [[s, str(c), str(p), ch] for s, c, p, ch in meet_movers],
-            )
-        )
-
-    sig_per_nc_cur = (
-        f"{snap.signups_all / snap.new_contacts * 100:.1f}%"
-        if snap.new_contacts
-        else "n/a"
+    milestones_html = "".join(
+        f"<li>{html.escape(m)}</li>" for m in report.milestones
     )
-    sig_per_nc_prior = (
-        f"{snap.prior_signups_all / snap.prior_new_contacts * 100:.1f}%"
-        if snap.prior_new_contacts
-        else "n/a"
+    channel_bullets_html = "".join(
+        f"<li>{html.escape(b)}</li>" for b in report.channel_bullets
     )
-    efficiency_html = (
-        "<p><strong>Efficiency slipped downstream:</strong></p>"
-        f"<ul><li>Signups per new contact: {sig_per_nc_cur} vs {sig_per_nc_prior} prior</li>"
-        "<li>More volume, lower yield through the rest of the funnel</li></ul>"
-        if snap.new_contacts > snap.prior_new_contacts and snap.signups_all <= snap.prior_signups_all
-        else ""
-    )
-
-    stage_rows = _stage_direction_table(snap)
-    stage_table = _html_table(
-        ["Stage", "Direction", "Primary driver"],
-        [[a, b, c] for a, b, c in stage_rows],
-    )
-
-    def _metric_section(
-        heading: str,
-        metric_rows: list[list[str]],
-        extra: str = "",
-    ) -> str:
-        return (
-            f"<h3>{html.escape(heading)}</h3>"
-            + _html_table(["Metric", "This week", "Prior", "Δ"], metric_rows)
-            + extra
-        )
-
-    nc_section = _metric_section(
-        f"1. New Contacts — {'Growing' if snap.new_contacts >= snap.prior_new_contacts else 'Softening'} ({pct_label(snap.new_contacts, snap.prior_new_contacts)})",
-        [
-            [
-                "New contacts",
-                f"{snap.new_contacts:,}",
-                f"{snap.prior_new_contacts:,}",
-                f"{snap.new_contacts - snap.prior_new_contacts:+,} ({pct_label(snap.new_contacts, snap.prior_new_contacts)})",
-            ]
-        ],
-    )
-
-    leads_section = _metric_section(
-        f"2. Leads (Paid: Google + Meta) — {pct_label(snap.paid_current.combined_leads, snap.paid_prior.combined_leads)}",
-        [
-            [
-                "Paid leads",
-                f"{snap.paid_current.combined_leads:.0f}",
-                f"{snap.paid_prior.combined_leads:.0f}",
-                f"{snap.paid_current.combined_leads - snap.paid_prior.combined_leads:+.0f} ({pct_label(snap.paid_current.combined_leads, snap.paid_prior.combined_leads)})",
-            ],
-            [
-                "Paid spend",
-                f"${snap.paid_current.spend:,.0f}",
-                f"${snap.paid_prior.spend:,.0f}",
-                f"${snap.paid_current.spend - snap.paid_prior.spend:+,.0f} ({pct_label(snap.paid_current.spend, snap.paid_prior.spend)})",
-            ],
-        ],
-        _html_table(
-            ["Channel", "This week", "Prior", "Change"],
-            [
-                [
-                    "Google",
-                    f"{snap.paid_current.google_leads:.0f}",
-                    f"{snap.paid_prior.google_leads:.0f}",
-                    pct_label(snap.paid_current.google_leads, snap.paid_prior.google_leads),
-                ],
-                [
-                    "Meta",
-                    f"{snap.paid_current.meta_leads:.0f}",
-                    f"{snap.paid_prior.meta_leads:.0f}",
-                    pct_label(snap.paid_current.meta_leads, snap.paid_prior.meta_leads),
-                ],
-            ],
-        ),
-    )
-
-    show_rate_cur = (
-        f"{snap.meetings / snap.bookings * 100:.1f}%"
-        if snap.bookings
-        else "n/a"
-    )
-    show_rate_prior = (
-        f"{snap.prior_meetings / snap.prior_bookings * 100:.1f}%"
-        if snap.prior_bookings
-        else "n/a"
-    )
-    meetings_section = _metric_section(
-        f"3. Meetings — {pct_label(snap.meetings, snap.prior_meetings)}",
-        [
-            [
-                "Meetings held",
-                f"{snap.meetings:,}",
-                f"{snap.prior_meetings:,}",
-                f"{snap.meetings - snap.prior_meetings:+,} ({pct_label(snap.meetings, snap.prior_meetings)})",
-            ]
-        ],
-        (
-            "<p><strong>Booking → meeting gap:</strong></p>"
-            + _html_table(
-                ["", "This week", "Prior"],
-                [
-                    ["Bookings", f"{snap.bookings:,}", f"{snap.prior_bookings:,}"],
-                    ["Meetings", f"{snap.meetings:,}", f"{snap.prior_meetings:,}"],
-                    ["Show rate (meetings / bookings)", show_rate_cur, show_rate_prior],
-                ],
-            )
-        ),
-    )
-
-    cur_m2s = (
-        f"{snap.signups_all / snap.meetings * 100:.1f}%"
-        if snap.meetings
-        else "n/a"
-    )
-    prior_m2s = (
-        f"{snap.prior_signups_all / snap.prior_meetings * 100:.1f}%"
-        if snap.prior_meetings
-        else "n/a"
-    )
-    cur_b2s = (
-        f"{snap.signups_all / snap.bookings * 100:.1f}%"
-        if snap.bookings
-        else "n/a"
-    )
-    prior_b2s = (
-        f"{snap.prior_signups_all / snap.prior_bookings * 100:.1f}%"
-        if snap.prior_bookings
-        else "n/a"
-    )
-    sig_movers = _source_mover_table(snap.signups_by_source)
-    signups_section = _metric_section(
-        f"4. Sign Ups — {pct_label(snap.signups_all, snap.prior_signups_all)}",
-        [
-            [
-                "Signups (all)",
-                f"{snap.signups_all:,}",
-                f"{snap.prior_signups_all:,}",
-                f"{snap.signups_all - snap.prior_signups_all:+,} ({pct_label(snap.signups_all, snap.prior_signups_all)})",
-            ],
-            [
-                "Signups (Committed = Yes)",
-                f"{snap.signups_committed:,}",
-                f"{snap.prior_signups_committed:,}",
-                f"{snap.signups_committed - snap.prior_signups_committed:+,} ({pct_label(snap.signups_committed, snap.prior_signups_committed)})",
-            ],
-        ],
-        (
-            (
-                "<p><strong>By source (biggest movers):</strong></p>"
-                + _html_table(
-                    ["Source", "This week", "Prior", "Change"],
-                    [[s, str(c), str(p), ch] for s, c, p, ch in sig_movers],
-                )
-                if sig_movers
-                else ""
-            )
-            + "<p><strong>Close rates:</strong></p>"
-            + _html_table(
-                ["Rate", "This week", "Prior"],
-                [
-                    ["Signups / meetings", cur_m2s, prior_m2s],
-                    ["Signups / bookings", cur_b2s, prior_b2s],
-                ],
-            )
-        ),
-    )
-
-    ops_html = ""
-    has_campaigns = any(title.casefold() == "campaigns" for title, _ in report.ops_sections)
-    for section_title, bullets in report.ops_sections:
-        items = "".join(f"<li>{html.escape(b)}</li>" for b in bullets)
-        ops_html += f"<h3>{html.escape(section_title)}</h3><ul>{items}</ul>"
-        if section_title.casefold() == "campaigns" and report.operational_work_groups:
-            ops_html += _render_operational_work_html(report.operational_work_groups)
-
-    if report.operational_work_groups and not has_campaigns:
-        ops_html = _render_operational_work_html(report.operational_work_groups) + ops_html
-
-    if report.vendor_lines:
-        items = "".join(f"<li>{html.escape(b)}</li>" for b in report.vendor_lines)
-        ops_html += f"<h3>Vendor / Partner</h3><ul>{items}</ul>"
+    tables_html = "".join(_render_table(t) for t in report.channel_tables)
+    ops_html = _render_ops_section(report.monday_ops)
 
     errors_html = ""
     if report.errors:
-        errors_html = f"<p style='color:#a00;'>{html.escape('; '.join(report.errors[:5]))}</p>"
+        errors_html = f"<p class='errors'>{html.escape('; '.join(report.errors[:4]))}</p>"
+
+    period_note = (
+        f"Sun–Fri {report.period_start.isoformat()} → {report.period_end.isoformat()} "
+        f"vs prior {report.prior_start.isoformat()} → {report.prior_end.isoformat()}. "
+        f"Funnel from work_week_in_review · ops from monday_ops_view."
+    )
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -794,45 +659,46 @@ def render_weekly_in_review_html(report: WeeklyInReviewEmail) -> str:
 <meta charset="utf-8">
 <title>{html.escape(title)}</title>
 <style>
-body {{ font-family: Arial, sans-serif; font-size: 10pt; margin: 16px; line-height: 1.45; color: #222; max-width: 720px; }}
-h2 {{ font-size: 11pt; font-weight: bold; margin: 18px 0 8px 0; border-bottom: 1px solid #ccc; padding-bottom: 4px; }}
+body {{ font-family: Arial, sans-serif; font-size: 10pt; margin: 16px; line-height: 1.5; color: #222; max-width: 720px; }}
+h2 {{ font-size: 11pt; font-weight: bold; margin: 22px 0 8px 0; border-bottom: 1px solid #ccc; padding-bottom: 4px; color: #264540; }}
 h3 {{ font-size: 10pt; font-weight: bold; margin: 14px 0 6px 0; }}
-h4 {{ font-size: 10pt; font-weight: bold; margin: 10px 0 4px 0; color: #444; }}
-p {{ margin: 0 0 10px 0; }}
-ul {{ margin: 0 0 10px 0; padding-left: 20px; }}
-li {{ margin-bottom: 4px; }}
-table {{ border-collapse: collapse; margin: 6px 0 12px 0; font-size: 10pt; width: 450px; max-width: 100%; }}
-th, td {{ border: 1px solid #bbb; padding: 4px 6px; text-align: right; }}
+h4 {{ font-size: 9.5pt; font-weight: bold; margin: 0 0 4px 0; color: #5DA68A; }}
+p {{ margin: 0 0 12px 0; }}
+ul {{ margin: 0 0 12px 0; padding-left: 20px; }}
+li {{ margin-bottom: 5px; }}
+.meta {{ font-size: 9pt; color: #666; margin-bottom: 16px; }}
+.exec {{ font-size: 10.5pt; margin-bottom: 8px; line-height: 1.55; }}
+.exec-meta {{ font-size: 8.5pt; color: #888; margin-bottom: 16px; }}
+table {{ border-collapse: collapse; width: 100%; margin: 8px 0 16px 0; font-size: 9pt; }}
+th, td {{ border: 1px solid #dde3ea; padding: 5px 8px; text-align: right; }}
 th:first-child, td:first-child {{ text-align: left; }}
-th {{ background: #eef2f6; font-weight: bold; }}
-.funnel-flow {{ background: #f6f8fa; border: 1px solid #dde3ea; padding: 10px 12px; margin: 10px 0; }}
+th {{ background: #f6f8fa; font-weight: bold; }}
+tr.total-row td {{ font-weight: bold; background: #fafbfc; }}
+.ops-person {{ margin-bottom: 18px; padding-bottom: 14px; border-bottom: 1px solid #e8ecef; }}
+.ops-person:last-child {{ border-bottom: none; }}
+.ops-sub {{ margin-bottom: 10px; padding-left: 4px; }}
+.count {{ font-weight: normal; color: #888; font-size: 9pt; }}
+.empty {{ margin: 0; color: #888; font-size: 9pt; }}
+.note {{ font-size: 9pt; color: #666; }}
+.errors {{ color: #a00; font-size: 9pt; }}
 </style>
 </head>
 <body>
 
-<p>{html.escape(report.opening)}</p>
+<h2>1. Executive summary</h2>
+<p class="exec">{html.escape(report.executive_summary)}</p>
+<p class="exec-meta">{report.executive_word_count} words · target ≤120</p>
+<p class="meta">{html.escape(period_note)}</p>
 
-{milestone_html}
+<h2>2. Milestones &amp; achievements</h2>
+<ul>{milestones_html}</ul>
+<p class="note"><em>Auto-detected — edit manually in --notes-file (## Milestones) if needed.</em></p>
 
-<h2>Marketing &amp; Sales Funnel Report (Deep Dive)</h2>
-<p>{html.escape(report.funnel_narrative)}</p>
+<h2>3. Key channel performance</h2>
+<ul>{channel_bullets_html}</ul>
+{tables_html}
 
-<h2>Summary in Numbers</h2>
-{summary_html}
-{next_week_html}
-{meet_table}
-{efficiency_html}
-
-<p><strong>Cross-period summary</strong></p>
-<div class="funnel-flow">{cross_html}</div>
-{stage_table}
-
-{nc_section}
-{leads_section}
-{meetings_section}
-{signups_section}
-
-<h2>Marketing Operations</h2>
+<h2>4. Operations</h2>
 {ops_html}
 
 {errors_html}
@@ -855,12 +721,8 @@ def write_weekly_in_review_email(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Unified weekly in-review email report")
-    parser.add_argument(
-        "--start",
-        type=str,
-        default="",
-        help="Period start YYYY-MM-DD (default: Sunday on or before --end)",
+    parser = argparse.ArgumentParser(
+        description="Weekly in-review email — funnel + milestones + channels + Monday ops"
     )
     parser.add_argument(
         "--end",
@@ -872,27 +734,25 @@ def main() -> None:
         "--notes-file",
         type=str,
         default="",
-        help="Optional markdown notes (## Milestones, ## Funnel narrative, ## Next week)",
+        help="Optional markdown (## Executive summary, ## Milestones)",
     )
     parser.add_argument("--open", action="store_true", help="Open HTML in browser")
     parser.add_argument("--output-dir", type=str, default="")
     args = parser.parse_args()
 
     end = date.fromisoformat(args.end) if args.end else default_end_date()
-    if args.start:
-        start = date.fromisoformat(args.start)
-    else:
-        start, end = sunday_friday_range(end=end)
 
     notes = NotesSections()
     if args.notes_file:
         notes = parse_notes_file(_resolve_path(args.notes_file))
         print(f"Loaded notes from {args.notes_file}")
 
-    report = load_weekly_in_review_email(start=start, end=end, notes=notes)
+    report = load_weekly_in_review_email(end=end, notes=notes)
     out_dir = Path(args.output_dir) if args.output_dir else OUTPUT_DIR
     path = write_weekly_in_review_email(report, output_dir=out_dir)
     print(f"Wrote {path}")
+    print(f"  Executive summary: {report.executive_word_count} words")
+    print(f"  Milestones: {len(report.milestones)}")
 
     if args.open:
         webbrowser.open(path.resolve().as_uri())
