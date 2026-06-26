@@ -3,6 +3,10 @@ Digital Channel Dashboard on localhost — live Google Ads, Meta, and GoHighLeve
 
     streamlit run DC-Live-Dash/digital_channel_live_dashboard.py --server.port 8850
 
+Campaign breakdown only (separate report):
+
+    streamlit run DC-Live-Dash/campaign_breakdown_report.py --server.port 8854
+
 Open:
 
     http://127.0.0.1:8850/
@@ -58,6 +62,7 @@ if (
 import funnel_over_time_data as _funnel_mod
 import signup_comparison_data as _signup_cmp_mod
 import bookings_meetings_comparison_data as _bookings_meetings_mod
+from campaign_breakdown_ui import render_campaign_breakdown
 
 _EXPECTED_FUNNEL_REVISION = "2026-06-25-consolidated-terminations-v1"
 if (
@@ -580,16 +585,6 @@ still open. Not affected by sidebar channel, campaign, or attribution filters.""
     if bm_notes:
         body += "<p><strong>Data sources</strong></p>" + _help_list_html(list(bm_notes))
     return body
-
-
-def _campaign_breakdown_help_html() -> str:
-    return _help_paragraphs_html(
-        """Filtered campaign rows for the selected date range and sidebar filters.""",
-        """<strong>Creative allocation</strong> — spend share by asset type (Text, Video,
-Image, Combo, etc.).""",
-        """<strong>Spend vs clicks</strong> — correlation scatter for filtered campaigns.""",
-        """Expand <strong>View filtered campaign data</strong> for the underlying table.""",
-    )
 
 
 def _date_range_help_html() -> str:
@@ -1380,63 +1375,6 @@ def _cpl_over_time_chart(monthly: pd.DataFrame) -> go.Figure | None:
             "%{x}<br>CPL: $%{y:,.2f}<br>Leads: %{customdata[0]:,.0f}<extra></extra>"
         ),
         customdata=plot_df[["leads"]].values,
-    )
-    return fig
-
-
-def _spend_click_correlation(df: pd.DataFrame) -> go.Figure | None:
-    if df.empty:
-        return None
-    by_campaign = (
-        df.groupby("campaign", as_index=False)
-        .agg(spend=("spend", "sum"), clicks=("clicks", "sum"))
-        .sort_values("spend", ascending=False)
-        .head(15)
-    )
-    if by_campaign.empty:
-        return None
-    fig = px.bar(
-        by_campaign,
-        x="campaign",
-        y=["spend", "clicks"],
-        barmode="group",
-        title="Spend / Click Correlation Per Campaign",
-        color_discrete_sequence=["#0B5394", "#C9DAF8"],
-        labels={"value": "Amount", "variable": "", "campaign": "Campaign"},
-    )
-    fig.update_layout(
-        height=420,
-        margin=_chart_margin(has_legend=True, bottom=100),
-        legend=_chart_legend_top(x=0.5, xanchor="center"),
-        xaxis_tickangle=-35,
-        plot_bgcolor="rgba(0,0,0,0)",
-        paper_bgcolor="rgba(0,0,0,0)",
-    )
-    return fig
-
-
-def _creative_allocation_pie(df: pd.DataFrame) -> go.Figure | None:
-    if df.empty:
-        return None
-    by_type = (
-        df.groupby("creative_type", as_index=False)["spend"]
-        .sum()
-        .sort_values("spend", ascending=False)
-    )
-    if by_type["spend"].sum() <= 0:
-        return None
-    fig = px.pie(
-        by_type,
-        names="creative_type",
-        values="spend",
-        title="Campaign Asset Marketing Creative Allocations",
-        color_discrete_sequence=px.colors.sequential.Teal,
-        hole=0.35,
-    )
-    fig.update_layout(
-        height=420,
-        margin=_chart_margin(has_legend=False, extra_top=8),
-        font=dict(family="Roboto, sans-serif", color=COLORS["accent_dark"]),
     )
     return fig
 
@@ -2285,46 +2223,10 @@ def main() -> None:
             else:
                 st.info("No discovery call data for quarter comparison.")
 
-    st.markdown("---")
-    _render_heading_with_help(
-        "Campaign breakdown",
-        _campaign_breakdown_help_html(),
-        style="section",
+    render_campaign_breakdown(
+        df,
+        render_heading_with_help=_render_heading_with_help,
     )
-
-    col_pie, col_bar = st.columns(2)
-    with col_pie:
-        pie = _creative_allocation_pie(df)
-        if pie:
-            st.plotly_chart(pie, use_container_width=True)
-    with col_bar:
-        corr = _spend_click_correlation(df)
-        if corr:
-            st.plotly_chart(corr, use_container_width=True)
-
-    with st.expander("View filtered campaign data"):
-        display_cols = [
-            "date",
-            "channel",
-            "campaign",
-            "creative_type",
-            "fb_ig_type",
-            "spend",
-            "clicks",
-            "cpc",
-            "leads",
-            "cpl",
-            "dcs",
-            "cpdc",
-            "conversions",
-            "lead_to_patient_pct",
-            "cac",
-        ]
-        st.dataframe(
-            df[display_cols].sort_values("date", ascending=False),
-            use_container_width=True,
-            hide_index=True,
-        )
 
 
 if __name__ == "__main__":

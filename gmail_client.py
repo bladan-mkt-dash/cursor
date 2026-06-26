@@ -327,14 +327,17 @@ def fetch_unread_by_label(
     return [fetch_message(service, mid, folder="marketing") for mid in ids]
 
 
-def fetch_unread_by_query(
+def fetch_messages_by_subject_contains(
     service,
     *,
-    query: str,
-    max_messages: int = 25,
+    subject_token: str,
+    folder: str = "search",
+    max_messages: int = 100,
 ) -> list[GmailMessage]:
-    """Unread messages matching a custom Gmail search query."""
-    full = f"({query.strip()}) is:unread".strip()
-    ids = list_message_ids(service, query=full, max_messages=max_messages)
-    return [fetch_message(service, mid, folder="marketing") for mid in ids]
+    """All messages whose subject contains ``subject_token`` (no date filter)."""
+    token = (subject_token or "").strip()
+    if not token:
+        return []
+    ids = list_message_ids(service, query=f"subject:{token}", max_messages=max_messages)
+    return [fetch_message(service, mid, folder=folder) for mid in ids]
 

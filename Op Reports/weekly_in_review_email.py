@@ -1,17 +1,21 @@
 """
 Weekly In Review — leadership email (HTML).
 
-Four sections:
+Six sections:
   1. Executive summary (≤120 words) — funnel health, next-week priorities, team focus
   2. Milestones & achievements (3–5 auto-detected; override via --notes-file)
   3. Key channel performance — selective WoW highlights from work_week_in_review data
   4. Operations — Monday ops view (Requested / Working on / Reviewed & Approved)
+  5. Tech Support — Major Tickets — Gmail threads for #TVL00011603, #TVL00011765, #TVL00011786
+  6. Partnerships & vendors — new partner/vendor conversations (Gmail)
 
 Sources:
   - work_week_in_review.py   Sun–Fri funnel snapshot vs prior Sun–Fri
   - monday_ops_view.py       team task boards
   - war_room_data.py         organic social (milestones)
   - activity_summary_report  completed Google Tasks (milestones)
+  - tech_support_major_tickets.py  Valley List ticket email chains (Gmail)
+  - partnerships_vendors.py  partnership/vendor email threads (Gmail)
 
     python weekly_in_review_email.py
     python weekly_in_review_email.py --end 2026-06-26 --open
@@ -42,6 +46,14 @@ if str(_MWR_DIR) not in sys.path:
 from activity_summary_report import fetch_completed_tasks  # noqa: E402
 from google_tasks_client import tasks_service  # noqa: E402
 from monday_ops_view import MondayOpsView, load_monday_ops_view  # noqa: E402
+from partnerships_vendors import (  # noqa: E402
+    PartnershipsVendorsSection,
+    load_partnerships_vendors,
+)
+from tech_support_major_tickets import (  # noqa: E402
+    TechSupportMajorTickets,
+    load_tech_support_major_tickets,
+)
 from war_room_data import OrganicSocialMetrics, load_organic_social  # noqa: E402
 from work_week_in_review import (  # noqa: E402
     SourceDeltaRow,
@@ -87,6 +99,8 @@ class WeeklyInReviewEmail:
     channel_bullets: list[str]
     channel_tables: list[ChannelTable]
     monday_ops: MondayOpsView
+    tech_support: TechSupportMajorTickets
+    partnerships: PartnershipsVendorsSection
     errors: list[str] = field(default_factory=list)
 
 
@@ -552,6 +566,20 @@ def load_weekly_in_review_email(
     completed_tasks, task_errors = _load_completed_tasks(start=period_start, end=period_end)
     errors.extend(task_errors)
 
+    print("Loading Tech Support major ticket threads …")
+    tech_support = load_tech_support_major_tickets(
+        period_start=period_start,
+        period_end=period_end,
+    )
+    errors.extend(tech_support.errors)
+
+    print("Loading partnerships & vendor threads …")
+    partnerships = load_partnerships_vendors(
+        period_start=period_start,
+        period_end=period_end,
+    )
+    errors.extend(partnerships.errors)
+
     executive = build_executive_summary(
         snap, monday, override=notes.executive_summary
     )
@@ -575,6 +603,8 @@ def load_weekly_in_review_email(
         channel_bullets=channel_bullets,
         channel_tables=channel_tables,
         monday_ops=monday,
+        tech_support=tech_support,
+        partnerships=partnerships,
         errors=errors,
     )
 
@@ -628,6 +658,55 @@ def _render_ops_section(monday: MondayOpsView) -> str:
     return "".join(parts)
 
 
+def _render_tech_support_section(tech_support: TechSupportMajorTickets) -> str:
+    if not tech_support.tickets:
+        return "<p class='empty'>No major ticket threads loaded.</p>"
+
+    parts: list[str] = []
+    for ticket in tech_support.tickets:
+        bullets = "".join(
+            f"<li>{html.escape(b)}</li>" for b in ticket.bullets
+        )
+        meta = (
+            f"Status: {html.escape(ticket.status)} · "
+            f"{ticket.period_messages} this week · {ticket.total_messages} in thread"
+        )
+        if ticket.last_activity:
+            meta += f" · last activity {ticket.last_activity:%b %d, %Y}"
+        parts.append(
+            f"""
+        <div class="ticket-block">
+          <h3>{html.escape(ticket.ticket_id)} — {html.escape(ticket.subject)}</h3>
+          <p class="ticket-meta">{meta}</p>
+          <ul>{bullets}</ul>
+        </div>
+        """
+        )
+    return "".join(parts)
+
+
+def _render_partnerships_section(partnerships: PartnershipsVendorsSection) -> str:
+    if not partnerships.items:
+        return "<p class='empty'>No partnership or vendor threads loaded.</p>"
+
+    parts: list[str] = []
+    for item in partnerships.items:
+        bullets = "".join(f"<li>{html.escape(b)}</li>" for b in item.bullets)
+        meta = f"Status: {html.escape(item.status)} · {item.period_messages} this week"
+        if item.last_activity:
+            meta += f" · last activity {item.last_activity:%b %d, %Y}"
+        parts.append(
+            f"""
+        <div class="ticket-block">
+          <h3>{html.escape(item.name)}</h3>
+          <p class="ticket-meta">{meta}</p>
+          <ul>{bullets}</ul>
+        </div>
+        """
+        )
+    return "".join(parts)
+
+
 def render_weekly_in_review_html(report: WeeklyInReviewEmail) -> str:
     title = (
         f"Weekly In Review — {report.period_start.strftime('%b %d')}–"
@@ -642,6 +721,8 @@ def render_weekly_in_review_html(report: WeeklyInReviewEmail) -> str:
     )
     tables_html = "".join(_render_table(t) for t in report.channel_tables)
     ops_html = _render_ops_section(report.monday_ops)
+    tech_support_html = _render_tech_support_section(report.tech_support)
+    partnerships_html = _render_partnerships_section(report.partnerships)
 
     errors_html = ""
     if report.errors:
@@ -650,7 +731,8 @@ def render_weekly_in_review_html(report: WeeklyInReviewEmail) -> str:
     period_note = (
         f"Sun–Fri {report.period_start.isoformat()} → {report.period_end.isoformat()} "
         f"vs prior {report.prior_start.isoformat()} → {report.prior_end.isoformat()}. "
-        f"Funnel from work_week_in_review · ops from monday_ops_view."
+        f"Funnel from work_week_in_review · ops from monday_ops_view · "
+        f"tech tickets from Gmail · partnerships from Gmail (Help Without Hassle, Red Beard Consulting)."
     )
 
     return f"""<!DOCTYPE html>
@@ -677,6 +759,9 @@ tr.total-row td {{ font-weight: bold; background: #fafbfc; }}
 .ops-person {{ margin-bottom: 18px; padding-bottom: 14px; border-bottom: 1px solid #e8ecef; }}
 .ops-person:last-child {{ border-bottom: none; }}
 .ops-sub {{ margin-bottom: 10px; padding-left: 4px; }}
+.ticket-block {{ margin-bottom: 20px; padding-bottom: 16px; border-bottom: 1px solid #e8ecef; }}
+.ticket-block:last-child {{ border-bottom: none; }}
+.ticket-meta {{ font-size: 9pt; color: #666; margin: 0 0 8px 0; }}
 .count {{ font-weight: normal; color: #888; font-size: 9pt; }}
 .empty {{ margin: 0; color: #888; font-size: 9pt; }}
 .note {{ font-size: 9pt; color: #666; }}
@@ -701,6 +786,14 @@ tr.total-row td {{ font-weight: bold; background: #fafbfc; }}
 <h2>4. Operations</h2>
 {ops_html}
 
+<h2>5. Tech Support — Major Tickets</h2>
+{tech_support_html}
+<p class="note"><em>Summarized from Gmail threads matching #TVL00011603, #TVL00011765, and #TVL00011786.</em></p>
+
+<h2>6. Partnerships &amp; vendors</h2>
+{partnerships_html}
+<p class="note"><em>Summarized from Gmail (Help Without Hassle, Red Beard Consulting). Edit manually where noted.</em></p>
+
 {errors_html}
 
 </body>
@@ -722,7 +815,7 @@ def write_weekly_in_review_email(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Weekly in-review email — funnel + milestones + channels + Monday ops"
+        description="Weekly in-review email — funnel + milestones + channels + ops + tech + partnerships"
     )
     parser.add_argument(
         "--end",
