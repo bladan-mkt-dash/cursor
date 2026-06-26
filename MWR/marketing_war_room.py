@@ -79,7 +79,7 @@ from ghl_client import HEAR_ABOUT_US_FIELD_NAME  # noqa: E402 — after war_room
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 # Bump when loader logic changes — invalidates @st.cache_data without a server restart.
-WAR_ROOM_LOADER_VERSION = "2026-06-17-organic-not-set-label-v24"
+WAR_ROOM_LOADER_VERSION = "2026-06-25-pay-period-hours-v1"
 
 SPARKLINE_HEIGHT_PX = 44
 
@@ -786,6 +786,14 @@ def _fmt_count(value: float | int | None) -> str:
     if isinstance(value, float) and not value.is_integer():
         return f"{value:,.1f}"
     return f"{int(round(value)):,}"
+
+
+def _fmt_hours(value: float | None) -> str:
+    if value is None:
+        return "—"
+    if abs(value - round(value)) < 0.05:
+        return f"{int(round(value))}h"
+    return f"{value:.1f}h"
 
 
 def _fmt_pct(value: float | None) -> str:
@@ -1907,11 +1915,24 @@ def _board_status_html(board: BoardTaskSummary) -> str:
 
 
 def _render_team_ops(data: TeamOpsMetrics) -> None:
+    pay_caption = "Monday.com · open queue · current status"
+    if data.pay_period_start and data.pay_period_end:
+        ps = datetime.fromisoformat(data.pay_period_start).strftime("%b %d")
+        pe = datetime.fromisoformat(data.pay_period_end).strftime("%b %d, %Y")
+        pay_caption = f"{pay_caption} · pay period {ps}–{pe}"
     with _panel(
         "Team & projects",
-        "Monday.com · open queue · current status",
+        pay_caption,
         "war-room-team-ops",
     ):
+        if data.pay_period_hours:
+            hour_metrics = [
+                (row.person, _fmt_hours(row.hours))
+                for row in data.pay_period_hours
+            ]
+            for idx in range(0, len(hour_metrics), 3):
+                _metric_row(hour_metrics[idx : idx + 3])
+            _metric_row([("Team total", _fmt_hours(data.pay_period_total_hours))])
         _metric_row(
             [
                 ("Requested", _fmt_count(data.total_requested)),

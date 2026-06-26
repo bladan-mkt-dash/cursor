@@ -4,7 +4,7 @@ from __future__ import annotations
 
 # Bump when exports or loaders change — marketing_war_room.py reloads this module
 # when the revision differs (Streamlit caches imports across reruns).
-WAR_ROOM_DATA_REVISION = "2026-06-12-team-ops-status-buckets-v14"
+WAR_ROOM_DATA_REVISION = "2026-06-25-pay-period-hours-v1"
 
 import calendar
 import importlib
@@ -182,6 +182,18 @@ WAR_ROOM_MONDAY_BOARD_NAMES: tuple[str, ...] = (
     "We Have SEO",
 )
 
+WAR_ROOM_BOARD_PERSON_LABELS: dict[str, str] = {
+    "Sam New To-Do List": "Sam",
+    "Je New To-Do List": "Je",
+    "Voltaire To-Do List": "Voltaire",
+    "Lead Paramedic": "Lead Paramedic",
+    "We Have SEO": "We Have SEO",
+}
+
+# Current pay period for Monday Total Hours rollups (14-day periods).
+WAR_ROOM_PAY_PERIOD_START = date(2026, 6, 14)
+WAR_ROOM_PAY_PERIOD_LENGTH_DAYS = 14
+
 @dataclass
 class StatusCountRow:
     status: str
@@ -234,6 +246,14 @@ TEAM_OPS_STATUS_TO_BUCKET: dict[str, str] = {
 
 
 @dataclass
+class PayPeriodPersonHours:
+    person: str
+    board_name: str
+    hours: float
+    task_count: int
+
+
+@dataclass
 class BoardTaskSummary:
     board_name: str
     requested: int = 0
@@ -252,6 +272,10 @@ class TeamOpsMetrics:
     total_ready_for_publishing: int = 0
     boards: list[BoardTaskSummary] = field(default_factory=list)
     missing_boards: list[str] = field(default_factory=list)
+    pay_period_start: str = ""
+    pay_period_end: str = ""
+    pay_period_hours: list[PayPeriodPersonHours] = field(default_factory=list)
+    pay_period_total_hours: float = 0.0
     errors: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -384,6 +408,53 @@ def _calendar_dates_inclusive(start: date, end: date) -> list[str]:
     return days
 
 
+def _trend_window(
+    *,
+    as_of: date | None = None,
+    period_start: date | None = None,
+    period_end: date | None = None,
+    days: int = 7,
+) -> tuple[str, str, list[str], str, str, list[str]]:
+    """
+    Inclusive trend window and the immediately prior window of the same length.
+
+    When ``period_start`` and ``period_end`` are set, uses that exact range instead
+    of the default rolling ``days`` ending on ``as_of``.
+    """
+    if period_start is not None and period_end is not None:
+        if period_start > period_end:
+            raise ValueError("period_start must be on or before period_end")
+        trend_since = period_start.isoformat()
+        trend_until = period_end.isoformat()
+        trend_dates = _calendar_dates_inclusive(period_start, period_end)
+        prior_end = period_start - timedelta(days=1)
+        prior_start = prior_end - timedelta(days=len(trend_dates) - 1)
+        prior_since = prior_start.isoformat()
+        prior_until = prior_end.isoformat()
+        prior_dates = _calendar_dates_inclusive(prior_start, prior_end)
+        return trend_since, trend_until, trend_dates, prior_since, prior_until, prior_dates
+
+    today = as_of or date.today()
+    trend_since, trend_until = _last_n_days_range(as_of=today, days=days)
+    trend_start = date.fromisoformat(trend_since)
+    trend_end = date.fromisoformat(trend_until)
+    trend_dates = (
+        _seven_day_dates(today)
+        if days == 7
+        else _calendar_dates_inclusive(trend_start, trend_end)
+    )
+    prior_anchor = today - timedelta(days=days)
+    prior_since, prior_until = _last_n_days_range(as_of=prior_anchor, days=days)
+    prior_start = date.fromisoformat(prior_since)
+    prior_end = date.fromisoformat(prior_until)
+    prior_dates = (
+        _prior_seven_day_dates(today)
+        if days == 7
+        else _calendar_dates_inclusive(prior_start, prior_end)
+    )
+    return trend_since, trend_until, trend_dates, prior_since, prior_until, prior_dates
+
+
 def _cumulative_by_date(dates: list[str], daily: dict[str, float]) -> dict[str, float]:
     running = 0.0
     out: dict[str, float] = {}
@@ -506,15 +577,24 @@ def _cpa(spend: float | None, leads: float | None) -> float | None:
     return spend / leads
 
 
-def load_paid_media(*, as_of: date | None = None) -> PaidMediaMetrics:
+def load_paid_media(
+    *,
+    as_of: date | None = None,
+    period_start: date | None = None,
+    period_end: date | None = None,
+) -> PaidMediaMetrics:
     """
     Paid media panel — account-level Google Ads + Meta for the last 7 days.
 
     Leads = Google Ads conversions (discovery calls) + Meta lead actions.
     CPL = combined spend ÷ combined leads.
     """
-    today = as_of or date.today()
-    since, until = _last_n_days_range(as_of=today, days=7)
+    today = period_end or as_of or date.today()
+    since, until, _, _, _, _ = _trend_window(
+        as_of=today,
+        period_start=period_start,
+        period_end=period_end,
+    )
     metrics = PaidMediaMetrics(period_since=since, period_until=until)
 
     google_spend: float | None = None
@@ -557,7 +637,12 @@ def _conversion_rate_pct(numerator: float | None, denominator: float | None) -> 
     return numerator / denominator * 100.0
 
 
-def load_crm_funnel(*, as_of: date | None = None) -> CrmFunnelMetrics:
+def load_crm_funnel(
+    *,
+    as_of: date | None = None,
+    period_start: date | None = None,
+    period_end: date | None = None,
+) -> CrmFunnelMetrics:
     """
     CRM & funnel panel — GHL signups, bookings, and meetings for the last 7 days.
 
@@ -566,8 +651,12 @@ def load_crm_funnel(*, as_of: date | None = None) -> CrmFunnelMetrics:
     - Meetings: calendar appointments by **startTime**
     - Conv. rate: signups ÷ meetings (%)
     """
-    today = as_of or date.today()
-    since, until = _last_n_days_range(as_of=today, days=7)
+    today = period_end or as_of or date.today()
+    since, until, _, _, _, _ = _trend_window(
+        as_of=today,
+        period_start=period_start,
+        period_end=period_end,
+    )
     metrics = CrmFunnelMetrics(period_since=since, period_until=until)
 
     try:
@@ -622,7 +711,12 @@ def _get_embed_page_paths() -> tuple[str, ...]:
     return _embed_paths_cache
 
 
-def load_website_traffic(*, as_of: date | None = None) -> WebsiteTrafficMetrics:
+def load_website_traffic(
+    *,
+    as_of: date | None = None,
+    period_start: date | None = None,
+    period_end: date | None = None,
+) -> WebsiteTrafficMetrics:
     """
     Website & traffic panel — GA4 property totals and embed-page views (last 7 days).
 
@@ -630,8 +724,12 @@ def load_website_traffic(*, as_of: date | None = None) -> WebsiteTrafficMetrics:
     - Top channel: highest ``sessionDefaultChannelGroup`` by sessions
     - Embed views: ``screenPageViews`` on GHL calendar embed pages (excludes home)
     """
-    today = as_of or date.today()
-    since, until = _last_n_days_range(as_of=today, days=7)
+    today = period_end or as_of or date.today()
+    since, until, _, _, _, _ = _trend_window(
+        as_of=today,
+        period_start=period_start,
+        period_end=period_end,
+    )
     metrics = WebsiteTrafficMetrics(period_since=since, period_until=until)
 
     try:
@@ -671,18 +769,33 @@ def load_website_traffic(*, as_of: date | None = None) -> WebsiteTrafficMetrics:
     return metrics
 
 
-def load_organic_social(*, as_of: date | None = None) -> OrganicSocialMetrics:
+def load_organic_social(
+    *,
+    as_of: date | None = None,
+    period_start: date | None = None,
+    period_end: date | None = None,
+) -> OrganicSocialMetrics:
     """Organic social panel — Instagram reach, engagement, followers, top post (7 days)."""
-    today = as_of or date.today()
-    since, until = _last_n_days_range(as_of=today, days=7)
+    today = period_end or as_of or date.today()
+    since, until, _, _, _, _ = _trend_window(
+        as_of=today,
+        period_start=period_start,
+        period_end=period_end,
+    )
     metrics = OrganicSocialMetrics(period_since=since, period_until=until)
 
     try:
         from meta_organic_client import fetch_organic_social_7d
 
-        snap = fetch_organic_social_7d(as_of=as_of)
-        metrics.period_since = snap.period_since
-        metrics.period_until = snap.period_until
+        snap = fetch_organic_social_7d(as_of=today)
+        if period_start is None and period_end is None:
+            metrics.period_since = snap.period_since
+            metrics.period_until = snap.period_until
+        if period_start is not None and period_end is not None:
+            metrics.notes.append(
+                "Instagram organic API uses a fixed 7-day window ending on period end; "
+                "headline metrics may include one day outside the selected range."
+            )
         metrics.ig_reach_7d = snap.ig_reach_7d
         metrics.ig_engagement_7d = snap.ig_engagement_7d
         metrics.follower_delta_7d = snap.follower_delta_7d
@@ -698,12 +811,21 @@ def load_organic_social(*, as_of: date | None = None) -> OrganicSocialMetrics:
     return metrics
 
 
-def load_content_seo(*, as_of: date | None = None) -> ContentSeoMetrics:
+def load_content_seo(
+    *,
+    as_of: date | None = None,
+    period_start: date | None = None,
+    period_end: date | None = None,
+) -> ContentSeoMetrics:
     """
     Content & SEO panel — organic search sessions, blog views, top landing page (7 days).
     """
-    today = as_of or date.today()
-    since, until = _last_n_days_range(as_of=today, days=7)
+    today = period_end or as_of or date.today()
+    since, until, _, _, _, _ = _trend_window(
+        as_of=today,
+        period_start=period_start,
+        period_end=period_end,
+    )
     metrics = ContentSeoMetrics(period_since=since, period_until=until)
 
     try:
@@ -816,6 +938,54 @@ def _tasks_by_bucket_for_board(df) -> dict[str, list[str]]:
     return buckets
 
 
+def _war_room_pay_period_range(*, as_of: date | None = None) -> tuple[date, date]:
+    """Inclusive pay-period dates through ``as_of`` (capped at period end)."""
+    from monday_board_hours_report import pay_period_end
+
+    today = as_of or date.today()
+    period_start = WAR_ROOM_PAY_PERIOD_START
+    scheduled_end = pay_period_end(
+        period_start, length_days=WAR_ROOM_PAY_PERIOD_LENGTH_DAYS
+    )
+    period_end = min(today, scheduled_end)
+    if period_end < period_start:
+        period_end = period_start
+    return period_start, period_end
+
+
+def _load_pay_period_hours(*, as_of: date | None = None) -> tuple[list[PayPeriodPersonHours], date, date, list[str]]:
+    """Sum Monday Total Hours per person/board for the active pay period."""
+    from monday_board_hours_report import load_board_hours_rows
+
+    period_start, period_end = _war_room_pay_period_range(as_of=as_of)
+    rows: list[PayPeriodPersonHours] = []
+    errors: list[str] = []
+
+    for board_name in WAR_ROOM_MONDAY_BOARD_NAMES:
+        person = WAR_ROOM_BOARD_PERSON_LABELS.get(board_name, board_name)
+        try:
+            task_rows = load_board_hours_rows(
+                board_name,
+                period_start=period_start,
+                period_end=period_end,
+            )
+        except Exception as exc:
+            errors.append(f"{person}: {exc}")
+            continue
+        total_hours = sum(float(row.get("working_hours") or 0.0) for row in task_rows)
+        rows.append(
+            PayPeriodPersonHours(
+                person=person,
+                board_name=board_name,
+                hours=total_hours,
+                task_count=len(task_rows),
+            )
+        )
+
+    rows.sort(key=lambda row: (-row.hours, row.person.casefold()))
+    return rows, period_start, period_end, errors
+
+
 def load_team_ops(*, as_of: date | None = None) -> TeamOpsMetrics:
     """Team & projects — open Monday.com tasks by current workflow Status per board."""
     metrics = TeamOpsMetrics()
@@ -830,57 +1000,75 @@ def load_team_ops(*, as_of: date | None = None) -> TeamOpsMetrics:
 
         if not board_map:
             metrics.errors.append("Monday: no scoped boards resolved.")
-            return metrics
+        else:
+            board_ids = list(board_map.values())
+            name_by_id = {board_id: name for name, board_id in board_map.items()}
+            df, truncated = fetch_items_from_boards(board_ids, board_names=name_by_id)
 
-        board_ids = list(board_map.values())
-        name_by_id = {board_id: name for name, board_id in board_map.items()}
-        df, truncated = fetch_items_from_boards(board_ids, board_names=name_by_id)
+            if any(truncated.values()):
+                metrics.notes.append("Some boards hit pagination cap; counts may be incomplete.")
 
-        if any(truncated.values()):
-            metrics.notes.append("Some boards hit pagination cap; counts may be incomplete.")
+            open_df = _open_team_ops_tasks(df)
 
-        open_df = _open_team_ops_tasks(df)
-
-        summaries: list[BoardTaskSummary] = []
-        for board_name in WAR_ROOM_MONDAY_BOARD_NAMES:
-            board_id = board_map.get(board_name)
-            if not board_id:
-                continue
-            board_df = open_df[open_df["board_id"] == board_id] if not open_df.empty else open_df
-            by_status = _count_tasks_by_status(board_df)
-            summaries.append(
-                BoardTaskSummary(
-                    board_name=board_name,
-                    requested=status_count_for(by_status, "Requested"),
-                    by_status=by_status,
-                    tasks_by_bucket=_tasks_by_bucket_for_board(board_df),
+            summaries: list[BoardTaskSummary] = []
+            for board_name in WAR_ROOM_MONDAY_BOARD_NAMES:
+                board_id = board_map.get(board_name)
+                if not board_id:
+                    continue
+                board_df = open_df[open_df["board_id"] == board_id] if not open_df.empty else open_df
+                by_status = _count_tasks_by_status(board_df)
+                summaries.append(
+                    BoardTaskSummary(
+                        board_name=board_name,
+                        requested=status_count_for(by_status, "Requested"),
+                        by_status=by_status,
+                        tasks_by_bucket=_tasks_by_bucket_for_board(board_df),
+                    )
                 )
-            )
 
-        metrics.boards = summaries
-        for board in summaries:
-            metrics.total_open += len(board.tasks_by_bucket.get("Open", []))
-            for row in board.by_status:
-                status_key = row.status.strip().casefold()
-                if status_key == "requested":
-                    metrics.total_requested += row.count
-                elif status_key == "working on it":
-                    metrics.total_working += row.count
-                elif status_key == "in review":
-                    metrics.total_in_review += row.count
-                elif status_key == "ready for publishing":
-                    metrics.total_ready_for_publishing += row.count
-        metrics.notes.append(
-            "Open tasks by current workflow Status (excludes Done/Published) · "
-            "Board-specific labels mapped to shared buckets (e.g. Request Made → Requested)."
-        )
+            metrics.boards = summaries
+            for board in summaries:
+                metrics.total_open += len(board.tasks_by_bucket.get("Open", []))
+                for row in board.by_status:
+                    status_key = row.status.strip().casefold()
+                    if status_key == "requested":
+                        metrics.total_requested += row.count
+                    elif status_key == "working on it":
+                        metrics.total_working += row.count
+                    elif status_key == "in review":
+                        metrics.total_in_review += row.count
+                    elif status_key == "ready for publishing":
+                        metrics.total_ready_for_publishing += row.count
+            metrics.notes.append(
+                "Open tasks by current workflow Status (excludes Done/Published) · "
+                "Board-specific labels mapped to shared buckets (e.g. Request Made → Requested)."
+            )
     except Exception as exc:
         metrics.errors.append(f"Monday.com: {exc}")
+
+    try:
+        pay_rows, pay_start, pay_end, pay_errors = _load_pay_period_hours(as_of=as_of)
+        metrics.pay_period_hours = pay_rows
+        metrics.pay_period_start = pay_start.isoformat()
+        metrics.pay_period_end = pay_end.isoformat()
+        metrics.pay_period_total_hours = sum(row.hours for row in pay_rows)
+        metrics.errors.extend(pay_errors)
+        metrics.notes.append(
+            "Pay-period hours from Monday Total Hours on tasks with Deadline/Worked On, "
+            "Posting Schedule, or Last Updated in range."
+        )
+    except Exception as exc:
+        metrics.errors.append(f"Monday pay-period hours: {exc}")
 
     return metrics
 
 
-def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
+def load_command_strip(
+    *,
+    as_of: date | None = None,
+    period_start: date | None = None,
+    period_end: date | None = None,
+) -> CommandStripMetrics:
     """
     Aggregate cross-channel KPIs for the command strip.
 
@@ -892,18 +1080,26 @@ def load_command_strip(*, as_of: date | None = None) -> CommandStripMetrics:
       - New contacts: GHL contacts by ``dateAdded``
       - Sessions: GA4 property total
     """
-    today = as_of or date.today()
+    today = period_end or as_of or date.today()
     month_start = today.replace(day=1)
     year_start = today.replace(month=1, day=1)
     month_start_iso = month_start.isoformat()
     year_start_iso = year_start.isoformat()
     today_iso = today.isoformat()
-    trend_since, trend_until = _last_n_days_range(as_of=today, days=7)
-    prior_since, prior_until = _last_n_days_range(as_of=today - timedelta(days=7), days=7)
+    (
+        trend_since,
+        trend_until,
+        trend_dates,
+        prior_since,
+        prior_until,
+        prior_dates,
+    ) = _trend_window(
+        as_of=today,
+        period_start=period_start,
+        period_end=period_end,
+    )
     prior_mtd_since, prior_mtd_until = _prior_month_mtd_range(today)
     prior_ytd_since, prior_ytd_until = _prior_year_ytd_range(today)
-    trend_dates = _seven_day_dates(today)
-    prior_dates = _prior_seven_day_dates(today)
     compare_dates = prior_dates + trend_dates
 
     metrics = CommandStripMetrics(period_since=trend_since, period_until=trend_until)
@@ -1325,23 +1521,34 @@ def _enrich_traffic_contributors_with_prior(
     return enriched
 
 
-def load_conversion_drivers(*, as_of: date | None = None) -> ConversionDriversMetrics:
+def load_conversion_drivers(
+    *,
+    as_of: date | None = None,
+    period_start: date | None = None,
+    period_end: date | None = None,
+) -> ConversionDriversMetrics:
     """
     Discovery Call & Conversion Drivers — GA4 traffic contributors, GHL bookings,
     meetings, and committed members grouped by **How did you hear about us?**
     (last 7 days).
     """
-    today = as_of or date.today()
-    since, until = _last_n_days_range(as_of=today, days=7)
+    today = period_end or as_of or date.today()
+    (
+        since,
+        until,
+        _,
+        prior_since,
+        prior_until,
+        _,
+    ) = _trend_window(
+        as_of=today,
+        period_start=period_start,
+        period_end=period_end,
+    )
     metrics = ConversionDriversMetrics(period_since=since, period_until=until)
 
     try:
         from google_data import get_sessions_by_session_default_channel_group
-
-        prior_since, prior_until = _last_n_days_range(
-            as_of=today - timedelta(days=7),
-            days=7,
-        )
         channels = get_sessions_by_session_default_channel_group(since, until)
         if channels.empty:
             metrics.notes.append("GA4 returned no channel rows for traffic contributors.")

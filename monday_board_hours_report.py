@@ -4,7 +4,7 @@ from __future__ import annotations
 import csv
 import sys
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from monday_client import (
@@ -18,8 +18,7 @@ from monday_client import (
     status_labels_from_settings,
 )
 
-START = date(2026, 5, 31)
-END = date(2026, 6, 13)
+DEFAULT_PAY_PERIOD_LENGTH_DAYS = 14
 DEADLINE_FIELD = "Deadline/Worked On"
 POSTING_FIELD = "Posting Schedule"
 UPDATED_FIELD = "Last Updated"
@@ -32,6 +31,11 @@ STATUS_BUCKETS = {
 }
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
+
+
+def pay_period_end(period_start: date, *, length_days: int = DEFAULT_PAY_PERIOD_LENGTH_DAYS) -> date:
+    """Inclusive end date for a fixed-length pay period."""
+    return period_start + timedelta(days=length_days - 1)
 
 
 def _parse_hours(text: str) -> float:
@@ -59,8 +63,8 @@ def _parse_date_from_col(cv: dict) -> date | None:
         return None
 
 
-def _in_range(d: date | None) -> bool:
-    return d is not None and START <= d <= END
+def _in_range(d: date | None, *, period_start: date, period_end: date) -> bool:
+    return d is not None and period_start <= d <= period_end
 
 
 def _bucket_status(status: str) -> str | None:
@@ -83,10 +87,15 @@ def _fetch_all_items(board_id: str) -> list[dict]:
     return all_items
 
 
-def load_board_rows(board_name: str) -> list[dict]:
+def load_board_hours_rows(
+    board_name: str,
+    *,
+    period_start: date,
+    period_end: date,
+) -> list[dict]:
     board_map, missing = resolve_board_ids_by_names([board_name])
     if missing:
-        raise SystemExit(f"Board not found: {missing}")
+        raise ValueError(f"Board not found: {missing}")
 
     board_id = board_map[board_name]
     cols = get_board_columns(board_id)
@@ -134,16 +143,20 @@ def load_board_rows(board_name: str) -> list[dict]:
             except ValueError:
                 pass
 
-        in_period = _in_range(deadline_dt) or _in_range(posting_dt)
-        if not in_period and hours > 0 and _in_range(updated_dt):
+        in_period = _in_range(deadline_dt, period_start=period_start, period_end=period_end) or _in_range(
+            posting_dt, period_start=period_start, period_end=period_end
+        )
+        if not in_period and hours > 0 and _in_range(
+            updated_dt, period_start=period_start, period_end=period_end
+        ):
             in_period = True
         if not in_period:
             continue
 
-        if _in_range(deadline_dt):
+        if _in_range(deadline_dt, period_start=period_start, period_end=period_end):
             work_date = deadline_dt
             date_source = col_titles.get(deadline_col or "", DEADLINE_FIELD)
-        elif _in_range(posting_dt):
+        elif _in_range(posting_dt, period_start=period_start, period_end=period_end):
             work_date = posting_dt
             date_source = col_titles.get(posting_col or "", POSTING_FIELD)
         else:
@@ -164,10 +177,25 @@ def load_board_rows(board_name: str) -> list[dict]:
     return rows
 
 
-def write_csvs(prefix: str, rows: list[dict]) -> tuple[Path, Path]:
+def load_board_rows(board_name: str) -> list[dict]:
+    """CLI default pay period (May 31 – Jun 13, 2026)."""
+    start = date(2026, 5, 31)
+    end = date(2026, 6, 13)
+    return load_board_hours_rows(board_name, period_start=start, period_end=end)
+
+
+def write_csvs(
+    prefix: str,
+    rows: list[dict],
+    *,
+    period_start: date,
+    period_end: date,
+) -> tuple[Path, Path]:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    detail_path = OUTPUT_DIR / f"{prefix}_2026-05-31_to_2026-06-13.csv"
-    daily_path = OUTPUT_DIR / f"{prefix}_2026-05-31_to_2026-06-13_daily_summary.csv"
+    start_s = period_start.isoformat()
+    end_s = period_end.isoformat()
+    detail_path = OUTPUT_DIR / f"{prefix}_{start_s}_to_{end_s}.csv"
+    daily_path = OUTPUT_DIR / f"{prefix}_{start_s}_to_{end_s}_daily_summary.csv"
 
     with detail_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
@@ -186,8 +214,8 @@ def write_csvs(prefix: str, rows: list[dict]) -> tuple[Path, Path]:
         for row in rows:
             writer.writerow(
                 {
-                    "pay_period_start": START.isoformat(),
-                    "pay_period_end": END.isoformat(),
+                    "pay_period_start": start_s,
+                    "pay_period_end": end_s,
                     **row,
                 }
             )
@@ -212,8 +240,8 @@ def write_csvs(prefix: str, rows: list[dict]) -> tuple[Path, Path]:
             grand_count += count
             writer.writerow(
                 {
-                    "pay_period_start": START.isoformat(),
-                    "pay_period_end": END.isoformat(),
+                    "pay_period_start": start_s,
+                    "pay_period_end": end_s,
                     "work_date": d,
                     "working_hours": round(hrs, 1) if hrs == int(hrs) else hrs,
                     "task_count": count,
@@ -221,8 +249,8 @@ def write_csvs(prefix: str, rows: list[dict]) -> tuple[Path, Path]:
             )
         writer.writerow(
             {
-                "pay_period_start": START.isoformat(),
-                "pay_period_end": END.isoformat(),
+                "pay_period_start": start_s,
+                "pay_period_end": end_s,
                 "work_date": "TOTAL",
                 "working_hours": round(grand_total, 1) if grand_total == int(grand_total) else grand_total,
                 "task_count": grand_count,
@@ -260,12 +288,18 @@ def print_summary(rows: list[dict]) -> None:
 def main() -> None:
     board_name = sys.argv[1] if len(sys.argv) > 1 else "Je New To-Do List"
     slug = sys.argv[2] if len(sys.argv) > 2 else "je_hours"
+    period_start = date(2026, 5, 31)
+    period_end = date(2026, 6, 13)
 
     print(f"Board: {board_name}")
-    print(f"Period: {START} to {END}")
-    rows = load_board_rows(board_name)
+    print(f"Period: {period_start} to {period_end}")
+    rows = load_board_hours_rows(
+        board_name, period_start=period_start, period_end=period_end
+    )
     print_summary(rows)
-    detail_path, daily_path = write_csvs(slug, rows)
+    detail_path, daily_path = write_csvs(
+        slug, rows, period_start=period_start, period_end=period_end
+    )
     print(f"\nWrote {detail_path}")
     print(f"Wrote {daily_path}")
 
