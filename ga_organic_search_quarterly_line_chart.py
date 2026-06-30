@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -17,6 +18,14 @@ from google_data import (
 
 _PROJECT_DIR = Path(__file__).resolve().parent
 load_dotenv(_PROJECT_DIR / ".env")
+
+# GA4 intraday totals are incomplete; chart and quarterly rollups end here.
+CHART_LAG = timedelta(hours=48)
+
+
+def _chart_through_date() -> date:
+    """Last calendar date included in the trend chart (now minus 48 hours, UTC)."""
+    return (datetime.now(timezone.utc) - CHART_LAG).date()
 
 # GA4 ``sessionDefaultChannelGroup`` values treated as paid (aggregated on the chart).
 GA4_PAID_SESSION_DEFAULT_CHANNELS = frozenset(
@@ -83,9 +92,11 @@ st.set_page_config(
     layout="wide",
 )
 st.title("Traffic by quarter and Q4 2025 → Q1 2026 channel lift (GA4)")
+chart_through = _chart_through_date()
 st.caption(
     "Chart: **Organic search**, **Paid traffic** (all GA4 paid default channel groups combined), "
-    "**Direct**, and **All sources**. **2026 Q2 excluded** from the chart. "
+    "**Direct**, and **All sources** — quarters from **2023 Q1** through the current quarter. "
+    f"Data through **{chart_through.isoformat()}** (last **48 hours** excluded for GA4 completeness). "
     "Side table: Q4 → Q1 session **change** by channel (**Cross-network**, **Display**, **Paid Other**, "
     "**Paid Search**). Expandable table: quarterly **breakdown** by channel. "
     "Latest chart point may be a **partial quarter**."
@@ -96,6 +107,7 @@ with st.spinner("Fetching GA4…"):
         df = get_organic_and_paid_search_sessions_by_quarter(
             first_year=2023,
             first_quarter=1,
+            through=chart_through,
         )
         lift_full = compare_session_default_channel_sessions(
             earlier_start=LIFT_EARLIER_START,
@@ -113,8 +125,6 @@ with st.spinner("Fetching GA4…"):
         st.error(str(e))
         st.stop()
 
-df = df[~((df["Year"] == 2026) & (df["Quarter_num"] == 2))].reset_index(drop=True)
-
 if df.empty:
     st.info("No quarterly rows returned from GA4.")
     st.stop()
@@ -131,7 +141,8 @@ is_partial = str(last_meta["Period_end"]) != _natural_q_end.isoformat()
 if is_partial:
     st.warning(
         f"Latest period **{last_meta['Quarter_label']}** is partial "
-        f"({last_meta['Period_start']} → {last_meta['Period_end']})."
+        f"({last_meta['Period_start']} → {last_meta['Period_end']}). "
+        f"Chart excludes the most recent 48 hours (through {chart_through.isoformat()})."
     )
 
 quarter_order = (

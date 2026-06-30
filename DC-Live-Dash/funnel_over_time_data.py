@@ -39,7 +39,7 @@ from ghl_client import (
 )
 
 # Bump when loader logic changes (Streamlit cache key).
-FUNNEL_OVER_TIME_REVISION = "2026-06-25-consolidated-terminations-v1"
+FUNNEL_OVER_TIME_REVISION = "2026-06-30-empty-shared-ghl-fallback-v1"
 
 _TERMINATIONS_SPREADSHEET_ID = "18fDtd3xEHHXC6sCeRFFadSwcshk4SJqFUG6aV006DhU"
 _TERMINATIONS_SHEET = "Consolidated Data"
@@ -300,7 +300,7 @@ def load_ghl_funnel_monthly(
     until_month = pd.Timestamp(until).to_period("M").to_timestamp()
 
     notes: list[str] = []
-    if ghl_leads_by_month is not None:
+    if ghl_leads_by_month:
         leads_by_month = {
             month: int(total)
             for month, total in ghl_leads_by_month.items()
@@ -311,11 +311,18 @@ def load_ghl_funnel_monthly(
                 f"GHL leads: {sum(leads_by_month.values()):,} new contacts "
                 f"({ghl_since} → {until}), by dateAdded (shared loader)."
             )
+        else:
+            notes.append(
+                "GHL leads: shared dashboard loader returned no rows for this "
+                "range; fetching directly."
+            )
+            leads_by_month, lead_notes = _ghl_leads_monthly(ghl_since, until)
+            notes.extend(lead_notes)
     else:
         leads_by_month, lead_notes = _ghl_leads_monthly(ghl_since, until)
         notes.extend(lead_notes)
 
-    if ghl_dcs_by_month is not None:
+    if ghl_dcs_by_month:
         dcs_by_month = {
             month: int(total)
             for month, total in ghl_dcs_by_month.items()
@@ -326,11 +333,18 @@ def load_ghl_funnel_monthly(
                 f"GHL DCs: {sum(dcs_by_month.values()):,} discovery-call meeting(s) "
                 f"({ghl_since} → {until}, shared loader)."
             )
+        else:
+            notes.append(
+                "GHL DCs: shared dashboard loader returned no rows for this "
+                "range; fetching discovery calls directly."
+            )
+            dcs_by_month, dc_notes = _ghl_dcs_monthly(ghl_since, until)
+            notes.extend(dc_notes)
     else:
         dcs_by_month, dc_notes = _ghl_dcs_monthly(ghl_since, until)
         notes.extend(dc_notes)
 
-    if ghl_signups_by_month is not None:
+    if ghl_signups_by_month:
         signups_by_month = {
             month: int(total)
             for month, total in ghl_signups_by_month.items()
@@ -341,6 +355,13 @@ def load_ghl_funnel_monthly(
                 f"GHL signups: {sum(signups_by_month.values()):,} committed "
                 f"(Sign Up Date {ghl_since} → {until}, shared loader)."
             )
+        else:
+            notes.append(
+                "GHL signups: shared dashboard loader returned no rows for this "
+                "range; fetching directly."
+            )
+            signups_by_month, signup_notes = _ghl_signups_monthly(ghl_since, until)
+            notes.extend(signup_notes)
     else:
         signups_by_month, signup_notes = _ghl_signups_monthly(ghl_since, until)
         notes.extend(signup_notes)
