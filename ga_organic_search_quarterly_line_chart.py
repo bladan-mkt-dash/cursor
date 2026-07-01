@@ -19,12 +19,18 @@ from google_data import (
 _PROJECT_DIR = Path(__file__).resolve().parent
 load_dotenv(_PROJECT_DIR / ".env")
 
-# GA4 intraday totals are incomplete; chart and quarterly rollups end here.
+# GA4 intraday totals are incomplete; full-trend mode ends here (UTC).
 CHART_LAG = timedelta(hours=48)
 
+# Q2 YoY compare: full calendar quarters, no lag trim.
+Q2_COMPARE_YEARS = (2023, 2024, 2025, 2026)
+Q2_COMPARE_THROUGH = date(2026, 6, 30)
 
-def _chart_through_date() -> date:
-    """Last calendar date included in the trend chart (now minus 48 hours, UTC)."""
+
+def _chart_through_date(*, apply_lag: bool) -> date:
+    """Last calendar date included in the trend chart."""
+    if not apply_lag:
+        return Q2_COMPARE_THROUGH
     return (datetime.now(timezone.utc) - CHART_LAG).date()
 
 # GA4 ``sessionDefaultChannelGroup`` values treated as paid (aggregated on the chart).
@@ -40,11 +46,27 @@ GA4_PAID_SESSION_DEFAULT_CHANNELS = frozenset(
     }
 )
 
-# Side table: channels that explain the Q1 2026 lift vs Q4 2025 (session default group).
+# Side table: paid channels that explain YoY session change (session default group).
 LIFT_TABLE_CHANNELS = ("Cross-network", "Display", "Paid Other", "Paid Search")
 
-LIFT_EARLIER_START, LIFT_EARLIER_END = "2025-10-01", "2025-12-31"
-LIFT_LATER_START, LIFT_LATER_END = "2026-01-01", "2026-03-31"
+_FULL_TREND_LIFT = (
+    "2025-10-01",
+    "2025-12-31",
+    "2026-01-01",
+    "2026-03-31",
+    "Q4 2025 → Q1 2026",
+    "Q4 2025",
+    "Q1 2026",
+)
+_Q2_YOY_LIFT = (
+    "2025-04-01",
+    "2025-06-30",
+    "2026-04-01",
+    "2026-06-30",
+    "Q2 2025 → Q2 2026",
+    "Q2 2025",
+    "Q2 2026",
+)
 
 _CHART_LABELS = {
     "Organic Search": "Organic search",
@@ -91,35 +113,85 @@ st.set_page_config(
     page_title="GA4 Traffic — Quarterly",
     layout="wide",
 )
-st.title("Traffic by quarter and Q4 2025 → Q1 2026 channel lift (GA4)")
-chart_through = _chart_through_date()
-st.caption(
-    "Chart: **Organic search**, **Paid traffic** (all GA4 paid default channel groups combined), "
-    "**Direct**, and **All sources** — quarters from **2023 Q1** through the current quarter. "
-    f"Data through **{chart_through.isoformat()}** (last **48 hours** excluded for GA4 completeness). "
-    "Side table: Q4 → Q1 session **change** by channel (**Cross-network**, **Display**, **Paid Other**, "
-    "**Paid Search**). Expandable table: quarterly **breakdown** by channel. "
-    "Latest chart point may be a **partial quarter**."
+
+_view_default = 1 if st.query_params.get("mode") == "q2" else 0
+view_mode = st.sidebar.radio(
+    "Chart range",
+    options=("full_trend", "q2_yoy"),
+    format_func=lambda k: {
+        "full_trend": "Full trend (2023 Q1 → current)",
+        "q2_yoy": "Q2 trend (2023–2026, full quarters)",
+    }[k],
+    index=_view_default,
+    key="ga_traffic_view_mode",
 )
+q2_yoy = view_mode == "q2_yoy"
+apply_lag = not q2_yoy
+chart_through = _chart_through_date(apply_lag=apply_lag)
+
+if q2_yoy:
+    lift_cfg = _Q2_YOY_LIFT
+    q2_year_span = f"{Q2_COMPARE_YEARS[0]}–{Q2_COMPARE_YEARS[-1]}"
+    page_title = f"Q2 traffic trend {q2_year_span} (GA4)"
+    chart_caption = (
+        "Chart: **Organic search**, **Paid traffic**, **Direct**, and **All sources** — "
+        f"**Q2 only** for **{q2_year_span}** "
+        f"(Apr 1 – Jun 30 each year, through **{chart_through.isoformat()}**, "
+        "**no 48-hour exclusion**). Side table: latest Q2 YoY session **change** "
+        f"({lift_cfg[5]} → {lift_cfg[7]}) by paid channel."
+    )
+else:
+    lift_cfg = _FULL_TREND_LIFT
+    page_title = "Traffic by quarter and Q4 2025 → Q1 2026 channel lift (GA4)"
+    chart_caption = (
+        "Chart: **Organic search**, **Paid traffic** (all GA4 paid default channel groups combined), "
+        "**Direct**, and **All sources** — quarters from **2023 Q1** through the current quarter. "
+        f"Data through **{chart_through.isoformat()}** (last **48 hours** excluded for GA4 completeness). "
+        "Side table: Q4 → Q1 session **change** by channel (**Cross-network**, **Display**, **Paid Other**, "
+        "**Paid Search**). Expandable table: quarterly **breakdown** by channel. "
+        "Latest chart point may be a **partial quarter**."
+    )
+
+(
+    lift_earlier_start,
+    lift_earlier_end,
+    lift_later_start,
+    lift_later_end,
+    lift_title,
+    lift_earlier_label,
+    lift_later_label,
+) = lift_cfg
+
+st.title(page_title)
+st.caption(chart_caption)
 
 with st.spinner("Fetching GA4…"):
     try:
-        df = get_organic_and_paid_search_sessions_by_quarter(
-            first_year=2023,
-            first_quarter=1,
-            through=chart_through,
-        )
+        if q2_yoy:
+            df = get_organic_and_paid_search_sessions_by_quarter(
+                first_year=Q2_COMPARE_YEARS[0],
+                first_quarter=2,
+                through=chart_through,
+            )
+            df = df[df["Quarter_num"] == 2].copy()
+            df = df[df["Year"].isin(Q2_COMPARE_YEARS)].copy()
+        else:
+            df = get_organic_and_paid_search_sessions_by_quarter(
+                first_year=2023,
+                first_quarter=1,
+                through=chart_through,
+            )
         lift_full = compare_session_default_channel_sessions(
-            earlier_start=LIFT_EARLIER_START,
-            earlier_end=LIFT_EARLIER_END,
-            later_start=LIFT_LATER_START,
-            later_end=LIFT_LATER_END,
+            earlier_start=lift_earlier_start,
+            earlier_end=lift_earlier_end,
+            later_start=lift_later_start,
+            later_end=lift_later_end,
         )
         paid_other_by_sm = compare_paid_other_by_session_source_medium(
-            earlier_start=LIFT_EARLIER_START,
-            earlier_end=LIFT_EARLIER_END,
-            later_start=LIFT_LATER_START,
-            later_end=LIFT_LATER_END,
+            earlier_start=lift_earlier_start,
+            earlier_end=lift_earlier_end,
+            later_start=lift_later_start,
+            later_end=lift_later_end,
         )
     except Exception as e:
         st.error(str(e))
@@ -139,10 +211,15 @@ _natural_q_end = pd.Period(
 ).end_time.date()
 is_partial = str(last_meta["Period_end"]) != _natural_q_end.isoformat()
 if is_partial:
+    partial_note = (
+        f"Chart excludes the most recent 48 hours (through {chart_through.isoformat()})."
+        if apply_lag
+        else f"Expected full quarter through {_natural_q_end.isoformat()}."
+    )
     st.warning(
         f"Latest period **{last_meta['Quarter_label']}** is partial "
         f"({last_meta['Period_start']} → {last_meta['Period_end']}). "
-        f"Chart excludes the most recent 48 hours (through {chart_through.isoformat()})."
+        f"{partial_note}"
     )
 
 quarter_order = (
@@ -184,7 +261,7 @@ with chart_col:
     st.plotly_chart(fig, width="stretch")
 
 with table_col:
-    st.subheader("Q4 2025 → Q1 2026 (why sessions moved)")
+    st.subheader(f"{lift_title} (why sessions moved)")
     st.caption("Traffic acquisition · `sessionDefaultChannelGroup`")
     if lift_full.empty:
         st.info("No comparison rows returned from GA4.")
@@ -193,13 +270,19 @@ with table_col:
             lift_full["Session_default_channel_group"].isin(LIFT_TABLE_CHANNELS)
         ].copy()
         lift_slice = lift_slice.sort_values("Session_delta", ascending=False)
+        prior_pct_help = (
+            f"Percent change vs that channel’s {lift_earlier_label} sessions "
+            "(not share of site total)."
+        )
         show = pd.DataFrame(
             {
                 "Channel": lift_slice["Session_default_channel_group"],
-                "Q4 2025": lift_slice["Sessions_earlier"],
-                "Q1 2026": lift_slice["Sessions_later"],
+                lift_earlier_label: lift_slice["Sessions_earlier"],
+                lift_later_label: lift_slice["Sessions_later"],
                 "Δ sessions": lift_slice["Session_delta"],
-                "Δ % vs Q4 (%)": lift_slice["Session_delta_pct_prior"],
+                f"Δ % vs {lift_earlier_label} (%)": lift_slice[
+                    "Session_delta_pct_prior"
+                ],
             }
         )
         st.dataframe(
@@ -208,13 +291,17 @@ with table_col:
             hide_index=True,
             column_config={
                 "Channel": st.column_config.TextColumn("Channel"),
-                "Q4 2025": st.column_config.NumberColumn("Q4 2025", format="%d"),
-                "Q1 2026": st.column_config.NumberColumn("Q1 2026", format="%d"),
+                lift_earlier_label: st.column_config.NumberColumn(
+                    lift_earlier_label, format="%d"
+                ),
+                lift_later_label: st.column_config.NumberColumn(
+                    lift_later_label, format="%d"
+                ),
                 "Δ sessions": st.column_config.NumberColumn("Δ sessions", format="%d"),
-                "Δ % vs Q4 (%)": st.column_config.NumberColumn(
-                    "Δ % vs Q4 (%)",
+                f"Δ % vs {lift_earlier_label} (%)": st.column_config.NumberColumn(
+                    f"Δ % vs {lift_earlier_label} (%)",
                     format="%.1f",
-                    help="Percent change vs that channel’s Q4 2025 sessions (not share of site total).",
+                    help=prior_pct_help,
                 ),
             },
         )
@@ -240,7 +327,11 @@ classified as **paid** in GA4.
 
 The table below breaks **only** sessions counted as **Paid Other** into
 `sessionSourceMedium` (e.g. `example / cpc`), for the **same** windows as the lift
-table: **Q4 2025** vs **Q1 2026**.
+table: **"""
+    + lift_earlier_label
+    + """** vs **"""
+    + lift_later_label
+    + """**.
 """
 )
 
@@ -250,10 +341,12 @@ else:
     po_show = pd.DataFrame(
         {
             "Source / medium": paid_other_by_sm["Session_source_medium"],
-            "Q4 2025": paid_other_by_sm["Sessions_earlier"],
-            "Q1 2026": paid_other_by_sm["Sessions_later"],
+            lift_earlier_label: paid_other_by_sm["Sessions_earlier"],
+            lift_later_label: paid_other_by_sm["Sessions_later"],
             "Δ sessions": paid_other_by_sm["Session_delta"],
-            "Δ % vs Q4 (%)": paid_other_by_sm["Session_delta_pct_prior"],
+            f"Δ % vs {lift_earlier_label} (%)": paid_other_by_sm[
+                "Session_delta_pct_prior"
+            ],
         }
     )
     st.dataframe(
@@ -265,19 +358,24 @@ else:
                 "Source / medium",
                 help="GA4 `sessionSourceMedium` for traffic in the Paid Other channel only.",
             ),
-            "Q4 2025": st.column_config.NumberColumn("Q4 2025", format="%d"),
-            "Q1 2026": st.column_config.NumberColumn("Q1 2026", format="%d"),
+            lift_earlier_label: st.column_config.NumberColumn(
+                lift_earlier_label, format="%d"
+            ),
+            lift_later_label: st.column_config.NumberColumn(
+                lift_later_label, format="%d"
+            ),
             "Δ sessions": st.column_config.NumberColumn("Δ sessions", format="%d"),
-            "Δ % vs Q4 (%)": st.column_config.NumberColumn(
-                "Δ % vs Q4 (%)",
+            f"Δ % vs {lift_earlier_label} (%)": st.column_config.NumberColumn(
+                f"Δ % vs {lift_earlier_label} (%)",
                 format="%.1f",
-                help="Percent change vs that row’s Q4 2025 sessions.",
+                help=f"Percent change vs that row’s {lift_earlier_label} sessions.",
             ),
         },
     )
     st.caption(
-        f"**Paid Other** session totals in this breakdown: Q4 **{int(paid_other_by_sm['Sessions_earlier'].sum()):,}** → "
-        f"Q1 **{int(paid_other_by_sm['Sessions_later'].sum()):,}** "
+        f"**Paid Other** session totals in this breakdown: {lift_earlier_label} "
+        f"**{int(paid_other_by_sm['Sessions_earlier'].sum()):,}** → "
+        f"{lift_later_label} **{int(paid_other_by_sm['Sessions_later'].sum()):,}** "
         f"(Δ **{int(paid_other_by_sm['Session_delta'].sum()):+,}**)."
     )
 
